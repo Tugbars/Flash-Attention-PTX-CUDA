@@ -39,6 +39,7 @@ enum class Precision : uint8_t {
 };
 
 // -- Kernel tuning constants ------------------------------------------------
+// Tuned for Blackwell (sm_120) / RTX 5080. Also works on Ampere/Ada/Hopper.
 namespace tuning {
 
 // Flash Attention tile sizes

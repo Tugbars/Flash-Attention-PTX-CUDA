@@ -6,7 +6,10 @@ project(cuda_transformer CUDA CXX)
 # ============================================================================
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90")  # Ampere, Ada, Hopper
+set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90;120")  # Ampere, Ada, Hopper, Blackwell
+
+# For faster builds targeting only your GPU, uncomment:
+# set(CMAKE_CUDA_ARCHITECTURES "120")  # RTX 5080 Blackwell only
 
 # Aggressive optimization
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math -lineinfo")

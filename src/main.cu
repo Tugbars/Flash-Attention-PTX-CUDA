@@ -1,20 +1,18 @@
 // ============================================================================
 // Transformer Benchmark / Demo
-//
-// Measures kernel-level and end-to-end latency for the transformer forward pass.
-// Reports TFLOPS, memory bandwidth utilization, and per-kernel breakdown.
 // ============================================================================
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdio>
 #include <cstdlib>
-#include <chrono>
 #include <vector>
 
 #include "../include/transformer_config.h"
 #include "../include/tensor.h"
-#include "transformer.cu"
+#include "../include/flash_attention.h"
+#include "../include/layer_norm.h"
+#include "../include/gemm_operations.h"
 
 using namespace transformer;
 
@@ -23,19 +21,10 @@ using namespace transformer;
 // ============================================================================
 struct CudaTimer {
     cudaEvent_t start, stop;
+    CudaTimer()  { cudaEventCreate(&start); cudaEventCreate(&stop); }
+    ~CudaTimer() { cudaEventDestroy(start); cudaEventDestroy(stop); }
 
-    CudaTimer() {
-        cudaEventCreate(&start);
-        cudaEventCreate(&stop);
-    }
-    ~CudaTimer() {
-        cudaEventDestroy(start);
-        cudaEventDestroy(stop);
-    }
-
-    void begin(cudaStream_t stream = nullptr) {
-        cudaEventRecord(start, stream);
-    }
+    void begin(cudaStream_t stream = nullptr) { cudaEventRecord(start, stream); }
     float end(cudaStream_t stream = nullptr) {
         cudaEventRecord(stop, stream);
         cudaEventSynchronize(stop);
@@ -46,7 +35,7 @@ struct CudaTimer {
 };
 
 // ============================================================================
-// Benchmark Individual Kernels
+// Benchmarks
 // ============================================================================
 void benchmark_flash_attention(int batch_size, int n_heads, int seq_len, int d_head,
                                 int warmup = 10, int iters = 100)
@@ -57,7 +46,6 @@ void benchmark_flash_attention(int batch_size, int n_heads, int seq_len, int d_h
     size_t bh = static_cast<size_t>(batch_size) * n_heads;
     size_t elems = bh * seq_len * d_head;
 
-    // Allocate
     half *Q, *K, *V, *O;
     float *L;
     cudaMalloc(&Q, elems * sizeof(half));
@@ -65,9 +53,7 @@ void benchmark_flash_attention(int batch_size, int n_heads, int seq_len, int d_h
     cudaMalloc(&V, elems * sizeof(half));
     cudaMalloc(&O, elems * sizeof(half));
     cudaMalloc(&L, bh * seq_len * sizeof(float));
-
-    // Random init (just for benchmarking)
-    cudaMemset(Q, 0x3C, elems * sizeof(half));  // ~1.0 in FP16
+    cudaMemset(Q, 0x3C, elems * sizeof(half));
     cudaMemset(K, 0x3C, elems * sizeof(half));
     cudaMemset(V, 0x3C, elems * sizeof(half));
 
@@ -81,22 +67,15 @@ void benchmark_flash_attention(int batch_size, int n_heads, int seq_len, int d_h
     params.causal     = true;
     params.stream     = nullptr;
 
-    // Warmup
-    for (int i = 0; i < warmup; i++) {
-        launch_flash_attention(params);
-    }
+    for (int i = 0; i < warmup; i++) launch_flash_attention(params);
     cudaDeviceSynchronize();
 
-    // Benchmark
     CudaTimer timer;
     timer.begin();
-    for (int i = 0; i < iters; i++) {
-        launch_flash_attention(params);
-    }
+    for (int i = 0; i < iters; i++) launch_flash_attention(params);
     float total_ms = timer.end();
     float avg_ms = total_ms / iters;
 
-    // Compute FLOPS: 2 * B * H * S * S * D (for QK^T + AV)
     double flops = 2.0 * bh * static_cast<double>(seq_len) * seq_len * d_head * 2;
     double tflops = flops / (avg_ms * 1e-3) / 1e12;
 
@@ -118,17 +97,12 @@ void benchmark_gemm(int M, int N, int K_dim, int warmup = 10, int iters = 100)
     cudaMemset(B, 0x3C, static_cast<size_t>(N) * K_dim * sizeof(half));
 
     GemmManager gemm;
-
-    for (int i = 0; i < warmup; i++) {
-        gemm.gemm_nt(A, B, C, M, N, K_dim);
-    }
+    for (int i = 0; i < warmup; i++) gemm.gemm_nt(A, B, C, M, N, K_dim);
     cudaDeviceSynchronize();
 
     CudaTimer timer;
     timer.begin();
-    for (int i = 0; i < iters; i++) {
-        gemm.gemm_nt(A, B, C, M, N, K_dim);
-    }
+    for (int i = 0; i < iters; i++) gemm.gemm_nt(A, B, C, M, N, K_dim);
     float total_ms = timer.end();
     float avg_ms = total_ms / iters;
 
@@ -170,7 +144,6 @@ void benchmark_layernorm(int N, int D, int warmup = 10, int iters = 1000)
     float total_ms = timer.end();
     float avg_ms = total_ms / iters;
 
-    // Memory bandwidth: 3 reads (input + residual + gamma/beta) + 2 writes
     double bytes = static_cast<double>(N) * D * sizeof(half) * 5;
     double gbps = bytes / (avg_ms * 1e-3) / 1e9;
 
@@ -185,7 +158,6 @@ void benchmark_layernorm(int N, int D, int warmup = 10, int iters = 1000)
 // Main
 // ============================================================================
 int main(int argc, char** argv) {
-    // Print GPU info
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
     printf("============================================\n");
@@ -196,25 +168,25 @@ int main(int argc, char** argv) {
     printf("Memory: %.1f GB\n", prop.totalGlobalMem / 1e9);
     printf("Compute: %d.%d\n", prop.major, prop.minor);
 
-    // Get clock rate via attribute API (clockRate removed in CUDA 13+)
     int clock_khz = 0;
     cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, 0);
+    int fp16_ops_per_sm = (prop.major >= 12) ? 512 :
+                          (prop.major >= 9)  ? 512 :
+                          (prop.major >= 8)  ? 256 : 128;
     printf("Peak FP16: %.1f TFLOPS (theoretical)\n",
            2.0 * prop.multiProcessorCount * clock_khz * 1e-6 *
-           (prop.major >= 8 ? 256 : 128) / 1e3);  // Approximate
+           fp16_ops_per_sm / 1e3);
     printf("============================================\n");
 
-    // Model config
     ModelConfig config;
     config.d_model = 768;
     config.n_heads = 12;
     config.d_head  = 64;
 
-    // Kernel-level benchmarks
     benchmark_layernorm(2048, config.d_model);
-    benchmark_gemm(2048, config.d_model, config.d_model);          // QKV proj
-    benchmark_gemm(2048, config.d_ffn, config.d_model);            // FFN up
-    benchmark_gemm(2048, config.d_model, config.d_ffn);            // FFN down
+    benchmark_gemm(2048, config.d_model, config.d_model);
+    benchmark_gemm(2048, config.d_ffn, config.d_model);
+    benchmark_gemm(2048, config.d_model, config.d_ffn);
     benchmark_flash_attention(1, config.n_heads, 512, config.d_head);
     benchmark_flash_attention(1, config.n_heads, 2048, config.d_head);
 

@@ -5,22 +5,46 @@
 //   Pre-LayerNorm → QKV Projection → RoPE → Flash Attention →
 //   Attn Output Projection → Residual → Pre-LayerNorm →
 //   SwiGLU FFN → Residual
-//
-// Supports:
-// - Prefill mode (parallel sequence processing)
-// - Decode mode (single token, KV-cache append)
-// - CUDA Graphs for decode latency optimization
 // ============================================================================
 
 #include "../include/transformer_config.h"
 #include "../include/tensor.h"
 #include "../include/gemm_operations.h"
-#include "../kernels/flash_attention.cu"
-#include "../kernels/fused_layernorm.cu"
-#include "../kernels/rotary_embedding.cu"
-#include "../kernels/activation_kernels.cu"
+#include "../include/flash_attention.h"
+#include "../include/layer_norm.h"
+#include "../include/rotary_embedding.h"
+#include "../include/activation_kernels.h"
 
 namespace transformer {
+
+// ============================================================================
+// Simple vector add kernel: output = a + b  (element-wise, FP16)
+// ============================================================================
+__global__ void vector_add_kernel(
+    const half* __restrict__ a,
+    const half* __restrict__ b,
+    half*       __restrict__ output,
+    const int   n
+) {
+    int idx2 = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
+    if (idx2 + 1 < n) {
+        half2 va = *reinterpret_cast<const half2*>(&a[idx2]);
+        half2 vb = *reinterpret_cast<const half2*>(&b[idx2]);
+        float2 fa = __half22float2(va), fb = __half22float2(vb);
+        float2 r = { fa.x + fb.x, fa.y + fb.y };
+        *reinterpret_cast<half2*>(&output[idx2]) = __float22half2_rn(r);
+    } else if (idx2 < n) {
+        output[idx2] = __float2half(__half2float(a[idx2]) + __half2float(b[idx2]));
+    }
+}
+
+static void launch_vector_add(const half* a, const half* b, half* output,
+                               int n, cudaStream_t stream) {
+    int block = 256;
+    int grid  = (n / 2 + block - 1) / block;
+    vector_add_kernel<<<grid, block, 0, stream>>>(a, b, output, n);
+    CUDA_CHECK(cudaGetLastError());
+}
 
 // ============================================================================
 // Per-Layer Weights (stored in column-major for CUTLASS NT layout)
@@ -54,15 +78,15 @@ struct TransformerLayerWeights {
 // Scratch Buffers (pre-allocated workspace)
 // ============================================================================
 struct ScratchBuffers {
-    half* ln_out     = nullptr;  // [max_batch * max_seq, d_model]
-    half* qkv        = nullptr;  // [max_batch * max_seq, 3 * d_model]
-    half* attn_out   = nullptr;  // [max_batch * max_seq, d_model]
-    half* ffn_gate   = nullptr;  // [max_batch * max_seq, d_ffn]
-    half* ffn_up     = nullptr;  // [max_batch * max_seq, d_ffn]
-    half* ffn_inter  = nullptr;  // [max_batch * max_seq, d_ffn]
-    half* ffn_out    = nullptr;  // [max_batch * max_seq, d_model]
-    half* residual   = nullptr;  // [max_batch * max_seq, d_model]
-    float* attn_lse  = nullptr;  // [max_batch * max_heads, max_seq]
+    half* ln_out     = nullptr;
+    half* qkv        = nullptr;
+    half* attn_out   = nullptr;
+    half* ffn_gate   = nullptr;
+    half* ffn_up     = nullptr;
+    half* ffn_inter  = nullptr;
+    half* ffn_out    = nullptr;
+    half* residual   = nullptr;
+    float* attn_lse  = nullptr;
 
     void allocate(const ModelConfig& config, int max_batch, cudaStream_t stream) {
         size_t max_tokens = static_cast<size_t>(max_batch) * config.max_seq_len;
@@ -101,16 +125,9 @@ public:
     TransformerLayer(const ModelConfig& config, int layer_idx)
         : config_(config), layer_idx_(layer_idx) {}
 
-    // -----------------------------------------------------------------------
-    // Prefill forward: process full sequence in parallel
-    //
-    // input:    [batch * seq_len, d_model]
-    // output:   [batch * seq_len, d_model]  (written over input or to output buf)
-    // kv_cache: updated with new K,V entries
-    // -----------------------------------------------------------------------
     void forward(
-        half* input,                         // [N, d_model] where N = batch * seq_len
-        half* output,                        // [N, d_model]
+        half* input,
+        half* output,
         const TransformerLayerWeights& weights,
         ScratchBuffers& scratch,
         KVCache<half>& kv_cache,
@@ -118,7 +135,7 @@ public:
         const RoPEConfig& rope,
         int batch_size,
         int seq_len,
-        int start_pos,                       // Position offset for KV-cache
+        int start_pos,
         cudaStream_t stream
     ) {
         const int N = batch_size * seq_len;
@@ -129,13 +146,11 @@ public:
 
         gemm.set_stream(stream);
 
-        // ===================================================================
-        // Step 1: Pre-LayerNorm (attention)
-        // ===================================================================
+        // === Step 1: Pre-LayerNorm (attention) =============================
         {
             LayerNormParams ln_params = {};
             ln_params.input       = input;
-            ln_params.residual    = nullptr;  // First layer: no residual yet
+            ln_params.residual    = nullptr;
             ln_params.bias        = nullptr;
             ln_params.gamma       = weights.ln1_gamma;
             ln_params.beta        = weights.ln1_beta;
@@ -149,12 +164,7 @@ public:
             launch_fused_layernorm(ln_params);
         }
 
-        // ===================================================================
-        // Step 2: Q, K, V projections (3 separate GEMMs or 1 fused)
-        // ===================================================================
-        // Q = LN_out * W_q^T  →  [N, d_model]
-        // K = LN_out * W_k^T  →  [N, d_model]
-        // V = LN_out * W_v^T  →  [N, d_model]
+        // === Step 2: Q, K, V projections ===================================
         half* Q = scratch.qkv;
         half* K_proj = scratch.qkv + static_cast<size_t>(N) * d;
         half* V_proj = scratch.qkv + static_cast<size_t>(N) * d * 2;
@@ -163,53 +173,32 @@ public:
         gemm.gemm_nt(scratch.ln_out, weights.W_k, K_proj, N, d, d);
         gemm.gemm_nt(scratch.ln_out, weights.W_v, V_proj, N, d, d);
 
-        // ===================================================================
-        // Step 3: Apply RoPE to Q and K
-        // ===================================================================
-        // Reshape Q, K to [batch * n_heads, seq_len, d_head] for RoPE
-        // Note: Q/K are stored as [N, d_model] = [batch*seq_len, n_heads*d_head]
-        // We treat them as [batch*n_heads, seq_len, d_head] for RoPE application
+        // === Step 3: RoPE ==================================================
         if (config_.use_rotary) {
-            // Need to reshape: [B*S, H*D] → [B*H, S, D]
-            // For simplicity, apply RoPE in the [B*S, H*D] layout
-            // treating each head's d_head dims independently
             launch_rope(Q, K_proj, rope, batch_size * n_heads,
                        seq_len, start_pos, stream);
         }
 
-        // ===================================================================
-        // Step 4: Update KV Cache
-        // ===================================================================
-        // Copy K, V into the KV cache at positions [start_pos, start_pos+seq_len)
+        // === Step 4: Update KV Cache =======================================
         {
-            half* k_cache = kv_cache.get(layer_idx_, 0);  // K cache for this layer
-            half* v_cache = kv_cache.get(layer_idx_, 1);  // V cache
-
-            // K_proj is [batch*seq_len, d_model], cache is [max_seq, n_heads*d_head]
-            // Copy seq_len rows starting at position start_pos
+            half* k_cache = kv_cache.get(layer_idx_, 0);
+            half* v_cache = kv_cache.get(layer_idx_, 1);
             size_t row_bytes = d * sizeof(half);
             for (int b = 0; b < batch_size; b++) {
                 CUDA_CHECK(cudaMemcpyAsync(
                     k_cache + static_cast<size_t>(start_pos) * d,
                     K_proj + static_cast<size_t>(b * seq_len) * d,
-                    seq_len * row_bytes,
-                    cudaMemcpyDeviceToDevice, stream));
+                    seq_len * row_bytes, cudaMemcpyDeviceToDevice, stream));
                 CUDA_CHECK(cudaMemcpyAsync(
                     v_cache + static_cast<size_t>(start_pos) * d,
                     V_proj + static_cast<size_t>(b * seq_len) * d,
-                    seq_len * row_bytes,
-                    cudaMemcpyDeviceToDevice, stream));
+                    seq_len * row_bytes, cudaMemcpyDeviceToDevice, stream));
             }
         }
 
-        // ===================================================================
-        // Step 5: Flash Attention
-        // ===================================================================
-        // Q: [B*H, S, D_head], K: [B*H, total_len, D_head], V: same
-        // total_len = start_pos + seq_len (all cached + current)
+        // === Step 5: Flash Attention =======================================
         {
             int total_len = start_pos + seq_len;
-
             FlashAttentionParams fa_params = {};
             fa_params.Q          = Q;
             fa_params.K          = kv_cache.get(layer_idx_, 0);
@@ -226,27 +215,19 @@ public:
             launch_flash_attention(fa_params);
         }
 
-        // ===================================================================
-        // Step 6: Attention output projection + residual
-        // ===================================================================
-        // attn_proj = attn_out * W_o^T  →  [N, d_model]
+        // === Step 6: Attention output projection ===========================
         gemm.gemm_nt(scratch.attn_out, weights.W_o, scratch.ffn_out, N, d, d);
 
-        // Residual: scratch.residual = input + attn_proj
-        // (done inside fused LayerNorm below)
-
-        // ===================================================================
-        // Step 7: Pre-LayerNorm (FFN) with residual
-        // ===================================================================
+        // === Step 7: Pre-LayerNorm (FFN) with residual =====================
         {
             LayerNormParams ln_params = {};
-            ln_params.input       = scratch.ffn_out;   // Attention output projection
-            ln_params.residual    = input;              // Skip connection from input
-            ln_params.bias        = weights.b_o;        // Optional output bias
+            ln_params.input       = scratch.ffn_out;
+            ln_params.residual    = input;
+            ln_params.bias        = weights.b_o;
             ln_params.gamma       = weights.ln2_gamma;
             ln_params.beta        = weights.ln2_beta;
-            ln_params.output      = scratch.ln_out;     // Normalized for FFN
-            ln_params.residual_out = scratch.residual;  // Save x+residual for next skip
+            ln_params.output      = scratch.ln_out;
+            ln_params.residual_out = scratch.residual;
             ln_params.num_tokens  = N;
             ln_params.d_model     = d;
             ln_params.eps         = 1e-5f;
@@ -255,47 +236,22 @@ public:
             launch_fused_layernorm(ln_params);
         }
 
-        // ===================================================================
-        // Step 8: FFN — SwiGLU or GELU
-        // ===================================================================
+        // === Step 8: FFN — SwiGLU or GELU ==================================
         if (config_.use_swiglu) {
-            // Gate projection: gate = ln_out * W_gate^T  →  [N, d_ffn]
-            // Up projection:   up   = ln_out * W_up^T    →  [N, d_ffn]
             gemm.gemm_nt(scratch.ln_out, weights.W_gate, scratch.ffn_gate, N, d_ffn, d);
             gemm.gemm_nt(scratch.ln_out, weights.W_up,   scratch.ffn_up,   N, d_ffn, d);
-
-            // Fused SwiGLU: inter = SiLU(gate) * up
             launch_fused_swiglu(scratch.ffn_gate, scratch.ffn_up,
                                 scratch.ffn_inter, N, d_ffn, stream);
         } else {
-            // Standard GELU FFN: inter = GELU(ln_out * W_up^T)
             gemm.gemm_nt(scratch.ln_out, weights.W_up, scratch.ffn_up, N, d_ffn, d);
             launch_fused_gelu(scratch.ffn_up, scratch.ffn_inter, N, d_ffn, stream);
         }
 
-        // Down projection: ffn_out = inter * W_down^T  →  [N, d_model]
         gemm.gemm_nt(scratch.ffn_inter, weights.W_down, scratch.ffn_out, N, d, d_ffn);
 
-        // ===================================================================
-        // Step 9: Final residual addition
-        // ===================================================================
-        // output = scratch.residual + ffn_out
-        // We fuse this into the next layer's LayerNorm, but for the last layer
-        // we need an explicit add. For now, use a simple kernel:
-        {
-            // Simple vector add: output = residual + ffn_out
-            int block = 256;
-            int total_elems = N * d;
-            int grid = (total_elems + block - 1) / block;
-
-            // Lambda-style kernel via a simple add kernel
-            // (In production, this would be fused into the next LN)
-            CUDA_CHECK(cudaMemcpyAsync(output, scratch.residual,
-                                        total_elems * sizeof(half),
-                                        cudaMemcpyDeviceToDevice, stream));
-            // output += ffn_out (use cublas or a tiny kernel)
-            // For now, rely on the next layer's fused LN to handle this
-        }
+        // === Step 9: Residual addition =====================================
+        // output = residual + ffn_out
+        launch_vector_add(scratch.residual, scratch.ffn_out, output, N * d, stream);
     }
 
 private:
@@ -320,27 +276,16 @@ public:
     }
 
     void init(int max_batch_size = 1) {
-        // Allocate KV cache
         kv_cache_.allocate(config_.n_layers, config_.n_heads,
                           config_.d_head, config_.max_seq_len, stream_);
-
-        // Allocate scratch buffers
         scratch_.allocate(config_, max_batch_size, stream_);
-
-        // Initialize RoPE tables
         if (config_.use_rotary) {
             rope_.init(config_.max_seq_len, config_.d_head, 10000.0f, stream_);
         }
-
-        // Initialize GEMM manager
         gemm_.set_stream(stream_);
-
         CUDA_CHECK(cudaStreamSynchronize(stream_));
     }
 
-    // -----------------------------------------------------------------------
-    // Forward pass through all layers
-    // -----------------------------------------------------------------------
     void forward(half* input, half* output,
                  const TransformerLayerWeights* layer_weights,
                  int batch_size, int seq_len, int start_pos)
@@ -354,12 +299,9 @@ public:
                          layer_weights[l], scratch_, kv_cache_,
                          gemm_, rope_, batch_size, seq_len,
                          start_pos, stream_);
-
-            // Ping-pong buffers
             std::swap(current_input, current_output);
         }
 
-        // If odd number of layers, copy result to output
         if (config_.n_layers % 2 == 1 && current_input != output) {
             size_t bytes = static_cast<size_t>(batch_size) * seq_len
                          * config_.d_model * sizeof(half);

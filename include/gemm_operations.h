@@ -11,6 +11,8 @@
 #include <cublas_v2.h>
 #include "transformer_config.h"
 #include "tensor.h"
+#include "activation_kernels.h"
+#include "activation_kernels.h"
 
 // CUTLASS headers (3.x)
 #ifdef USE_CUTLASS
@@ -184,7 +186,7 @@ public:
 #else
         // Fallback: separate GEMM + SiLU kernel
         launch_cublas_gemm_nt(A, B, C, M, N, K, 1.0f, 0.0f);
-        launch_silu_inplace(C, static_cast<size_t>(M) * N, stream_);
+        silu_fallback(C, static_cast<size_t>(M) * N);
 #endif
     }
 
@@ -310,8 +312,10 @@ private:
     }
 #endif
 
-    // SiLU fallback kernel (used when CUTLASS fused epilogue not available)
-    static void launch_silu_inplace(half* data, size_t n, cudaStream_t stream);
+    // SiLU fallback — delegates to launch_silu_inplace from activation_kernels
+    void silu_fallback(half* data, size_t n) {
+        launch_silu_inplace(data, n, stream_);
+    }
 };
 
 } // namespace transformer
