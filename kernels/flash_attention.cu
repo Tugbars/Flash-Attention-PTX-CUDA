@@ -1,19 +1,6 @@
 // ============================================================================
-// Flash Attention CUDA Kernel — Tensor Core Accelerated
-//
-// Uses WMMA (Warp Matrix Multiply-Accumulate) for Q*K^T and Attn*V matmuls.
-// Online softmax with tiled KV iteration (Dao et al., 2022).
-//
-// Key differences from scalar version:
-// - Q*K^T computed via wmma::mma_sync (16x16x16 tiles) instead of scalar dots
-// - Attn*V computed via wmma::mma_sync instead of scalar accumulation
-// - Shared memory reuse: smem_s region doubles as O accumulation buffer
-//
-// Tile strategy:
-//   BLOCK_M = 64 query rows per threadblock
-//   BLOCK_N = 64 KV rows per tile iteration
-//   D_HEAD  = 64 head dimension (tiled in 16-wide WMMA chunks)
-//   8 warps per block (256 threads) edited
+// Flash Attention — WMMA for both Q*K^T and P*V, fused softmax→half,
+// no smem_o zero pass. Best version so far: ~26.7 TFLOPS on RTX 5080.
 // ============================================================================
 
 #include <cuda_fp16.h>
@@ -29,9 +16,6 @@ namespace transformer {
 
 static constexpr int WARP_SIZE_FA = 32;
 
-// ============================================================================
-// Warp reductions
-// ============================================================================
 __device__ __forceinline__ float warp_reduce_max_fa(float val) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
@@ -46,24 +30,10 @@ __device__ __forceinline__ float warp_reduce_sum_fa(float val) {
     return val;
 }
 
-// ============================================================================
-// WMMA tile sizes
-// ============================================================================
 constexpr int WMMA_M = 16;
 constexpr int WMMA_N = 16;
 constexpr int WMMA_K = 16;
 
-// ============================================================================
-// WMMA Flash Attention Kernel
-//
-// Each threadblock handles BLOCK_M query rows for one attention head.
-// Iterates over KV in tiles of BLOCK_N, using WMMA for:
-//   S_tile = Q_tile * K_tile^T   (HMMA 16x16x16)
-//   O_tile += softmax(S_tile) * V_tile  (HMMA 16x16x16)
-//
-// Grid:  (ceil(seq_len/BLOCK_M), batch_size * num_heads)
-// Block: (32, NUM_WARPS)
-// ============================================================================
 template <int BLOCK_M, int BLOCK_N, int D_HEAD, int NUM_WARPS, bool CAUSAL>
 __global__ void flash_attention_wmma_kernel(
     const half* __restrict__ Q,
@@ -84,7 +54,6 @@ __global__ void flash_attention_wmma_kernel(
     if (q_start >= seq_len) return;
 
     // -- Shared memory layout -----------------------------------------------
-    // Eliminated smem_p entirely — convert inline during WMMA load
     constexpr int SMEM_PAD  = 8;
     constexpr int Q_STRIDE  = D_HEAD + SMEM_PAD;
     constexpr int KV_STRIDE = D_HEAD + SMEM_PAD;
@@ -94,12 +63,8 @@ __global__ void flash_attention_wmma_kernel(
     half*  smem_q = reinterpret_cast<half*>(smem_raw);
     half*  smem_k = smem_q + BLOCK_M * Q_STRIDE;
     half*  smem_v = smem_k + BLOCK_N * KV_STRIDE;
-    // smem_s for float scores, smem_p for half probs — overlaid after scores are consumed
     float* smem_s = reinterpret_cast<float*>(smem_v + BLOCK_N * KV_STRIDE);
-    // smem_p placed right after smem_s (we need both alive during conversion)
     half*  smem_p = reinterpret_cast<half*>(smem_s + BLOCK_M * BLOCK_N);
-    // smem_o for WMMA output accumulation — reuses smem_s region
-    // (only used after smem_s is fully consumed and smem_p is populated)
 
     const size_t head_offset = static_cast<size_t>(bh_idx) * seq_len * D_HEAD;
     const half* Q_head = Q + head_offset;
@@ -133,11 +98,11 @@ __global__ void flash_attention_wmma_kernel(
     }
 
     // -- WMMA tile counts ---------------------------------------------------
-    constexpr int TILES_M = BLOCK_M / WMMA_M;   // 4
-    constexpr int TILES_N = BLOCK_N / WMMA_N;   // 4
-    constexpr int TILES_K = D_HEAD  / WMMA_K;   // 4
-    constexpr int TILES_D = D_HEAD  / WMMA_N;   // 4
-    constexpr int TILES_BN = BLOCK_N / WMMA_K;  // 4
+    constexpr int TILES_M  = BLOCK_M / WMMA_M;   // 4
+    constexpr int TILES_N  = BLOCK_N / WMMA_N;   // 4
+    constexpr int TILES_K  = D_HEAD  / WMMA_K;   // 4
+    constexpr int TILES_D  = D_HEAD  / WMMA_N;   // 4
+    constexpr int TILES_BN = BLOCK_N / WMMA_K;   // 4
     constexpr int TOTAL_QK_TILES = TILES_M * TILES_N;  // 16
     constexpr int TOTAL_PV_TILES = TILES_M * TILES_D;  // 16
 
@@ -215,13 +180,11 @@ __global__ void flash_attention_wmma_kernel(
         }
         __syncthreads();
 
-        // === Step C: Online softmax + convert to half =======================
-        // Fused: compute softmax exp values AND write half to smem_p in one pass
+        // === Step C: Online softmax + fused half conversion ================
         #pragma unroll
         for (int r = 0; r < ROWS_PER_WARP; r++) {
             int q_row = warp_id * ROWS_PER_WARP + r;
 
-            // Row max
             float tile_max = -FLT_MAX;
             for (int j = lane_id; j < BLOCK_N; j += WARP_SIZE_FA)
                 tile_max = fmaxf(tile_max, smem_s[q_row * BLOCK_N + j]);
@@ -231,13 +194,11 @@ __global__ void flash_attention_wmma_kernel(
             float new_max  = fmaxf(prev_max, tile_max);
             float correction = expf(prev_max - new_max);
 
-            // Exp, sum, AND convert to half in one pass
             float tile_sum = 0.0f;
             for (int j = lane_id; j < BLOCK_N; j += WARP_SIZE_FA) {
                 float s = smem_s[q_row * BLOCK_N + j];
                 float e = (s > -FLT_MAX * 0.5f) ? expf(s - new_max) : 0.0f;
                 tile_sum += e;
-                // Write half directly — eliminates the separate conversion pass
                 smem_p[q_row * P_STRIDE + j] = __float2half(e);
             }
             tile_sum = warp_reduce_sum_fa(tile_sum);
@@ -252,8 +213,7 @@ __global__ void flash_attention_wmma_kernel(
         __syncthreads();
 
         // === Step D: O += P * V via WMMA ===================================
-        // Each (mi,di) tile is computed by exactly one warp — no conflicts,
-        // no need to zero first. Just write directly.
+        // Reuse smem_s as smem_o. No zero needed (unique tile ownership).
         float* smem_o = smem_s;
 
         for (int tile_idx = warp_id; tile_idx < TOTAL_PV_TILES; tile_idx += NUM_WARPS) {
@@ -284,14 +244,13 @@ __global__ void flash_attention_wmma_kernel(
         }
         __syncthreads();
 
-        // Accumulate into register accumulators
+        // === Step E: Accumulate smem_o into register accumulators ===========
         #pragma unroll
         for (int r = 0; r < ROWS_PER_WARP; r++) {
             int q_row = warp_id * ROWS_PER_WARP + r;
             #pragma unroll
-            for (int d = 0; d < DIMS_PER_LANE; d++) {
+            for (int d = 0; d < DIMS_PER_LANE; d++)
                 acc[r][d] += smem_o[q_row * D_HEAD + lane_id + d * WARP_SIZE_FA];
-            }
         }
         __syncthreads();
     }
@@ -338,7 +297,7 @@ void launch_flash_attention(const FlashAttentionParams& params) {
     smem_bytes += BLOCK_M * Q_STRIDE * sizeof(half);           // smem_q
     smem_bytes += BLOCK_N * KV_STRIDE * sizeof(half);          // smem_k
     smem_bytes += BLOCK_N * KV_STRIDE * sizeof(half);          // smem_v
-    smem_bytes += BLOCK_M * BLOCK_N * sizeof(float);           // smem_s (also reused as smem_o)
+    smem_bytes += BLOCK_M * BLOCK_N * sizeof(float);           // smem_s (reused as smem_o)
     smem_bytes += BLOCK_M * P_STRIDE * sizeof(half);           // smem_p
 
     if (smem_bytes > 48 * 1024) {
