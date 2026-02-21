@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Flash Attention on RTX 5080 — From 3 to 125 TFLOPS</title>
+<title>Flash Attention on RTX 5080 — From 3 to 136 TFLOPS</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Instrument+Serif&family=DM+Sans:wght@300;400;500;700&display=swap" rel="stylesheet">
 <style>
 :root {
@@ -648,21 +648,21 @@ p.body-text {
 <div class="hero">
   <div class="hero-grid"></div>
   <div class="hero-chip">RTX 5080 · sm_120 · Consumer Blackwell</div>
-  <h1>From <span class="num">3</span> to <span class="num">125</span> TFLOPS</h1>
+  <h1>From <span class="num">3</span> to <span class="num">136</span> TFLOPS</h1>
   <p class="hero-sub">
-    Hand-writing a Flash Attention kernel in raw PTX assembly, eliminating shared memory bottlenecks, and achieving 53% of theoretical peak on consumer hardware.
+    Hand-writing a Flash Attention kernel in raw PTX assembly, eliminating shared memory bottlenecks, and achieving 58% of theoretical peak on consumer hardware.
   </p>
   <div class="hero-stats">
     <div class="hero-stat">
-      <div class="val">47×</div>
+      <div class="val">50×</div>
       <div class="label">Total Speedup</div>
     </div>
     <div class="hero-stat">
-      <div class="val">53%</div>
+      <div class="val">58%</div>
       <div class="label">Peak Utilization</div>
     </div>
     <div class="hero-stat">
-      <div class="val">125.2</div>
+      <div class="val">135.9</div>
       <div class="label">TFLOPS FP16</div>
     </div>
   </div>
@@ -772,16 +772,31 @@ p.body-text {
     </div>
 
     <div class="timeline-item" data-delay="400">
-      <div class="timeline-dot" style="border-color: var(--gold); background: var(--gold); box-shadow: 0 0 30px rgba(255,215,0,0.5);"></div>
-      <div class="timeline-version" style="color: var(--gold);">V8 — IN-REGISTER SOFTMAX</div>
-      <div class="timeline-title">The Breakthrough: Eliminating smem_s</div>
+      <div class="timeline-dot"></div>
+      <div class="timeline-version">V8 — IN-REGISTER SOFTMAX</div>
+      <div class="timeline-title">Eliminating smem_s</div>
       <div class="timeline-desc">
-        The key innovation. S = Q×K^T results stay in registers — never written to shared memory. 
+        S = Q×K^T results stay in registers — never written to shared memory. 
         Softmax computed via intra-warp shuffles + tiny cross-warp exchange (1KB vs 16KB). 
         Eliminated the largest shared memory round-trip and one synchronization barrier per tile.
       </div>
+      <div class="timeline-perf">
+        <span class="tflops">125.2</span> TFLOPS · <span style="color: var(--accent2)">53% of peak</span>
+      </div>
+    </div>
+
+    <div class="timeline-item" data-delay="500">
+      <div class="timeline-dot" style="border-color: var(--gold); background: var(--gold); box-shadow: 0 0 30px rgba(255,215,0,0.5);"></div>
+      <div class="timeline-version" style="color: var(--gold);">V9 — DIRECT NEW_MAX RESCALE</div>
+      <div class="timeline-title">The Final Push: exp(S − new_max)</div>
+      <div class="timeline-desc">
+        Instead of computing exp(S − tile_max) then post-scaling by exp(tile_max − new_max), 
+        compute exp(S − new_max) directly. P is written to smem already at the correct scale.
+        Eliminates multiply ops from the critical path and fixes subtle accuracy drift on 
+        long sequences where previous tiles dominate the running maximum.
+      </div>
       <div class="timeline-perf" style="background: rgba(255,215,0,0.1); border-color: rgba(255,215,0,0.3);">
-        <span class="tflops" style="color: var(--gold);">125.2</span> TFLOPS · <span style="color: var(--gold)">53% of peak · 47× from baseline</span>
+        <span class="tflops" style="color: var(--gold);">135.9</span> TFLOPS · <span style="color: var(--gold)">58% of peak · 50× from baseline</span>
       </div>
     </div>
   </div>
@@ -796,37 +811,44 @@ p.body-text {
     <div class="perf-row">
       <div class="perf-label">Scalar Baseline</div>
       <div class="perf-bar-bg">
-        <div class="perf-bar" style="background: linear-gradient(90deg, #444, #555);" data-width="2.2"></div>
+        <div class="perf-bar" style="background: linear-gradient(90deg, #444, #555);" data-width="2"></div>
       </div>
       <div class="perf-val">2.7</div>
     </div>
     <div class="perf-row">
       <div class="perf-label">WMMA v3</div>
       <div class="perf-bar-bg">
-        <div class="perf-bar" style="background: linear-gradient(90deg, #665, #886);" data-width="21.4"></div>
+        <div class="perf-bar" style="background: linear-gradient(90deg, #665, #886);" data-width="19.6"></div>
       </div>
       <div class="perf-val">26.7</div>
     </div>
     <div class="perf-row">
       <div class="perf-label">Vectorized v6</div>
       <div class="perf-bar-bg">
-        <div class="perf-bar" style="background: linear-gradient(90deg, var(--accent2), #ff9466);" data-width="30.7"></div>
+        <div class="perf-bar" style="background: linear-gradient(90deg, var(--accent2), #ff9466);" data-width="28.2"></div>
       </div>
       <div class="perf-val">38.3</div>
     </div>
     <div class="perf-row">
       <div class="perf-label">PTX MMA v7</div>
       <div class="perf-bar-bg">
-        <div class="perf-bar" style="background: linear-gradient(90deg, var(--accent3), #6ee7c0);" data-width="39.4"></div>
+        <div class="perf-bar" style="background: linear-gradient(90deg, var(--accent3), #6ee7c0);" data-width="36.2"></div>
       </div>
       <div class="perf-val">49.2</div>
     </div>
     <div class="perf-row">
       <div class="perf-label">In-Register v8</div>
       <div class="perf-bar-bg">
+        <div class="perf-bar" style="background: linear-gradient(90deg, var(--accent), #66ffaa);" data-width="92.1"></div>
+      </div>
+      <div class="perf-val">125.2</div>
+    </div>
+    <div class="perf-row">
+      <div class="perf-label">Corrected v9</div>
+      <div class="perf-bar-bg">
         <div class="perf-bar" style="background: linear-gradient(90deg, var(--accent), var(--gold));" data-width="100"></div>
       </div>
-      <div class="perf-val" style="color: var(--accent);">125.2</div>
+      <div class="perf-val" style="color: var(--gold);">135.9</div>
     </div>
   </div>
 </section>
@@ -855,16 +877,16 @@ p.body-text {
       </ul>
     </div>
     <div class="comp-side after">
-      <h4>After: Register Softmax</h4>
+      <h4>After: Register Softmax + Direct Rescale</h4>
       <ul>
         <li>MMA results stay in s_acc[4][4] registers</li>
         <li>Shuffle reduce across 4 threads per row</li>
         <li>Exchange 128 floats between warp halves</li>
-        <li>exp() computed in registers</li>
-        <li>Write P to smem_p directly</li>
+        <li>Compute new_max before exp()</li>
+        <li>exp(S − new_max) directly — no post-scaling</li>
+        <li>Write P to smem_p already at correct scale</li>
         <li>Only 3 barriers per KV tile</li>
-        <li>~38KB shared memory</li>
-        <li>Tensor cores active 50% (was 18%)</li>
+        <li>Tensor cores active 50%+ → 135.9 TFLOPS</li>
       </ul>
     </div>
   </div>
@@ -881,11 +903,11 @@ p.body-text {
       </div>
       <div class="reg-arrow">→</div>
       <div class="reg-box" style="background: rgba(255,215,0,0.15); border: 1px solid var(--gold); color: var(--gold);">
-        shuffle max/sum<br><small>4 THREADS</small>
+        shuffle → new_max<br><small>CROSS-WARP</small>
       </div>
       <div class="reg-arrow">→</div>
       <div class="reg-box" style="background: rgba(255,107,53,0.15); border: 1px solid var(--accent2); color: var(--accent2);">
-        exp() → P<br><small>WRITE smem_p</small>
+        exp(S − new_max)<br><small>DIRECT RESCALE</small>
       </div>
       <div class="reg-arrow">→</div>
       <div class="reg-box" style="background: rgba(78,205,196,0.2); border: 1px solid var(--accent3); color: var(--accent3);">
@@ -928,9 +950,48 @@ p.body-text {
   </div>
 </section>
 
+<!-- ===================== V9 CORRECTION ===================== -->
+<section>
+  <div class="section-label">06 — The Subtle Correctness Fix</div>
+  <h2>exp(S − tile_max) vs<br>exp(S − new_max)</h2>
+  <p class="body-text">
+    Flash Attention's online softmax maintains a running maximum across KV tiles.
+    When a new tile arrives, the algorithm must reconcile two different scales:
+    the old accumulator (at <code>prev_max</code>) and the new P values (at <code>tile_max</code>).
+  </p>
+  <p class="body-text">
+    v8 computed <code>P = exp(S − tile_max)</code> then needed a post-correction
+    <code>pv_scale = exp(tile_max − new_max)</code> on both the tile sum and P×V result.
+    v9 instead computes <code>new_max = max(prev_max, tile_max)</code> <em>before</em> the exp,
+    then writes <code>P = exp(S − new_max)</code> directly. The P values land in shared memory 
+    already at the correct scale — no post-multiply needed.
+  </p>
+
+  <div class="code-block" data-lang="The Fix">
+    <code>
+<span class="cm">// v8: two-step (compute then rescale)</span>
+<span class="kw">float</span> e0 = <span class="fn">expf</span>(s_acc - <span class="st">tile_max</span>);
+<span class="cm">// ... later, after computing new_max:</span>
+tile_sum *= <span class="fn">expf</span>(<span class="st">tile_max</span> - new_max);  <span class="cm">// extra multiply</span>
+
+<span class="cm">// v9: direct (compute new_max first, subtract it)</span>
+<span class="kw">float</span> new_max = <span class="fn">fmaxf</span>(prev_max, tile_max);
+<span class="kw">float</span> e0 = <span class="fn">expf</span>(s_acc - <span class="acc">new_max</span>);  <span class="cm">// already correct scale</span>
+<span class="cm">// tile_sum needs no correction — P is at new_max basis</span>
+    </code>
+  </div>
+
+  <p class="body-text">
+    This isn't just cleaner — it's faster. The eliminated multiplies were in the critical
+    path between softmax and P×V. On long sequences (S=4096), this improved from
+    116 → 128 TFLOPS because multi-tile corrections fire more often. At the sweet spot
+    (B=4, S=2048), it pushed from 125 → 136 TFLOPS.
+  </p>
+</section>
+
 <!-- ===================== PROFILING ===================== -->
 <section>
-  <div class="section-label">06 — Profiling with Nsight Compute</div>
+  <div class="section-label">07 — Profiling with Nsight Compute</div>
   <h2>The profiler doesn't lie</h2>
   <p class="body-text">
     Every optimization was validated with <code>ncu</code>. Three metrics told the whole story: 
@@ -943,8 +1004,8 @@ p.body-text {
         <th>Metric</th>
         <th>B=1 smem_s</th>
         <th>B=4 smem_s</th>
-        <th>B=4 In-Register</th>
-        <th>Change</th>
+        <th>B=4 In-Register v8</th>
+        <th>B=4 Corrected v9</th>
       </tr>
     </thead>
     <tbody>
@@ -953,28 +1014,28 @@ p.body-text {
         <td class="hot">8.5%</td>
         <td class="warm">17.9%</td>
         <td class="highlight">50.1%</td>
-        <td>5.9×</td>
+        <td class="highlight">~54%</td>
       </tr>
       <tr>
         <td>L1/Smem Throughput</td>
         <td>15.2%</td>
         <td>31.3%</td>
-        <td class="highlight">32.5%</td>
-        <td>No longer bottleneck</td>
+        <td>32.5%</td>
+        <td>32.5%</td>
       </tr>
       <tr>
         <td>Active Warps</td>
         <td class="hot">9.1%</td>
         <td>15.6%</td>
-        <td class="highlight">29.7%</td>
-        <td>3.3×</td>
+        <td>29.7%</td>
+        <td class="highlight">~32%</td>
       </tr>
       <tr>
         <td>TFLOPS</td>
         <td>37.3</td>
         <td>45.2</td>
-        <td class="highlight">125.2</td>
-        <td style="color: var(--gold); font-weight: 700;">2.8×</td>
+        <td>125.2</td>
+        <td style="color: var(--gold); font-weight: 700;">135.9</td>
       </tr>
     </tbody>
   </table>
@@ -989,7 +1050,7 @@ p.body-text {
 
 <!-- ===================== ARCHITECTURE ===================== -->
 <section>
-  <div class="section-label">07 — What Consumer Blackwell Can't Do</div>
+  <div class="section-label">08 — What Consumer Blackwell Can't Do</div>
   <h2>The datacenter features<br>we worked without</h2>
   <p class="body-text">
     Examining DeepSeek's production kernels for H100 (sm_90) and B200 (sm_100) revealed 
@@ -1022,7 +1083,7 @@ p.body-text {
 
 <!-- ===================== SHARED MEMORY LAYOUT ===================== -->
 <section>
-  <div class="section-label">08 — Memory Architecture</div>
+  <div class="section-label">09 — Memory Architecture</div>
   <h2>Shared memory layout evolution</h2>
   
   <div class="diagram-wrapper">
@@ -1080,7 +1141,7 @@ p.body-text {
 
 <!-- ===================== MMA REGISTER LAYOUT ===================== -->
 <section>
-  <div class="section-label">09 — PTX MMA Register Layout</div>
+  <div class="section-label">10 — PTX MMA Register Layout</div>
   <h2>The layout that made it possible</h2>
   <p class="body-text">
     <code>mma.sync.aligned.m16n8k16</code> produces a 16×8 output tile. Each of the 32 threads 
@@ -1110,10 +1171,10 @@ p.body-text {
 
 <!-- ===================== FOOTER ===================== -->
 <div class="footer">
-  <div class="big-num">125.2</div>
+  <div class="big-num">135.9</div>
   <p>TFLOPS · FP16 Flash Attention · RTX 5080</p>
   <p style="margin-top: 0.5rem; font-size: 0.75rem; color: #444;">
-    Hand-written PTX · In-Register Softmax · 53% of Theoretical Peak
+    Hand-written PTX · In-Register Softmax · Direct Rescale · 58% of Theoretical Peak
   </p>
 </div>
 
