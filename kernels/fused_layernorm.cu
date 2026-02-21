@@ -1,5 +1,10 @@
 // ============================================================================
-// Fused Layer Normalization Kernels
+// Fused Layer Normalization Kernels — Optimized
+//
+// Key optimizations over v1:
+//   1. Single-pass (caches combined values in smem, avoids re-reading globals)
+//   2. Vectorized half2 loads/stores
+//   3. Unified kernel handles both LayerNorm and RMSNorm, with/without residual
 // ============================================================================
 
 #include <cuda_fp16.h>
@@ -9,25 +14,31 @@
 
 namespace transformer {
 
-__device__ __forceinline__ float block_reduce_sum_ln(float val, float* smem,
-                                                      int tid, int block_size) {
+__device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
         val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+    return val;
+}
 
+__device__ __forceinline__ float block_reduce_sum_opt(float val, float* smem, int tid, int nwarps) {
+    val = warp_reduce_sum(val);
     if (tid % 32 == 0) smem[tid / 32] = val;
     __syncthreads();
-
     if (tid < 32) {
-        val = (tid < (block_size + 31) / 32) ? smem[tid] : 0.0f;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-            val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+        val = (tid < nwarps) ? smem[tid] : 0.0f;
+        val = warp_reduce_sum(val);
     }
     return val;
 }
 
-__global__ void fused_layernorm_residual_kernel(
+// ============================================================================
+// Single-pass LayerNorm / RMSNorm + optional residual add
+//
+// Pass 1: read input (+residual), cache in smem, compute sum/sumsq
+// Normalize: read from smem cache (no second global read!)
+// ============================================================================
+__global__ void layernorm_singlepass_kernel(
     const half* __restrict__ input,
     const half* __restrict__ residual,
     const half* __restrict__ bias,
@@ -36,87 +47,85 @@ __global__ void fused_layernorm_residual_kernel(
     half*       __restrict__ output,
     half*       __restrict__ residual_out,
     const int   D,
-    const float eps
+    const float eps,
+    const bool  rmsnorm
 ) {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
-    const int block_size = blockDim.x;
-    extern __shared__ float smem[];
+    const int nthreads = blockDim.x;
+    const int nwarps = nthreads / 32;
 
-    const half* x_row = input + static_cast<size_t>(row) * D;
-    const half* r_row = residual ? (residual + static_cast<size_t>(row) * D) : nullptr;
-    half* out_row = output + static_cast<size_t>(row) * D;
-    half* res_out_row = residual_out ? (residual_out + static_cast<size_t>(row) * D) : nullptr;
+    extern __shared__ char smem_raw[];
+    float* smem_reduce = (float*)smem_raw;
+    float* row_cache   = smem_reduce + nwarps + 1;  // D floats
+
+    const size_t row_off = (size_t)row * D;
+    const half* x_ptr = input + row_off;
+    const half* r_ptr = residual ? residual + row_off : nullptr;
+    half* o_ptr       = output + row_off;
+    half* rout_ptr    = residual_out ? residual_out + row_off : nullptr;
 
     float local_sum = 0.0f, local_sumsq = 0.0f;
-    for (int i = tid; i < D; i += block_size) {
-        float val = __half2float(x_row[i]);
-        if (r_row) val += __half2float(r_row[i]);
-        if (bias)  val += __half2float(bias[i]);
-        if (res_out_row) res_out_row[i] = __float2half(val);
-        local_sum   += val;
-        local_sumsq += val * val;
+    const int D2 = D / 2;
+
+    // ---- Pass 1: load, combine, cache, accumulate ----
+    for (int i = tid; i < D2; i += nthreads) {
+        float2 xf = __half22float2(((const half2*)x_ptr)[i]);
+        if (r_ptr) {
+            float2 rf = __half22float2(((const half2*)r_ptr)[i]);
+            xf.x += rf.x;
+            xf.y += rf.y;
+        }
+        if (bias) {
+            float2 bf = __half22float2(((const half2*)bias)[i]);
+            xf.x += bf.x;
+            xf.y += bf.y;
+        }
+        if (rout_ptr) {
+            ((half2*)rout_ptr)[i] = __float22half2_rn(xf);
+        }
+        row_cache[i * 2]     = xf.x;
+        row_cache[i * 2 + 1] = xf.y;
+        local_sum   += xf.x + xf.y;
+        local_sumsq += xf.x * xf.x + xf.y * xf.y;
     }
 
-    float sum   = block_reduce_sum_ln(local_sum, smem, tid, block_size);
+    // ---- Reduce ----
+    float sum   = block_reduce_sum_opt(local_sum, smem_reduce, tid, nwarps);
     __syncthreads();
-    float sumsq = block_reduce_sum_ln(local_sumsq, smem, tid, block_size);
+    float sumsq = block_reduce_sum_opt(local_sumsq, smem_reduce, tid, nwarps);
 
-    __shared__ float s_mean, s_inv_std;
+    __shared__ float s_mean, s_scale;
     if (tid == 0) {
-        s_mean = sum / D;
-        s_inv_std = rsqrtf(sumsq / D - s_mean * s_mean + eps);
+        if (rmsnorm) {
+            s_mean  = 0.0f;
+            s_scale = rsqrtf(sumsq / D + eps);
+        } else {
+            float m = sum / D;
+            s_mean  = m;
+            s_scale = rsqrtf(sumsq / D - m * m + eps);
+        }
     }
     __syncthreads();
 
-    float mean = s_mean, inv_std = s_inv_std;
-    for (int i = tid; i < D; i += block_size) {
-        float val = __half2float(x_row[i]);
-        if (r_row) val += __half2float(r_row[i]);
-        if (bias)  val += __half2float(bias[i]);
-        float normalized = (val - mean) * inv_std;
-        out_row[i] = __float2half(normalized * __half2float(gamma[i]) + __half2float(beta[i]));
-    }
-}
+    float mean  = s_mean;
+    float scale = s_scale;
 
-__global__ void fused_rmsnorm_residual_kernel(
-    const half* __restrict__ input,
-    const half* __restrict__ residual,
-    const half* __restrict__ gamma,
-    half*       __restrict__ output,
-    half*       __restrict__ residual_out,
-    const int   D,
-    const float eps
-) {
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-    const int block_size = blockDim.x;
-    extern __shared__ float smem[];
-
-    const half* x_row = input + static_cast<size_t>(row) * D;
-    const half* r_row = residual ? (residual + static_cast<size_t>(row) * D) : nullptr;
-    half* out_row = output + static_cast<size_t>(row) * D;
-    half* res_out_row = residual_out ? (residual_out + static_cast<size_t>(row) * D) : nullptr;
-
-    float local_sumsq = 0.0f;
-    for (int i = tid; i < D; i += block_size) {
-        float val = __half2float(x_row[i]);
-        if (r_row) val += __half2float(r_row[i]);
-        if (res_out_row) res_out_row[i] = __float2half(val);
-        local_sumsq += val * val;
-    }
-
-    float sumsq = block_reduce_sum_ln(local_sumsq, smem, tid, block_size);
-
-    __shared__ float s_inv_rms;
-    if (tid == 0) s_inv_rms = rsqrtf(sumsq / D + eps);
-    __syncthreads();
-
-    float inv_rms = s_inv_rms;
-    for (int i = tid; i < D; i += block_size) {
-        float val = __half2float(x_row[i]);
-        if (r_row) val += __half2float(r_row[i]);
-        out_row[i] = __float2half(val * inv_rms * __half2float(gamma[i]));
+    // ---- Normalize from cache (zero global re-reads) ----
+    for (int i = tid; i < D2; i += nthreads) {
+        float vx = row_cache[i * 2];
+        float vy = row_cache[i * 2 + 1];
+        float2 gf = __half22float2(((const half2*)gamma)[i]);
+        float nx, ny;
+        if (rmsnorm) {
+            nx = vx * scale * gf.x;
+            ny = vy * scale * gf.y;
+        } else {
+            float2 bf = __half22float2(((const half2*)beta)[i]);
+            nx = (vx - mean) * scale * gf.x + bf.x;
+            ny = (vy - mean) * scale * gf.y + bf.y;
+        }
+        ((half2*)o_ptr)[i] = __float22half2_rn({nx, ny});
     }
 }
 
@@ -124,22 +133,20 @@ __global__ void fused_rmsnorm_residual_kernel(
 // Launch
 // ============================================================================
 void launch_fused_layernorm(const LayerNormParams& params) {
-    const int block_size = min(params.d_model, tuning::LN_BLOCK_SIZE);
-    const int grid_size  = params.num_tokens;
-    const size_t smem_bytes = (block_size / 32 + 1) * sizeof(float);
+    int block_size = min(params.d_model / 2, 1024);
+    block_size = max(block_size, 32);
+    block_size = (block_size + 31) / 32 * 32;
 
-    if (params.use_rmsnorm) {
-        fused_rmsnorm_residual_kernel<<<grid_size, block_size, smem_bytes, params.stream>>>(
-            params.input, params.residual, params.gamma,
-            params.output, params.residual_out,
-            params.d_model, params.eps);
-    } else {
-        fused_layernorm_residual_kernel<<<grid_size, block_size, smem_bytes, params.stream>>>(
-            params.input, params.residual, params.bias,
-            params.gamma, params.beta,
-            params.output, params.residual_out,
-            params.d_model, params.eps);
-    }
+    const int nwarps = block_size / 32;
+    const size_t smem_reduce = (nwarps + 1) * sizeof(float);
+    const size_t smem_cache  = params.d_model * sizeof(float);
+    const size_t smem_total  = smem_reduce + smem_cache;
+
+    layernorm_singlepass_kernel<<<params.num_tokens, block_size, smem_total, params.stream>>>(
+        params.input, params.residual, params.bias,
+        params.gamma, params.beta,
+        params.output, params.residual_out,
+        params.d_model, params.eps, params.use_rmsnorm);
     CUDA_CHECK(cudaGetLastError());
 }
 
