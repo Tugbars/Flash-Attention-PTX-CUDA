@@ -189,6 +189,9 @@ int main(int argc, char** argv) {
     benchmark_gemm(2048, config.d_model, config.d_ffn);
     benchmark_flash_attention(1, config.n_heads, 512, config.d_head);
     benchmark_flash_attention(1, config.n_heads, 2048, config.d_head);
+    benchmark_flash_attention(4, 12, 2048, 64); // 384 blocks → 4.6/SM
+    benchmark_flash_attention(8, 12, 2048, 64); // 768 blocks → 9.1/SM
+    benchmark_flash_attention(1, 12, 4096, 64); // 768 blocks
 
     printf("\n============================================\n");
     printf("All benchmarks complete.\n");
