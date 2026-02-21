@@ -96,8 +96,11 @@ __global__ void flash_attention_ptx_kernel(
     half*  smem_k = smem_q + BLOCK_M * Q_STRIDE;
     half*  smem_v = smem_k + BLOCK_N * KV_STRIDE;
     half*  smem_p = smem_v + BLOCK_N * KV_STRIDE;
-    // Cross-warp exchange: [2][BLOCK_M] for partial_max, [2][BLOCK_M] for partial_sum
-    float* smem_xchg = reinterpret_cast<float*>(smem_p + BLOCK_M * P_STRIDE);
+    // DEBUG: add smem_s back to test if MMA+P*V are correct
+    constexpr int S_STRIDE = BLOCK_N;
+    float* smem_s = reinterpret_cast<float*>(smem_p + BLOCK_M * P_STRIDE);
+    // Cross-warp exchange after smem_s
+    float* smem_xchg = smem_s + BLOCK_M * S_STRIDE;
     float* smem_partial_max = smem_xchg;
     float* smem_partial_sum = smem_xchg + 2 * BLOCK_M;
 
@@ -192,8 +195,12 @@ __global__ void flash_attention_ptx_kernel(
                     {
                         int row = lane_id % 16;
                         int col = (lane_id / 16) * 8;
-                        ldmatrix_x4(a0, a1, a2, a3,
+                        uint32_t r0, r1, r2, r3;
+                        ldmatrix_x4(r0, r1, r2, r3,
                             smem_q + (mi * 16 + row) * Q_STRIDE + ki * 16 + col);
+                        // ldmatrix returns: r0=top-left, r1=bottom-left, r2=top-right, r3=bottom-right
+                        // MMA expects: a0=top-left, a1=top-right, a2=bottom-left, a3=bottom-right
+                        a0 = r0; a1 = r2; a2 = r1; a3 = r3;
                     }
 
                     uint32_t b0, b1;
@@ -230,73 +237,67 @@ __global__ void flash_attention_ptx_kernel(
             }
         }
 
-        // === Step B: In-register softmax ===================================
-        // Phase 1: Partial max within this warp (32 cols)
-        float partial_max0 = -FLT_MAX, partial_max1 = -FLT_MAX;
+        // === Step B: DEBUG — write S to smem_s, do old-style softmax ========
+        // Write s_acc to smem_s
         #pragma unroll
-        for (int ni = 0; ni < QK_TILES_PER_WARP; ni++) {
-            partial_max0 = fmaxf(partial_max0, fmaxf(s_acc[ni][0], s_acc[ni][1]));
-            partial_max1 = fmaxf(partial_max1, fmaxf(s_acc[ni][2], s_acc[ni][3]));
-        }
-        #pragma unroll
-        for (int delta = 1; delta < 4; delta <<= 1) {
-            partial_max0 = fmaxf(partial_max0, __shfl_xor_sync(0xFFFFFFFF, partial_max0, delta));
-            partial_max1 = fmaxf(partial_max1, __shfl_xor_sync(0xFFFFFFFF, partial_max1, delta));
-        }
-
-        // Phase 2: Exchange partial max between warp halves
-        if (lane_id % 4 == 0) {
-            smem_partial_max[warp_half * BLOCK_M + global_row0] = partial_max0;
-            smem_partial_max[warp_half * BLOCK_M + global_row1] = partial_max1;
+        for (int ni_local = 0; ni_local < QK_TILES_PER_WARP; ni_local++) {
+            int ni = warp_half * QK_TILES_PER_WARP + ni_local;
+            int s_col0 = ni * 8 + (lane_id % 4) * 2;
+            int s_col1 = s_col0 + 1;
+            smem_s[global_row0 * S_STRIDE + s_col0] = s_acc[ni_local][0];
+            smem_s[global_row0 * S_STRIDE + s_col1] = s_acc[ni_local][1];
+            smem_s[global_row1 * S_STRIDE + s_col0] = s_acc[ni_local][2];
+            smem_s[global_row1 * S_STRIDE + s_col1] = s_acc[ni_local][3];
         }
         __syncthreads();
 
-        float other_pmax0 = smem_partial_max[(1 - warp_half) * BLOCK_M + global_row0];
-        float other_pmax1 = smem_partial_max[(1 - warp_half) * BLOCK_M + global_row1];
-        float tile_max0 = fmaxf(partial_max0, other_pmax0);
-        float tile_max1 = fmaxf(partial_max1, other_pmax1);
+        // Old-style softmax: 8 warps, 8 rows each
+        {
+            constexpr int ROWS_PER_WARP = BLOCK_M / NUM_WARPS;
+            constexpr int S_PER_LANE = BLOCK_N / WARP_SIZE_FA;
 
-        // Phase 3: Compute exp, partial sum, write P to smem
-        float partial_sum0 = 0.0f, partial_sum1 = 0.0f;
-        #pragma unroll
-        for (int ni = 0; ni < QK_TILES_PER_WARP; ni++) {
-            float e0 = (s_acc[ni][0] > -FLT_MAX * 0.5f) ? expf(s_acc[ni][0] - tile_max0) : 0.0f;
-            float e1 = (s_acc[ni][1] > -FLT_MAX * 0.5f) ? expf(s_acc[ni][1] - tile_max0) : 0.0f;
-            float e2 = (s_acc[ni][2] > -FLT_MAX * 0.5f) ? expf(s_acc[ni][2] - tile_max1) : 0.0f;
-            float e3 = (s_acc[ni][3] > -FLT_MAX * 0.5f) ? expf(s_acc[ni][3] - tile_max1) : 0.0f;
+            #pragma unroll
+            for (int r = 0; r < ROWS_PER_WARP; r++) {
+                int q_row = warp_id * ROWS_PER_WARP + r;
+                float cached_s[S_PER_LANE];
+                float tile_max = -FLT_MAX;
 
-            partial_sum0 += e0 + e1;
-            partial_sum1 += e2 + e3;
+                #pragma unroll
+                for (int j = lane_id; j < BLOCK_N; j += WARP_SIZE_FA) {
+                    float s = smem_s[q_row * S_STRIDE + j];
+                    if (j >= kv_count) s = -FLT_MAX;
+                    cached_s[j / WARP_SIZE_FA] = s;
+                    tile_max = fmaxf(tile_max, s);
+                }
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    tile_max = fmaxf(tile_max, __shfl_xor_sync(0xFFFFFFFF, tile_max, offset));
 
-            int ni_global = warp_half * QK_TILES_PER_WARP + ni;
-            int p_col0 = ni_global * 8 + (lane_id % 4) * 2;
-            int p_col1 = p_col0 + 1;
-            smem_p[global_row0 * P_STRIDE + p_col0] = __float2half(e0);
-            smem_p[global_row0 * P_STRIDE + p_col1] = __float2half(e1);
-            smem_p[global_row1 * P_STRIDE + p_col0] = __float2half(e2);
-            smem_p[global_row1 * P_STRIDE + p_col1] = __float2half(e3);
-        }
+                float tile_sum = 0.0f;
+                #pragma unroll
+                for (int j = lane_id; j < BLOCK_N; j += WARP_SIZE_FA) {
+                    float e = expf(cached_s[j / WARP_SIZE_FA] - tile_max);
+                    tile_sum += e;
+                    smem_p[q_row * P_STRIDE + j] = __float2half(e);
+                }
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    tile_sum += __shfl_xor_sync(0xFFFFFFFF, tile_sum, offset);
 
-        #pragma unroll
-        for (int delta = 1; delta < 4; delta <<= 1) {
-            partial_sum0 += __shfl_xor_sync(0xFFFFFFFF, partial_sum0, delta);
-            partial_sum1 += __shfl_xor_sync(0xFFFFFFFF, partial_sum1, delta);
-        }
-
-        // Phase 4: Exchange partial sums
-        if (lane_id % 4 == 0) {
-            smem_partial_sum[warp_half * BLOCK_M + global_row0] = partial_sum0;
-            smem_partial_sum[warp_half * BLOCK_M + global_row1] = partial_sum1;
+                // Store tile_max/tile_sum to smem for correction step
+                if (lane_id == 0) {
+                    smem_partial_max[q_row] = tile_max;
+                    smem_partial_sum[q_row] = tile_sum;
+                }
+            }
         }
         __syncthreads();
-
-        float other_psum0 = smem_partial_sum[(1 - warp_half) * BLOCK_M + global_row0];
-        float other_psum1 = smem_partial_sum[(1 - warp_half) * BLOCK_M + global_row1];
-        float tile_sum0 = partial_sum0 + other_psum0;
-        float tile_sum1 = partial_sum1 + other_psum1;
 
         // === Step C: Online softmax correction on O accumulators ============
         {
+            float tile_max0 = smem_partial_max[global_row0];
+            float tile_max1 = smem_partial_max[global_row1];
+            float tile_sum0 = smem_partial_sum[global_row0];
+            float tile_sum1 = smem_partial_sum[global_row1];
+
             float prev_max0 = row_max0, prev_max1 = row_max1;
             float new_max0 = fmaxf(prev_max0, tile_max0);
             float new_max1 = fmaxf(prev_max1, tile_max1);
@@ -308,18 +309,12 @@ __global__ void flash_attention_ptx_kernel(
             row_sum0 = row_sum0 * corr0 + tile_sum0;
             row_sum1 = row_sum1 * corr1 + tile_sum1;
 
-            if (warp_half == 0) {
-                #pragma unroll
-                for (int di = 0; di < PV_TILES_PER_WARP; di++) {
-                    o_acc[di][0] *= corr0;
-                    o_acc[di][1] *= corr0;
-                }
-            } else {
-                #pragma unroll
-                for (int di = 0; di < PV_TILES_PER_WARP; di++) {
-                    o_acc[di][2] *= corr1;
-                    o_acc[di][3] *= corr1;
-                }
+            #pragma unroll
+            for (int di = 0; di < PV_TILES_PER_WARP; di++) {
+                o_acc[di][0] *= corr0;
+                o_acc[di][1] *= corr0;
+                o_acc[di][2] *= corr1;
+                o_acc[di][3] *= corr1;
             }
         }
 
@@ -335,8 +330,10 @@ __global__ void flash_attention_ptx_kernel(
                     {
                         int row = lane_id % 16;
                         int col = (lane_id / 16) * 8;
-                        ldmatrix_x4(a0, a1, a2, a3,
+                        uint32_t r0, r1, r2, r3;
+                        ldmatrix_x4(r0, r1, r2, r3,
                             smem_p + (mi * 16 + row) * P_STRIDE + ki * 16 + col);
+                        a0 = r0; a1 = r2; a2 = r1; a3 = r3;
                     }
 
                     uint32_t b0, b1;
@@ -415,7 +412,8 @@ void launch_flash_attention(const FlashAttentionParams& params) {
     smem_bytes += BLOCK_N * KV_STRIDE * sizeof(half);
     smem_bytes += BLOCK_N * KV_STRIDE * sizeof(half);
     smem_bytes += BLOCK_M * P_STRIDE * sizeof(half);
-    smem_bytes += 4 * BLOCK_M * sizeof(float);  // partial_max[2][64] + partial_sum[2][64]
+    smem_bytes += BLOCK_M * BLOCK_N * sizeof(float);         // smem_s (DEBUG)
+    smem_bytes += 4 * BLOCK_M * sizeof(float);  // partial_max + partial_sum
 
     if (smem_bytes > 48 * 1024) {
         if (params.causal) {
