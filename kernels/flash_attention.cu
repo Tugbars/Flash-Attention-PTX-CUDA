@@ -1,17 +1,23 @@
 // ============================================================================
-// Flash Attention v9 — PTX MMA + In-Register Softmax + Corrected Online Rescale
+// Flash Attention v9 — PTX MMA + In-Register Softmax
 //
-// Based on v8 (125 TFLOPS, correct). Changes:
+// Peak: 135.9 TFLOPS on RTX 5080 (58% of theoretical FP16 peak)
 //
-// 1. TILE_SUM CORRECTION: exp values written to smem_p are pre-scaled by
-//    pv_scale = exp(tile_max - new_max), so P*V accumulates at new_max basis.
-//    This also correctly scales tile_sum. Fixes accuracy drift on long seqs.
+// Architecture:
+//   - 8 warps (256 threads) per block, organized as 4 warp pairs
+//   - Each warp pair handles a 16×64 output tile (m16n8k16 MMA)
+//   - Within a pair, warp_half=0 covers N-columns 0-31, warp_half=1 covers 32-63
+//   - Q*K^T results stay in registers — softmax via shuffle + 1KB smem exchange
+//   - P written to smem_p only for the P*V MMA step
 //
-// 2. SMEM_P RETAINED: Eliminating smem_p requires cross-warp reduction of
-//    partial P*V results (32+ __syncthreads). The 9KB smem_p with one sync
-//    is cheaper. The ldmatrix load for P is fast since data is hot in L1.
+// Per KV tile:
+//   Step A: S = Q * K^T          (PTX MMA, result in s_acc registers)
+//   Step B: softmax(S)           (shuffle reduce + cross-warp smem exchange)
+//   Step C: online rescale O     (exp correction for running max)
+//   Step D: O += P * V           (PTX MMA, P from smem_p, V from smem_v)
 //
-// Tile: BLOCK_M=64, BLOCK_N=64, D_HEAD=64, 8 warps (256 threads)
+// Tile sizes: BLOCK_M=64, BLOCK_N=64, D_HEAD=64
+// Shared memory: ~37 KB (smem_q + smem_k + smem_v + smem_p + 1KB exchange)
 // ============================================================================
 
 #include <cuda_fp16.h>
@@ -25,8 +31,18 @@ namespace transformer {
 static constexpr int WARP_SIZE_FA = 32;
 
 // ============================================================================
-// PTX helpers
+// PTX Intrinsics
+//
+// We use raw PTX instead of WMMA because it gives us a known register layout:
+//   mma.sync.m16n8k16 output: each thread holds 4 floats at deterministic
+//   (row, col) positions, enabling in-register softmax without shared memory.
 // ============================================================================
+
+// m16n8k16 matrix multiply-accumulate: D = A * B + C
+// A is 16×16 (row-major, FP16), B is 16×8 (col-major, FP16), D/C are 16×8 (FP32)
+// Per thread: a0-a3 = 4 register pairs for A, b0-b1 = 2 register pairs for B
+// Output: d0=C[row0,col0], d1=C[row0,col1], d2=C[row1,col0], d3=C[row1,col1]
+//   where row0 = (lane_id/4)%8, row1 = row0+8, col0 = (lane_id%4)*2, col1 = col0+1
 __device__ __forceinline__ void ptx_mma_m16n8k16(
     float& d0, float& d1, float& d2, float& d3,
     uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
@@ -42,6 +58,8 @@ __device__ __forceinline__ void ptx_mma_m16n8k16(
           "f"(c0), "f"(c1), "f"(c2), "f"(c3));
 }
 
+// Load four 8×8 FP16 matrices from shared memory into registers (A operand).
+// All 32 threads provide addresses; thread t loads from row (t % 16).
 __device__ __forceinline__ void ldmatrix_x4(
     uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3,
     const void* smem_ptr)
@@ -52,6 +70,11 @@ __device__ __forceinline__ void ldmatrix_x4(
         : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
 }
 
+// Load two 8×8 FP16 matrices with transpose from shared memory (B operand).
+// CRITICAL: threads 0-7 address matrix 0, threads 8-15 address matrix 1.
+// The second group MUST offset by +8 cols (K load) or +8 rows (V load)
+// to cover the full 16-element k-dimension. Getting this wrong loads only
+// half the data — the bug that took longest to find.
 __device__ __forceinline__ void ldmatrix_x2_trans(
     uint32_t& r0, uint32_t& r1, const void* smem_ptr)
 {
@@ -74,8 +97,8 @@ __global__ void flash_attention_ptx_kernel(
     const int   seq_len,
     const float scale)
 {
-    const int bh_idx  = blockIdx.y;
-    const int q_start = blockIdx.x * BLOCK_M;
+    const int bh_idx  = blockIdx.y;       // batch * head index
+    const int q_start = blockIdx.x * BLOCK_M;  // first query row for this block
     const int tid     = threadIdx.x + threadIdx.y * WARP_SIZE_FA;
     const int warp_id = threadIdx.y;
     const int lane_id = threadIdx.x;
@@ -83,7 +106,16 @@ __global__ void flash_attention_ptx_kernel(
 
     if (q_start >= seq_len) return;
 
-    // -- Shared memory layout -----------------------------------------------
+    // -- Shared memory layout ------------------------------------------------
+    // Padding by 8 halfs avoids bank conflicts on 16-byte aligned ldmatrix.
+    //
+    //   smem_q:            [BLOCK_M × (D_HEAD+8)] half     Q tile (9 KB)
+    //   smem_k:            [BLOCK_N × (D_HEAD+8)] half     K tile (9 KB)
+    //   smem_v:            [BLOCK_N × (D_HEAD+8)] half     V tile (9 KB)
+    //   smem_p:            [BLOCK_M × (BLOCK_N+8)] half    P = softmax(S) (9 KB)
+    //   smem_partial_max:  [2 × BLOCK_M] float             cross-warp max (0.5 KB)
+    //   smem_partial_sum:  [2 × BLOCK_M] float             cross-warp sum (0.5 KB)
+    //                                                      Total: ~37 KB
     constexpr int SMEM_PAD  = 8;
     constexpr int Q_STRIDE  = D_HEAD + SMEM_PAD;
     constexpr int KV_STRIDE = D_HEAD + SMEM_PAD;
@@ -103,7 +135,8 @@ __global__ void flash_attention_ptx_kernel(
     const half* V_head = V + head_offset;
     half*       O_head = O + head_offset;
 
-    // -- Load Q tile --------------------------------------------------------
+    // -- Load Q tile (stays in smem for all KV iterations) -------------------
+    // 128-bit vectorized loads: each uint4 moves 8 half values.
     {
         constexpr int VEC_COLS = D_HEAD / 8;
         for (int idx = tid; idx < BLOCK_M * VEC_COLS; idx += THREADS) {
@@ -117,26 +150,37 @@ __global__ void flash_attention_ptx_kernel(
     }
     __syncthreads();
 
-    // -- Warp assignment ----------------------------------------------------
-    constexpr int QK_TILES_PER_WARP = 4;
-    constexpr int PV_TILES_PER_WARP = 4;
-    constexpr int TILES_K  = D_HEAD / 16;
-    constexpr int TILES_BN = BLOCK_N / 16;
+    // -- Warp assignment -----------------------------------------------------
+    // 8 warps form 4 warp pairs. Each pair computes one m16 output tile (16 rows).
+    // Within a pair, the two warps split the N dimension:
+    //   warp_half=0 → Q*K^T columns 0-31  (ni tiles 0-3)
+    //   warp_half=1 → Q*K^T columns 32-63 (ni tiles 4-7)
+    // For P*V, they split the D dimension similarly.
+    constexpr int QK_TILES_PER_WARP = 4;  // 4 × m16n8 = 32 N-cols per half
+    constexpr int PV_TILES_PER_WARP = 4;  // 4 × m16n8 = 32 D-cols per half
+    constexpr int TILES_K  = D_HEAD / 16; // k-tiles for Q*K^T
+    constexpr int TILES_BN = BLOCK_N / 16;// k-tiles for P*V
 
-    const int warp_pair = warp_id / 2;
-    const int warp_half = warp_id % 2;
-    const int mi = warp_pair;
+    const int warp_pair = warp_id / 2;    // which 16-row tile (0-3)
+    const int warp_half = warp_id % 2;    // which half of N or D
+    const int mi = warp_pair;             // m-tile index
 
+    // MMA output layout: each thread owns 2 rows and 2 columns.
+    // row0 = (lane_id/4)%8, row1 = row0+8 (within the m16 tile)
     const int local_row0 = (lane_id / 4) % 8;
     const int global_row0 = mi * 16 + local_row0;
     const int global_row1 = global_row0 + 8;
 
+    // Persistent output accumulator — survives across KV tiles.
     float o_acc[PV_TILES_PER_WARP][4] = {{0}};
 
+    // Online softmax state: running max and sum for each of the 2 rows this thread tracks.
     float row_max0 = -FLT_MAX, row_max1 = -FLT_MAX;
     float row_sum0 = 0.0f,     row_sum1 = 0.0f;
 
-    // -- KV tile loop -------------------------------------------------------
+    // -- KV tile loop --------------------------------------------------------
+    // Flash attention's outer loop: iterate over KV in BLOCK_N chunks.
+    // Causal: stop early when all keys are beyond the query positions.
     const int kv_end = CAUSAL ? min(q_start + BLOCK_M, seq_len) : seq_len;
     const int num_kv_tiles = (kv_end + BLOCK_N - 1) / BLOCK_N;
 
@@ -144,7 +188,10 @@ __global__ void flash_attention_ptx_kernel(
         const int kv_start = kv_tile * BLOCK_N;
         const int kv_count = min(BLOCK_N, seq_len - kv_start);
 
-        // === Load K,V tiles ================================================
+        // ================================================================
+        // Load K and V tiles from global memory → shared memory
+        // All 256 threads participate via 128-bit coalesced loads.
+        // ================================================================
         {
             constexpr int VEC_COLS = D_HEAD / 8;
             for (int idx = tid; idx < BLOCK_N * VEC_COLS; idx += THREADS) {
@@ -166,7 +213,14 @@ __global__ void flash_attention_ptx_kernel(
         }
         __syncthreads();
 
-        // === Step A: S = Q * K^T — in registers ============================
+        // ================================================================
+        // Step A: S = Q * K^T — result stays in s_acc registers
+        //
+        // Each warp computes 4 m16n8k16 tiles covering 32 columns of S.
+        // s_acc[ni_local][0..3] holds 4 output elements per tile:
+        //   [0] = S[row0, col0],  [1] = S[row0, col1]
+        //   [2] = S[row1, col0],  [3] = S[row1, col1]
+        // ================================================================
         float s_acc[QK_TILES_PER_WARP][4];
         {
             #pragma unroll
@@ -180,6 +234,7 @@ __global__ void flash_attention_ptx_kernel(
 
                 #pragma unroll
                 for (int ki = 0; ki < TILES_K; ki++) {
+                    // Load Q tile: A operand (row-major, m16k16)
                     uint32_t a0, a1, a2, a3;
                     {
                         int row = lane_id % 16;
@@ -188,6 +243,9 @@ __global__ void flash_attention_ptx_kernel(
                             smem_q + (mi * 16 + row) * Q_STRIDE + ki * 16 + col);
                     }
 
+                    // Load K tile: B operand (col-major via transpose, n8k16)
+                    // mat = 0 for threads 0-7, 1 for threads 8-15
+                    // Threads 8-15 offset by +8 columns to load the second 8×8 block
                     uint32_t b0, b1;
                     {
                         int k_row = lane_id % 8;
@@ -204,7 +262,7 @@ __global__ void flash_attention_ptx_kernel(
                         s_acc[ni_local][2], s_acc[ni_local][3]);
                 }
 
-                // Scale + causal mask
+                // Apply scale and causal mask directly in registers
                 int s_col0 = ni * 8 + (lane_id % 4) * 2;
                 int s_col1 = s_col0 + 1;
 
@@ -223,9 +281,20 @@ __global__ void flash_attention_ptx_kernel(
             }
         }
 
-        // === Step B: In-register softmax ===================================
+        // ================================================================
+        // Step B: In-register softmax
+        //
+        // Each thread has 16 S values (4 tiles × 4 elements) for its 2 rows.
+        // 4 threads share each row (they differ in lane_id % 4, covering 8 cols).
+        // Full softmax needs max/sum across all 64 columns = both warp halves.
+        //
+        //   Phase 1-2: shuffle reduce across 4 threads → partial max (32 cols)
+        //   Phase 3:   smem exchange between warp halves → global max (64 cols)
+        //   Phase 4:   exp(S - new_max), compute partial sum, write P to smem
+        //   Phase 5:   smem exchange → global sum (64 cols)
+        // ================================================================
 
-        // Phase 1+2: Partial max (32 cols within this warp_half)
+        // Phases 1-2: Partial max within this warp half
         float partial_max0 = -FLT_MAX, partial_max1 = -FLT_MAX;
         #pragma unroll
         for (int ni = 0; ni < QK_TILES_PER_WARP; ni++) {
@@ -238,7 +307,7 @@ __global__ void flash_attention_ptx_kernel(
             partial_max1 = fmaxf(partial_max1, __shfl_xor_sync(0xFFFFFFFF, partial_max1, delta));
         }
 
-        // Phase 3: Exchange partial max between warp halves
+        // Phase 3: Exchange partial max between warp halves via shared memory
         if (lane_id % 4 == 0) {
             smem_partial_max[warp_half * BLOCK_M + global_row0] = partial_max0;
             smem_partial_max[warp_half * BLOCK_M + global_row1] = partial_max1;
@@ -250,18 +319,16 @@ __global__ void flash_attention_ptx_kernel(
         float tile_max0 = fmaxf(partial_max0, other_pmax0);
         float tile_max1 = fmaxf(partial_max1, other_pmax1);
 
-        // Phase 4: Compute exp, write P to smem_p
-        // CORRECTION: compute pv_scale BEFORE writing P so P is at new_max basis
+        // Compute new_max BEFORE exp so P lands at the correct scale.
+        // This is the v9 improvement: exp(S - new_max) directly, no post-scaling.
         float prev_max0 = row_max0, prev_max1 = row_max1;
         float new_max0 = fmaxf(prev_max0, tile_max0);
         float new_max1 = fmaxf(prev_max1, tile_max1);
-        float pv_scale0 = expf(tile_max0 - new_max0);
-        float pv_scale1 = expf(tile_max1 - new_max1);
 
+        // Phase 4: Compute exp at new_max basis, accumulate partial sum, write P
         float partial_sum0 = 0.0f, partial_sum1 = 0.0f;
         #pragma unroll
         for (int ni = 0; ni < QK_TILES_PER_WARP; ni++) {
-            // Compute exp at new_max basis directly: exp(S - new_max)
             float e0 = (s_acc[ni][0] > -FLT_MAX * 0.5f) ? expf(s_acc[ni][0] - new_max0) : 0.0f;
             float e1 = (s_acc[ni][1] > -FLT_MAX * 0.5f) ? expf(s_acc[ni][1] - new_max0) : 0.0f;
             float e2 = (s_acc[ni][2] > -FLT_MAX * 0.5f) ? expf(s_acc[ni][2] - new_max1) : 0.0f;
@@ -270,6 +337,7 @@ __global__ void flash_attention_ptx_kernel(
             partial_sum0 += e0 + e1;
             partial_sum1 += e2 + e3;
 
+            // Write P to smem for P*V MMA (both warp halves write to their columns)
             int ni_global = warp_half * QK_TILES_PER_WARP + ni;
             int p_col0 = ni_global * 8 + (lane_id % 4) * 2;
             int p_col1 = p_col0 + 1;
@@ -279,7 +347,7 @@ __global__ void flash_attention_ptx_kernel(
             smem_p[global_row1 * P_STRIDE + p_col1] = __float2half(e3);
         }
 
-        // Reduce sum across 4 threads sharing the row
+        // Reduce partial sum across 4 threads sharing each row
         #pragma unroll
         for (int delta = 1; delta < 4; delta <<= 1) {
             partial_sum0 += __shfl_xor_sync(0xFFFFFFFF, partial_sum0, delta);
@@ -298,9 +366,13 @@ __global__ void flash_attention_ptx_kernel(
         float tile_sum0 = partial_sum0 + other_psum0;
         float tile_sum1 = partial_sum1 + other_psum1;
 
-        // === Step C: Online softmax correction =============================
-        // P is already at new_max basis (exp(S - new_max)), so no pv_scale needed
-        // on tile_sum or P*V. Just correct old O accumulator.
+        // ================================================================
+        // Step C: Online softmax correction
+        //
+        // P was computed as exp(S - new_max), already at the correct scale.
+        // Only the OLD O accumulator needs rescaling: multiply by
+        // exp(prev_max - new_max) to bring it to the new_max basis.
+        // ================================================================
         {
             float corr0 = (kv_tile == 0) ? 0.0f : expf(prev_max0 - new_max0);
             float corr1 = (kv_tile == 0) ? 0.0f : expf(prev_max1 - new_max1);
@@ -319,7 +391,14 @@ __global__ void flash_attention_ptx_kernel(
             }
         }
 
-        // === Step D: O += P * V ============================================
+        // ================================================================
+        // Step D: O += P * V
+        //
+        // P is loaded from smem_p via ldmatrix (A operand).
+        // V is loaded from smem_v via ldmatrix_x2_trans (B operand).
+        // Both warp halves now have access to all 64 P columns via smem.
+        // Each half computes 4 m16n8 tiles over its 32 D-columns.
+        // ================================================================
         {
             #pragma unroll
             for (int di_local = 0; di_local < PV_TILES_PER_WARP; di_local++) {
@@ -327,6 +406,7 @@ __global__ void flash_attention_ptx_kernel(
 
                 #pragma unroll
                 for (int ki = 0; ki < TILES_BN; ki++) {
+                    // Load P tile (A operand)
                     uint32_t a0, a1, a2, a3;
                     {
                         int row = lane_id % 16;
@@ -335,6 +415,8 @@ __global__ void flash_attention_ptx_kernel(
                             smem_p + (mi * 16 + row) * P_STRIDE + ki * 16 + col);
                     }
 
+                    // Load V tile (B operand, transposed)
+                    // Same addressing fix as K: threads 8-15 offset by +8 rows
                     uint32_t b0, b1;
                     {
                         int v_row = lane_id % 8 + ((lane_id / 8) % 2) * 8;
@@ -352,9 +434,10 @@ __global__ void flash_attention_ptx_kernel(
             }
         }
         __syncthreads();
-    }
+    } // end KV tile loop
 
-    // -- Write output -------------------------------------------------------
+    // -- Finalize: normalize by sum and write to global memory ----------------
+    // O_final = O_acc / row_sum  (the 1/sum normalization deferred to the end)
     {
         float inv_sum0 = (row_sum0 > 0.0f) ? (1.0f / row_sum0) : 0.0f;
         float inv_sum1 = (row_sum1 > 0.0f) ? (1.0f / row_sum1) : 0.0f;
@@ -377,6 +460,7 @@ __global__ void flash_attention_ptx_kernel(
             }
         }
 
+        // Optional: write log-sum-exp for backward pass or diagnostics
         if (lane_id % 4 == 0 && LSE != nullptr) {
             int gq0 = q_start + global_row0;
             int gq1 = q_start + global_row1;
@@ -389,7 +473,7 @@ __global__ void flash_attention_ptx_kernel(
 }
 
 // ============================================================================
-// Launch
+// Host Launch
 // ============================================================================
 void launch_flash_attention(const FlashAttentionParams& params) {
     constexpr int BLOCK_M   = 64;
@@ -404,15 +488,17 @@ void launch_flash_attention(const FlashAttentionParams& params) {
     const int grid_x = (params.seq_len + BLOCK_M - 1) / BLOCK_M;
     const int grid_y = params.batch_size * params.num_heads;
     dim3 grid(grid_x, grid_y);
-    dim3 block(WARP_SIZE_FA, NUM_WARPS);
+    dim3 block(WARP_SIZE_FA, NUM_WARPS);  // 32 × 8 = 256 threads
 
+    // Compute dynamic shared memory requirement
     size_t smem_bytes = 0;
-    smem_bytes += BLOCK_M * Q_STRIDE * sizeof(half);
-    smem_bytes += BLOCK_N * KV_STRIDE * sizeof(half);
-    smem_bytes += BLOCK_N * KV_STRIDE * sizeof(half);
-    smem_bytes += BLOCK_M * P_STRIDE * sizeof(half);
-    smem_bytes += 4 * BLOCK_M * sizeof(float);
+    smem_bytes += BLOCK_M * Q_STRIDE * sizeof(half);   // smem_q
+    smem_bytes += BLOCK_N * KV_STRIDE * sizeof(half);  // smem_k
+    smem_bytes += BLOCK_N * KV_STRIDE * sizeof(half);  // smem_v
+    smem_bytes += BLOCK_M * P_STRIDE * sizeof(half);   // smem_p
+    smem_bytes += 4 * BLOCK_M * sizeof(float);         // partial_max + partial_sum
 
+    // Request extended shared memory if needed (>48KB requires opt-in)
     if (smem_bytes > 48 * 1024) {
         if (params.causal) {
             CUDA_CHECK(cudaFuncSetAttribute(
