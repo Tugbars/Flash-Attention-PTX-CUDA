@@ -22,6 +22,16 @@ namespace transformer {
         }                                                                       \
     } while (0)
 
+#define CUBLAS_CHECK(call)                                                     \
+    do {                                                                        \
+        cublasStatus_t status = (call);                                         \
+        if (status != CUBLAS_STATUS_SUCCESS) {                                  \
+            fprintf(stderr, "cuBLAS error at %s:%d: %d\n", __FILE__, __LINE__, \
+                    static_cast<int>(status));                                  \
+            abort();                                                            \
+        }                                                                       \
+    } while (0)
+
 // ============================================================================
 // GPU Tensor — thin wrapper over device memory
 // ============================================================================

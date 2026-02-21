@@ -13,6 +13,7 @@
 #include <cuda_runtime.h>
 #include <cmath>
 #include "../include/transformer_config.h"
+#include "../include/tensor.h"
 
 namespace transformer {
 

@@ -124,8 +124,8 @@ using GemmFP16_SiLU = cutlass::gemm::device::GemmUniversal<
 class GemmManager {
 public:
     GemmManager() {
-        CUDA_CHECK(cublasCreate(&cublas_handle_));
-        CUDA_CHECK(cublasSetMathMode(cublas_handle_, CUBLAS_TENSOR_OP_MATH));
+        CUBLAS_CHECK(cublasCreate(&cublas_handle_));
+        CUBLAS_CHECK(cublasSetMathMode(cublas_handle_, CUBLAS_TENSOR_OP_MATH));
     }
 
     ~GemmManager() {
@@ -133,7 +133,7 @@ public:
     }
 
     void set_stream(cudaStream_t stream) {
-        CUDA_CHECK(cublasSetStream(cublas_handle_, stream));
+        CUBLAS_CHECK(cublasSetStream(cublas_handle_, stream));
         stream_ = stream;
     }
 

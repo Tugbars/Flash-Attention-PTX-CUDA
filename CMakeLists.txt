@@ -62,7 +62,7 @@ target_compile_options(cuda_transformer PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
         --expt-relaxed-constexpr
         --expt-extended-lambda
-        -Xcompiler=-fPIC
+        $<$<NOT:$<PLATFORM_ID:Windows>>:-Xcompiler=-fPIC>
     >
 )
 

@@ -195,8 +195,12 @@ int main(int argc, char** argv) {
     printf("SMs: %d\n", prop.multiProcessorCount);
     printf("Memory: %.1f GB\n", prop.totalGlobalMem / 1e9);
     printf("Compute: %d.%d\n", prop.major, prop.minor);
+
+    // Get clock rate via attribute API (clockRate removed in CUDA 13+)
+    int clock_khz = 0;
+    cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, 0);
     printf("Peak FP16: %.1f TFLOPS (theoretical)\n",
-           2.0 * prop.multiProcessorCount * prop.clockRate * 1e-6 *
+           2.0 * prop.multiProcessorCount * clock_khz * 1e-6 *
            (prop.major >= 8 ? 256 : 128) / 1e3);  // Approximate
     printf("============================================\n");
 
