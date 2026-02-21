@@ -234,7 +234,7 @@ __global__ void test_mma_kernel(float* result) {
     // Load B via ldmatrix.x2.trans
     uint32_t b0, b1;
     {
-        int row = lane_id % 8;
+        int row = lane_id % 8 + ((lane_id / 8) % 2) * 8;
         test_ldmatrix_x2_trans(b0, b1, smem_b + row * B_STRIDE);
     }
 
