@@ -231,6 +231,11 @@ __global__ void flash_attention_ptx_kernel(
         __syncthreads();
 
         // === Step B: Softmax (old-style, via smem_s) =======================
+        // Use smem arrays for per-row tile_max and tile_sum so all warps can
+        // read any row's values for correction.
+        // Reuse smem_s tail for these (only need 2*BLOCK_M floats = 512 bytes)
+        float* smem_tile_max = reinterpret_cast<float*>(smem_p + BLOCK_M * P_STRIDE);
+        float* smem_tile_sum = smem_tile_max + BLOCK_M;
         {
             constexpr int ROWS_PER_WARP = BLOCK_M / NUM_WARPS;  // 8
             constexpr int S_PER_LANE = BLOCK_N / WARP_SIZE_FA;  // 2
@@ -263,45 +268,41 @@ __global__ void flash_attention_ptx_kernel(
                 for (int offset = 16; offset > 0; offset >>= 1)
                     tile_sum += __shfl_xor_sync(0xFFFFFFFF, tile_sum, offset);
 
-                // Online correction for matching MMA rows
-                int my_mma_local_row = (lane_id / 4) % 8;
-                int softmax_warp_pair = q_row / 16;
-                int softmax_local_row = q_row % 16;
-
-                // Map softmax row to correction target:
-                // Each thread has o_acc for row0 (global_row0) and row1 (global_row1)
-                // Update if this softmax row matches either
-                if (softmax_warp_pair == warp_pair) {
-                    if (softmax_local_row < 8 && softmax_local_row == my_mma_local_row) {
-                        // row0 match
-                        float prev_max = row_max0;
-                        float new_max = fmaxf(prev_max, tile_max);
-                        float corr = (kv_tile == 0) ? 0.0f : expf(prev_max - new_max);
-                        row_max0 = new_max;
-                        row_sum0 = row_sum0 * corr + tile_sum;
-                        #pragma unroll
-                        for (int di = 0; di < PV_TILES_PER_WARP; di++) {
-                            o_acc[di][0] *= corr;
-                            o_acc[di][1] *= corr;
-                        }
-                    }
-                    if (softmax_local_row >= 8 && (softmax_local_row - 8) == my_mma_local_row) {
-                        // row1 match
-                        float prev_max = row_max1;
-                        float new_max = fmaxf(prev_max, tile_max);
-                        float corr = (kv_tile == 0) ? 0.0f : expf(prev_max - new_max);
-                        row_max1 = new_max;
-                        row_sum1 = row_sum1 * corr + tile_sum;
-                        #pragma unroll
-                        for (int di = 0; di < PV_TILES_PER_WARP; di++) {
-                            o_acc[di][2] *= corr;
-                            o_acc[di][3] *= corr;
-                        }
-                    }
+                // Store per-row max and sum to smem
+                if (lane_id == 0) {
+                    smem_tile_max[q_row] = tile_max;
+                    smem_tile_sum[q_row] = tile_sum;
                 }
             }
         }
         __syncthreads();
+
+        // === Step C: Online correction — each thread reads its own rows ====
+        {
+            float tile_max0 = smem_tile_max[global_row0];
+            float tile_max1 = smem_tile_max[global_row1];
+            float tile_sum0 = smem_tile_sum[global_row0];
+            float tile_sum1 = smem_tile_sum[global_row1];
+
+            float prev_max0 = row_max0, prev_max1 = row_max1;
+            float new_max0 = fmaxf(prev_max0, tile_max0);
+            float new_max1 = fmaxf(prev_max1, tile_max1);
+            float corr0 = (kv_tile == 0) ? 0.0f : expf(prev_max0 - new_max0);
+            float corr1 = (kv_tile == 0) ? 0.0f : expf(prev_max1 - new_max1);
+
+            row_max0 = new_max0;
+            row_max1 = new_max1;
+            row_sum0 = row_sum0 * corr0 + tile_sum0;
+            row_sum1 = row_sum1 * corr1 + tile_sum1;
+
+            #pragma unroll
+            for (int di = 0; di < PV_TILES_PER_WARP; di++) {
+                o_acc[di][0] *= corr0;
+                o_acc[di][1] *= corr0;
+                o_acc[di][2] *= corr1;
+                o_acc[di][3] *= corr1;
+            }
+        }
 
         // === Step D: O += P * V via PTX MMA ================================
         {
@@ -397,6 +398,7 @@ void launch_flash_attention(const FlashAttentionParams& params) {
     smem_bytes += BLOCK_N * KV_STRIDE * sizeof(half);
     smem_bytes += BLOCK_M * BLOCK_N * sizeof(float);           // smem_s
     smem_bytes += BLOCK_M * P_STRIDE * sizeof(half);
+    smem_bytes += 2 * BLOCK_M * sizeof(float);                // tile_max + tile_sum
 
     if (smem_bytes > 48 * 1024) {
         if (params.causal) {
