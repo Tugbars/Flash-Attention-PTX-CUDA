@@ -70,7 +70,7 @@ target_compile_options(cuda_transformer PRIVATE
 )
 
 # ============================================================================
-# Benchmark / Demo Executable
+# Benchmark / Demo Executables
 # ============================================================================
 add_executable(transformer_bench src/main.cu)
 target_link_libraries(transformer_bench PRIVATE cuda_transformer)
@@ -79,12 +79,9 @@ target_include_directories(transformer_bench PRIVATE
     ${CUTLASS_INCLUDE_DIR}
 )
 
-# ============================================================================
-# Flash Attention Demo
-# ============================================================================
-add_executable(flash_demo src/demo.cu)
-target_link_libraries(flash_demo PRIVATE cuda_transformer)
-target_include_directories(flash_demo PRIVATE
+add_executable(bench_critical_path src/bench_critical_path.cu)
+target_link_libraries(bench_critical_path PRIVATE cuda_transformer)
+target_include_directories(bench_critical_path PRIVATE
     ${CMAKE_SOURCE_DIR}/include
     ${CUTLASS_INCLUDE_DIR}
 )
