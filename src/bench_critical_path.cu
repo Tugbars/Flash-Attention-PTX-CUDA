@@ -78,7 +78,9 @@ int main() {
     // --- GPU Info ---
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
-    float peak_tflops = 2.0f * prop.multiProcessorCount * (prop.clockRate * 1e-6f) * 256 / 1e3f;
+    int clock_khz = 0;
+    cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, 0);
+    float peak_tflops = 2.0f * prop.multiProcessorCount * (clock_khz * 1e-6f) * 256 / 1e3f;
 
     printf("================================================================\n");
     printf("  Critical Path Benchmark — Transformer Layer Pipeline\n");
