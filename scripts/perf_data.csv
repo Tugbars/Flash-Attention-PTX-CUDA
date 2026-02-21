@@ -1,0 +1,7 @@
+version,tflops,pct_peak
+Scalar Baseline,2.7,1.1498
+WMMA v3,26.7,11.3702
+Vectorized v6,38.3,16.3101
+PTX MMA v7,49.2,20.9519
+In-Register v8,125.2,53.3166
+Corrected v9,135.9,57.8732
