@@ -1,6 +1,9 @@
 // ============================================================================
-// Flash Attention — WMMA for both Q*K^T and P*V, fused softmax→half,
-// no smem_o zero pass. Best version so far: ~26.7 TFLOPS on RTX 5080.
+// Flash Attention — Best Version (v4 + fused mask + cached softmax)
+//
+// 8 warps, WMMA for both Q*K^T and P*V, fused causal mask into softmax,
+// no smem_o zero pass, cached S values to eliminate second smem read.
+// Baseline: 27.3 TFLOPS on RTX 5080 (B=1, H=12, S=2048, D=64)
 // ============================================================================
 
 #include <cuda_fp16.h>
@@ -106,6 +109,10 @@ __global__ void flash_attention_wmma_kernel(
     constexpr int TOTAL_QK_TILES = TILES_M * TILES_N;  // 16
     constexpr int TOTAL_PV_TILES = TILES_M * TILES_D;  // 16
 
+    // -- Cached S values for softmax (avoid second smem read) ---------------
+    // BLOCK_N / WARP_SIZE_FA = 2 values per lane per row
+    constexpr int S_PER_LANE = BLOCK_N / WARP_SIZE_FA;
+
     // -- KV tile loop -------------------------------------------------------
     const int kv_end = CAUSAL ? min(q_start + BLOCK_M, seq_len) : seq_len;
     const int num_kv_tiles = (kv_end + BLOCK_N - 1) / BLOCK_N;
@@ -164,17 +171,21 @@ __global__ void flash_attention_wmma_kernel(
         }
         __syncthreads();
 
-        // === Step B+C: Fused causal mask + online softmax + half convert ===
+        // === Step B+C: Fused mask + online softmax + cached S + half P =====
         #pragma unroll
         for (int r = 0; r < ROWS_PER_WARP; r++) {
             int q_row = warp_id * ROWS_PER_WARP + r;
 
+            // First pass: mask + find max, cache values in registers
+            float cached_s[S_PER_LANE];
             float tile_max = -FLT_MAX;
+
+            #pragma unroll
             for (int j = lane_id; j < BLOCK_N; j += WARP_SIZE_FA) {
                 float s = smem_s[q_row * BLOCK_N + j];
                 if (CAUSAL && (kv_start + j > q_start + q_row)) s = -FLT_MAX;
                 if (j >= kv_count) s = -FLT_MAX;
-                smem_s[q_row * BLOCK_N + j] = s;
+                cached_s[j / WARP_SIZE_FA] = s;
                 tile_max = fmaxf(tile_max, s);
             }
             tile_max = warp_reduce_max_fa(tile_max);
@@ -183,10 +194,12 @@ __global__ void flash_attention_wmma_kernel(
             float new_max  = fmaxf(prev_max, tile_max);
             float correction = expf(prev_max - new_max);
 
+            // Second pass: exp from cached values (no smem read!)
             float tile_sum = 0.0f;
+            #pragma unroll
             for (int j = lane_id; j < BLOCK_N; j += WARP_SIZE_FA) {
-                float s = smem_s[q_row * BLOCK_N + j];
-                float e = (s > -FLT_MAX * 0.5f) ? expf(s - new_max) : 0.0f;
+                float cs = cached_s[j / WARP_SIZE_FA];
+                float e = (cs > -FLT_MAX * 0.5f) ? expf(cs - new_max) : 0.0f;
                 tile_sum += e;
                 smem_p[q_row * P_STRIDE + j] = __float2half(e);
             }
@@ -264,7 +277,7 @@ __global__ void flash_attention_wmma_kernel(
 }
 
 // ============================================================================
-// Launch Wrapper
+// Launch
 // ============================================================================
 void launch_flash_attention(const FlashAttentionParams& params) {
     constexpr int BLOCK_M   = 64;
