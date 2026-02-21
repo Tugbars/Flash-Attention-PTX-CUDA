@@ -164,30 +164,19 @@ __global__ void flash_attention_wmma_kernel(
         }
         __syncthreads();
 
-        // === Step B: Causal mask ===========================================
-        if (CAUSAL) {
-            for (int idx = tid; idx < BLOCK_M * BLOCK_N; idx += THREADS) {
-                int qi = idx / BLOCK_N, ki = idx % BLOCK_N;
-                if (kv_start + ki > q_start + qi || ki >= kv_count)
-                    smem_s[qi * BLOCK_N + ki] = -FLT_MAX;
-            }
-        } else {
-            for (int idx = tid; idx < BLOCK_M * BLOCK_N; idx += THREADS) {
-                int ki = idx % BLOCK_N;
-                if (ki >= kv_count)
-                    smem_s[(idx / BLOCK_N) * BLOCK_N + ki] = -FLT_MAX;
-            }
-        }
-        __syncthreads();
-
-        // === Step C: Online softmax + fused half conversion ================
+        // === Step B+C: Fused causal mask + online softmax + half convert ===
         #pragma unroll
         for (int r = 0; r < ROWS_PER_WARP; r++) {
             int q_row = warp_id * ROWS_PER_WARP + r;
 
             float tile_max = -FLT_MAX;
-            for (int j = lane_id; j < BLOCK_N; j += WARP_SIZE_FA)
-                tile_max = fmaxf(tile_max, smem_s[q_row * BLOCK_N + j]);
+            for (int j = lane_id; j < BLOCK_N; j += WARP_SIZE_FA) {
+                float s = smem_s[q_row * BLOCK_N + j];
+                if (CAUSAL && (kv_start + j > q_start + q_row)) s = -FLT_MAX;
+                if (j >= kv_count) s = -FLT_MAX;
+                smem_s[q_row * BLOCK_N + j] = s;
+                tile_max = fmaxf(tile_max, s);
+            }
             tile_max = warp_reduce_max_fa(tile_max);
 
             float prev_max = row_max[r];
