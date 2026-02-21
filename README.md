@@ -1,5 +1,6 @@
 <p align="center">
-  <img src="figures/attention_heatmap.png" alt="Flash Attention Heatmap" width="100%">
+  <img width="2681" height="696" alt="attention_heatmap" src="https://github.com/user-attachments/assets/e6bd7a71-9023-4b7f-9464-19c25097f1c9" />
+"100%">
 </p>
 
 <h1 align="center">Flash Attention CUDA</h1>
@@ -30,7 +31,7 @@ Consumer Blackwell (sm_120) lacks the datacenter features that make H100/B200 at
 ## Performance
 
 <p align="center">
-  <img src="figures/performance.png" alt="Performance Progression" width="85%">
+<img width="1783" height="734" alt="performance" src="https://github.com/user-attachments/assets/547dfcc4-e5e4-4f27-b38f-8c3cf14751ca" />
 </p>
 
 **Peak: 135.9 TFLOPS** at B=4, H=12, S=2048, D=64 (causal attention).
@@ -178,7 +179,7 @@ The demo generates binary dumps that `visualize.py` turns into publication-quali
 Four synthetic heads demonstrate the kernel handles diverse attention patterns correctly:
 
 <p align="center">
-  <img src="figures/attention_heatmap.png" alt="Attention Heatmap" width="100%">
+<img width="2681" height="696" alt="attention_heatmap" src="https://github.com/user-attachments/assets/c4231a48-246c-48ef-a151-437cdcd97e89" />
 </p>
 
 - **Local**: Diagonal band — nearby tokens attend to each other
@@ -189,7 +190,8 @@ Four synthetic heads demonstrate the kernel handles diverse attention patterns c
 ### Error analysis
 
 <p align="center">
-  <img src="figures/error_analysis.png" alt="Error Analysis" width="85%">
+<img width="2225" height="619" alt="error_analysis" src="https://github.com/user-attachments/assets/69c24db1-56d5-4f95-aeb3-154d14b12763" />
+
 </p>
 
 Median absolute error: 0.00025 (FP16 precision). Error is highest at early sequence positions where softmax has fewer tokens to average over, then drops to near-zero. No systematic patterns — pure FP16 quantization noise.
@@ -197,7 +199,8 @@ Median absolute error: 0.00025 (FP16 precision). Error is highest at early seque
 ### Per-head behavior
 
 <p align="center">
-  <img src="figures/head_comparison.png" alt="Head Comparison" width="80%">
+<img width="1484" height="1231" alt="head_comparison" src="https://github.com/user-attachments/assets/04725df4-abfd-44f6-85d1-dd037f964d2a" />
+
 </p>
 
 ## Architecture
