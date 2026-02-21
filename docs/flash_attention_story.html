@@ -1,0 +1,1197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Flash Attention on RTX 5080 — From 3 to 125 TFLOPS</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Instrument+Serif&family=DM+Sans:wght@300;400;500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0a0f;
+  --bg2: #12121a;
+  --fg: #e8e6e1;
+  --dim: #6b6878;
+  --accent: #00ff88;
+  --accent2: #ff6b35;
+  --accent3: #4ecdc4;
+  --hot: #ff2d55;
+  --gold: #ffd700;
+  --mono: 'JetBrains Mono', monospace;
+  --serif: 'Instrument Serif', serif;
+  --sans: 'DM Sans', sans-serif;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--sans);
+  line-height: 1.7;
+  overflow-x: hidden;
+}
+
+::selection {
+  background: var(--accent);
+  color: var(--bg);
+}
+
+/* =================== HERO =================== */
+.hero {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  position: relative;
+  overflow: hidden;
+  padding: 2rem;
+}
+
+.hero::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(ellipse 80% 50% at 50% 0%, rgba(0,255,136,0.08) 0%, transparent 60%),
+    radial-gradient(ellipse 60% 40% at 80% 80%, rgba(255,107,53,0.06) 0%, transparent 50%);
+  pointer-events: none;
+}
+
+.hero-grid {
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
+  background-size: 60px 60px;
+  mask-image: radial-gradient(ellipse at center, black 30%, transparent 70%);
+  animation: gridPulse 8s ease-in-out infinite;
+}
+
+@keyframes gridPulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 0.8; }
+}
+
+.hero-chip {
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--accent);
+  border: 1px solid rgba(0,255,136,0.3);
+  padding: 0.4rem 1.2rem;
+  border-radius: 100px;
+  margin-bottom: 2rem;
+  animation: fadeSlideUp 1s ease-out 0.2s both;
+}
+
+.hero h1 {
+  font-family: var(--serif);
+  font-size: clamp(3rem, 8vw, 7rem);
+  line-height: 1.05;
+  text-align: center;
+  max-width: 900px;
+  animation: fadeSlideUp 1s ease-out 0.4s both;
+}
+
+.hero h1 .num {
+  font-family: var(--mono);
+  font-weight: 700;
+  background: linear-gradient(135deg, var(--accent), var(--accent3));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.hero-sub {
+  font-size: 1.2rem;
+  color: var(--dim);
+  margin-top: 1.5rem;
+  text-align: center;
+  max-width: 600px;
+  animation: fadeSlideUp 1s ease-out 0.6s both;
+}
+
+.hero-stats {
+  display: flex;
+  gap: 3rem;
+  margin-top: 3rem;
+  animation: fadeSlideUp 1s ease-out 0.8s both;
+}
+
+.hero-stat {
+  text-align: center;
+}
+
+.hero-stat .val {
+  font-family: var(--mono);
+  font-size: 2.5rem;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.hero-stat .label {
+  font-size: 0.8rem;
+  color: var(--dim);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  margin-top: 0.25rem;
+}
+
+.scroll-hint {
+  position: absolute;
+  bottom: 2rem;
+  animation: bounce 2s ease-in-out infinite;
+  color: var(--dim);
+  font-size: 0.8rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+}
+
+@keyframes bounce {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(8px); }
+}
+
+@keyframes fadeSlideUp {
+  from { opacity: 0; transform: translateY(30px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* =================== SECTIONS =================== */
+section {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 6rem 2rem;
+}
+
+.section-label {
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.25em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 1rem;
+}
+
+h2 {
+  font-family: var(--serif);
+  font-size: clamp(2rem, 4vw, 3.5rem);
+  line-height: 1.15;
+  margin-bottom: 1.5rem;
+}
+
+p.body-text {
+  color: var(--dim);
+  font-size: 1.05rem;
+  max-width: 680px;
+  margin-bottom: 1.5rem;
+}
+
+/* =================== TIMELINE =================== */
+.timeline {
+  position: relative;
+  margin-top: 3rem;
+}
+
+.timeline::before {
+  content: '';
+  position: absolute;
+  left: 24px;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: linear-gradient(to bottom, var(--accent), var(--accent2), var(--hot));
+}
+
+.timeline-item {
+  position: relative;
+  padding-left: 64px;
+  padding-bottom: 4rem;
+  opacity: 0;
+  transform: translateX(-20px);
+  transition: all 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.timeline-item.visible {
+  opacity: 1;
+  transform: translateX(0);
+}
+
+.timeline-dot {
+  position: absolute;
+  left: 14px;
+  top: 4px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2px solid var(--accent);
+  background: var(--bg);
+  z-index: 1;
+  transition: all 0.3s;
+}
+
+.timeline-item.visible .timeline-dot {
+  background: var(--accent);
+  box-shadow: 0 0 20px rgba(0,255,136,0.4);
+}
+
+.timeline-version {
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--accent);
+  letter-spacing: 0.1em;
+  margin-bottom: 0.3rem;
+}
+
+.timeline-title {
+  font-family: var(--serif);
+  font-size: 1.6rem;
+  margin-bottom: 0.5rem;
+}
+
+.timeline-desc {
+  color: var(--dim);
+  font-size: 0.95rem;
+  max-width: 550px;
+  margin-bottom: 1rem;
+}
+
+.timeline-perf {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.75rem;
+  background: rgba(0,255,136,0.08);
+  border: 1px solid rgba(0,255,136,0.2);
+  border-radius: 8px;
+  padding: 0.5rem 1rem;
+  font-family: var(--mono);
+  font-size: 0.9rem;
+}
+
+.timeline-perf .tflops {
+  color: var(--accent);
+  font-weight: 700;
+  font-size: 1.1rem;
+}
+
+/* =================== PERF BAR CHART =================== */
+.perf-chart {
+  margin-top: 3rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.perf-row {
+  display: grid;
+  grid-template-columns: 180px 1fr 80px;
+  align-items: center;
+  gap: 1rem;
+}
+
+.perf-label {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  color: var(--dim);
+  text-align: right;
+}
+
+.perf-bar-bg {
+  height: 32px;
+  background: rgba(255,255,255,0.03);
+  border-radius: 4px;
+  overflow: hidden;
+  position: relative;
+}
+
+.perf-bar {
+  height: 100%;
+  border-radius: 4px;
+  width: 0%;
+  transition: width 1.5s cubic-bezier(0.16, 1, 0.3, 1);
+  position: relative;
+}
+
+.perf-bar::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.15) 100%);
+}
+
+.perf-val {
+  font-family: var(--mono);
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: var(--fg);
+}
+
+/* =================== CONCEPT CARDS =================== */
+.concept-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 1.5rem;
+  margin-top: 2rem;
+}
+
+.concept-card {
+  background: var(--bg2);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 12px;
+  padding: 2rem;
+  position: relative;
+  overflow: hidden;
+  transition: all 0.4s;
+}
+
+.concept-card:hover {
+  border-color: rgba(0,255,136,0.3);
+  transform: translateY(-4px);
+  box-shadow: 0 12px 40px rgba(0,0,0,0.4);
+}
+
+.concept-card .icon {
+  font-size: 2rem;
+  margin-bottom: 1rem;
+}
+
+.concept-card h3 {
+  font-family: var(--serif);
+  font-size: 1.3rem;
+  margin-bottom: 0.75rem;
+}
+
+.concept-card p {
+  color: var(--dim);
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+
+/* =================== ANIMATED DIAGRAM =================== */
+.diagram-wrapper {
+  margin: 3rem 0;
+  padding: 2rem;
+  background: var(--bg2);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 16px;
+  overflow-x: auto;
+}
+
+.diagram-title {
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--accent);
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  margin-bottom: 1.5rem;
+}
+
+.smem-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-family: var(--mono);
+  font-size: 0.7rem;
+}
+
+.smem-block {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.smem-label {
+  width: 80px;
+  text-align: right;
+  color: var(--dim);
+  font-size: 0.7rem;
+}
+
+.smem-bar {
+  height: 28px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  padding-left: 10px;
+  color: var(--bg);
+  font-weight: 600;
+  font-size: 0.7rem;
+  transition: width 1s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* =================== CODE BLOCK =================== */
+.code-block {
+  background: #0d0d14;
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 12px;
+  padding: 1.5rem;
+  margin: 1.5rem 0;
+  overflow-x: auto;
+  position: relative;
+}
+
+.code-block::before {
+  content: attr(data-lang);
+  position: absolute;
+  top: 0.75rem;
+  right: 1rem;
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  color: var(--dim);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.code-block code {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  line-height: 1.8;
+  color: #c8c5be;
+}
+
+.code-block .kw { color: #ff7eb6; }
+.code-block .fn { color: #78dce8; }
+.code-block .cm { color: #5a5870; }
+.code-block .st { color: #a9dc76; }
+.code-block .num { color: #ffd866; }
+.code-block .acc { color: #00ff88; }
+
+/* =================== WARP DIAGRAM =================== */
+.warp-visual {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 3px;
+  margin: 1.5rem 0;
+  max-width: 500px;
+}
+
+.warp-cell {
+  aspect-ratio: 1;
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--mono);
+  font-size: 0.55rem;
+  color: var(--bg);
+  font-weight: 600;
+  opacity: 0;
+  animation: cellFadeIn 0.3s ease-out forwards;
+}
+
+/* =================== PROFILE TABLE =================== */
+.profile-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 2rem 0;
+  font-family: var(--mono);
+  font-size: 0.85rem;
+}
+
+.profile-table th {
+  text-align: left;
+  padding: 0.75rem 1rem;
+  border-bottom: 2px solid rgba(255,255,255,0.1);
+  color: var(--dim);
+  font-weight: 400;
+  font-size: 0.7rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.profile-table td {
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+
+.profile-table .highlight {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.profile-table .hot { color: var(--hot); }
+.profile-table .warm { color: var(--accent2); }
+
+/* =================== REGISTER ANIMATION =================== */
+.reg-flow {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin: 2rem 0;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.reg-box {
+  padding: 0.75rem 1.25rem;
+  border-radius: 8px;
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  font-weight: 600;
+  text-align: center;
+  min-width: 100px;
+  position: relative;
+}
+
+.reg-arrow {
+  color: var(--dim);
+  font-size: 1.5rem;
+  animation: arrowPulse 1.5s ease-in-out infinite;
+}
+
+@keyframes arrowPulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; color: var(--accent); }
+}
+
+@keyframes cellFadeIn {
+  from { opacity: 0; transform: scale(0.8); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+/* =================== COMPARISON STRIP =================== */
+.comparison {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2rem;
+  margin: 2rem 0;
+}
+
+.comp-side {
+  padding: 2rem;
+  border-radius: 12px;
+  border: 1px solid rgba(255,255,255,0.06);
+}
+
+.comp-side.before {
+  background: rgba(255,45,85,0.05);
+  border-color: rgba(255,45,85,0.2);
+}
+
+.comp-side.after {
+  background: rgba(0,255,136,0.05);
+  border-color: rgba(0,255,136,0.2);
+}
+
+.comp-side h4 {
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  margin-bottom: 1rem;
+}
+
+.comp-side.before h4 { color: var(--hot); }
+.comp-side.after h4 { color: var(--accent); }
+
+.comp-side ul {
+  list-style: none;
+  color: var(--dim);
+  font-size: 0.9rem;
+}
+
+.comp-side ul li {
+  padding: 0.3rem 0;
+  padding-left: 1.2rem;
+  position: relative;
+}
+
+.comp-side ul li::before {
+  content: '×';
+  position: absolute;
+  left: 0;
+  color: var(--hot);
+  font-weight: 700;
+}
+
+.comp-side.after ul li::before {
+  content: '✓';
+  color: var(--accent);
+}
+
+/* =================== FOOTER =================== */
+.footer {
+  text-align: center;
+  padding: 4rem 2rem;
+  color: var(--dim);
+  font-size: 0.85rem;
+  border-top: 1px solid rgba(255,255,255,0.04);
+}
+
+.footer .big-num {
+  font-family: var(--mono);
+  font-size: clamp(4rem, 10vw, 8rem);
+  font-weight: 700;
+  background: linear-gradient(135deg, var(--accent), var(--accent3), var(--accent2));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  line-height: 1;
+  margin-bottom: 1rem;
+}
+
+/* =================== RESPONSIVE =================== */
+@media (max-width: 768px) {
+  .hero-stats { flex-direction: column; gap: 1.5rem; }
+  .perf-row { grid-template-columns: 100px 1fr 60px; }
+  .comparison { grid-template-columns: 1fr; }
+  .concept-grid { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+
+<!-- ===================== HERO ===================== -->
+<div class="hero">
+  <div class="hero-grid"></div>
+  <div class="hero-chip">RTX 5080 · sm_120 · Consumer Blackwell</div>
+  <h1>From <span class="num">3</span> to <span class="num">125</span> TFLOPS</h1>
+  <p class="hero-sub">
+    Hand-writing a Flash Attention kernel in raw PTX assembly, eliminating shared memory bottlenecks, and achieving 53% of theoretical peak on consumer hardware.
+  </p>
+  <div class="hero-stats">
+    <div class="hero-stat">
+      <div class="val">47×</div>
+      <div class="label">Total Speedup</div>
+    </div>
+    <div class="hero-stat">
+      <div class="val">53%</div>
+      <div class="label">Peak Utilization</div>
+    </div>
+    <div class="hero-stat">
+      <div class="val">125.2</div>
+      <div class="label">TFLOPS FP16</div>
+    </div>
+  </div>
+  <div class="scroll-hint">↓ Scroll to explore</div>
+</div>
+
+<!-- ===================== THE PROBLEM ===================== -->
+<section>
+  <div class="section-label">01 — The Challenge</div>
+  <h2>Flash Attention on a GPU<br>without datacenter features</h2>
+  <p class="body-text">
+    The RTX 5080 is NVIDIA's consumer Blackwell chip — fast tensor cores, but none of the 
+    datacenter magic that makes H100 and B200 kernels fly. No WGMMA (warp group MMA), no TMA 
+    (tensor memory accelerator), no warp specialization barriers. Just raw CUDA, shared memory, 
+    and 84 streaming multiprocessors.
+  </p>
+  <p class="body-text">
+    Flash Attention is memory-bound by nature: the softmax in the inner loop breaks the pure 
+    GEMM pattern that tensor cores crave. The question was — how close to peak can we get 
+    with only the tools available on consumer silicon?
+  </p>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <div class="icon">⚡</div>
+      <h3>234.8 TFLOPS Peak</h3>
+      <p>The RTX 5080's theoretical FP16 throughput. Our target ceiling. Production Flash Attention on H100 achieves 50-70% of peak — could we match that ratio?</p>
+    </div>
+    <div class="concept-card">
+      <div class="icon">🧱</div>
+      <h3>No WGMMA / TMA</h3>
+      <p>sm_120 (consumer Blackwell) is architecturally closer to Ada Lovelace than datacenter Blackwell. 32-thread warps, not 128-thread warp groups. Manual memory management.</p>
+    </div>
+    <div class="concept-card">
+      <div class="icon">🔥</div>
+      <h3>The Softmax Wall</h3>
+      <p>Every KV tile needs a full softmax: find max, compute exp, sum, normalize. This serial dependency between tiles is what makes attention fundamentally harder than GEMM.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== THE JOURNEY ===================== -->
+<section>
+  <div class="section-label">02 — The Optimization Journey</div>
+  <h2>Five versions, five breakthroughs</h2>
+  <p class="body-text">
+    Each version identified and eliminated a specific bottleneck. The profiler told us where 
+    time was being wasted; the architecture told us how to fix it.
+  </p>
+
+  <div class="timeline" id="timeline">
+    <div class="timeline-item" data-delay="0">
+      <div class="timeline-dot"></div>
+      <div class="timeline-version">V1 — BASELINE</div>
+      <div class="timeline-title">Scalar FP32 Attention</div>
+      <div class="timeline-desc">
+        No tensor cores. Each thread computes one element of Q×K^T using scalar multiply-add. 
+        The entire 64×64 attention matrix computed element-by-element. The GPU's tensor cores 
+        sit completely idle.
+      </div>
+      <div class="timeline-perf">
+        <span class="tflops">~2.7</span> TFLOPS
+      </div>
+    </div>
+
+    <div class="timeline-item" data-delay="100">
+      <div class="timeline-dot"></div>
+      <div class="timeline-version">V3 — TENSOR CORES</div>
+      <div class="timeline-title">WMMA Fragment Operations</div>
+      <div class="timeline-desc">
+        Switched to nvcuda::wmma — NVIDIA's C++ API for tensor cores. Each warp now computes 
+        16×16 matrix tiles in a single instruction. 10× faster compute, but we immediately 
+        hit a new wall: global memory bandwidth.
+      </div>
+      <div class="timeline-perf">
+        <span class="tflops">26.7</span> TFLOPS · <span style="color: var(--accent2)">10× from baseline</span>
+      </div>
+    </div>
+
+    <div class="timeline-item" data-delay="200">
+      <div class="timeline-dot"></div>
+      <div class="timeline-version">V6 — VECTORIZED LOADS</div>
+      <div class="timeline-title">uint4 Coalesced Memory Access</div>
+      <div class="timeline-desc">
+        Replaced individual half-precision loads with 128-bit uint4 vector loads. Each thread 
+        now moves 16 bytes per transaction instead of 2. Global memory bandwidth utilization 
+        jumped from ~15% to ~40%.
+      </div>
+      <div class="timeline-perf">
+        <span class="tflops">38.3</span> TFLOPS · <span style="color: var(--accent2)">+43% from WMMA</span>
+      </div>
+    </div>
+
+    <div class="timeline-item" data-delay="300">
+      <div class="timeline-dot"></div>
+      <div class="timeline-version">V7 — RAW PTX</div>
+      <div class="timeline-title">PTX MMA + ldmatrix Instructions</div>
+      <div class="timeline-desc">
+        Replaced WMMA's opaque fragment API with raw PTX assembly. 
+        <code>mma.sync.aligned.m16n8k16</code> gives us known register layouts — 
+        each thread holds exactly 4 floats at deterministic (row, col) positions. 
+        <code>ldmatrix.sync</code> loads tiles directly from shared memory into MMA-ready registers.
+      </div>
+      <div class="timeline-perf">
+        <span class="tflops">49.2</span> TFLOPS · <span style="color: var(--accent2)">Known register layout unlocked</span>
+      </div>
+    </div>
+
+    <div class="timeline-item" data-delay="400">
+      <div class="timeline-dot" style="border-color: var(--gold); background: var(--gold); box-shadow: 0 0 30px rgba(255,215,0,0.5);"></div>
+      <div class="timeline-version" style="color: var(--gold);">V8 — IN-REGISTER SOFTMAX</div>
+      <div class="timeline-title">The Breakthrough: Eliminating smem_s</div>
+      <div class="timeline-desc">
+        The key innovation. S = Q×K^T results stay in registers — never written to shared memory. 
+        Softmax computed via intra-warp shuffles + tiny cross-warp exchange (1KB vs 16KB). 
+        Eliminated the largest shared memory round-trip and one synchronization barrier per tile.
+      </div>
+      <div class="timeline-perf" style="background: rgba(255,215,0,0.1); border-color: rgba(255,215,0,0.3);">
+        <span class="tflops" style="color: var(--gold);">125.2</span> TFLOPS · <span style="color: var(--gold)">53% of peak · 47× from baseline</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== PERFORMANCE CHART ===================== -->
+<section>
+  <div class="section-label">03 — Performance Progression</div>
+  <h2>The numbers speak</h2>
+
+  <div class="perf-chart" id="perfChart">
+    <div class="perf-row">
+      <div class="perf-label">Scalar Baseline</div>
+      <div class="perf-bar-bg">
+        <div class="perf-bar" style="background: linear-gradient(90deg, #444, #555);" data-width="2.2"></div>
+      </div>
+      <div class="perf-val">2.7</div>
+    </div>
+    <div class="perf-row">
+      <div class="perf-label">WMMA v3</div>
+      <div class="perf-bar-bg">
+        <div class="perf-bar" style="background: linear-gradient(90deg, #665, #886);" data-width="21.4"></div>
+      </div>
+      <div class="perf-val">26.7</div>
+    </div>
+    <div class="perf-row">
+      <div class="perf-label">Vectorized v6</div>
+      <div class="perf-bar-bg">
+        <div class="perf-bar" style="background: linear-gradient(90deg, var(--accent2), #ff9466);" data-width="30.7"></div>
+      </div>
+      <div class="perf-val">38.3</div>
+    </div>
+    <div class="perf-row">
+      <div class="perf-label">PTX MMA v7</div>
+      <div class="perf-bar-bg">
+        <div class="perf-bar" style="background: linear-gradient(90deg, var(--accent3), #6ee7c0);" data-width="39.4"></div>
+      </div>
+      <div class="perf-val">49.2</div>
+    </div>
+    <div class="perf-row">
+      <div class="perf-label">In-Register v8</div>
+      <div class="perf-bar-bg">
+        <div class="perf-bar" style="background: linear-gradient(90deg, var(--accent), var(--gold));" data-width="100"></div>
+      </div>
+      <div class="perf-val" style="color: var(--accent);">125.2</div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== KEY INSIGHT ===================== -->
+<section>
+  <div class="section-label">04 — The Key Insight</div>
+  <h2>Why in-register softmax<br>changes everything</h2>
+  <p class="body-text">
+    In a standard flash attention kernel, the S = Q×K^T matrix is written to shared memory 
+    (16KB), a barrier fires, then softmax reads it back. This round-trip dominates the inner loop.
+  </p>
+
+  <div class="comparison">
+    <div class="comp-side before">
+      <h4>Before: smem_s Round-Trip</h4>
+      <ul>
+        <li>MMA writes S to shared memory (16KB)</li>
+        <li>__syncthreads() — all 8 warps stall</li>
+        <li>Each warp reads 8 rows from smem_s</li>
+        <li>Compute softmax per row</li>
+        <li>Write P to smem_p (9KB)</li>
+        <li>__syncthreads() again</li>
+        <li>4 barriers per KV tile</li>
+        <li>~54KB shared memory</li>
+      </ul>
+    </div>
+    <div class="comp-side after">
+      <h4>After: Register Softmax</h4>
+      <ul>
+        <li>MMA results stay in s_acc[4][4] registers</li>
+        <li>Shuffle reduce across 4 threads per row</li>
+        <li>Exchange 128 floats between warp halves</li>
+        <li>exp() computed in registers</li>
+        <li>Write P to smem_p directly</li>
+        <li>Only 3 barriers per KV tile</li>
+        <li>~38KB shared memory</li>
+        <li>Tensor cores active 50% (was 18%)</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="diagram-wrapper">
+    <div class="diagram-title">Data Flow — Register Softmax Pipeline</div>
+    <div class="reg-flow">
+      <div class="reg-box" style="background: rgba(78,205,196,0.2); border: 1px solid var(--accent3); color: var(--accent3);">
+        Q × K^T<br><small>PTX MMA</small>
+      </div>
+      <div class="reg-arrow">→</div>
+      <div class="reg-box" style="background: rgba(0,255,136,0.15); border: 1px solid var(--accent); color: var(--accent);">
+        s_acc[4][4]<br><small>IN REGISTERS</small>
+      </div>
+      <div class="reg-arrow">→</div>
+      <div class="reg-box" style="background: rgba(255,215,0,0.15); border: 1px solid var(--gold); color: var(--gold);">
+        shuffle max/sum<br><small>4 THREADS</small>
+      </div>
+      <div class="reg-arrow">→</div>
+      <div class="reg-box" style="background: rgba(255,107,53,0.15); border: 1px solid var(--accent2); color: var(--accent2);">
+        exp() → P<br><small>WRITE smem_p</small>
+      </div>
+      <div class="reg-arrow">→</div>
+      <div class="reg-box" style="background: rgba(78,205,196,0.2); border: 1px solid var(--accent3); color: var(--accent3);">
+        P × V<br><small>PTX MMA</small>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== LDMATRIX BUG ===================== -->
+<section>
+  <div class="section-label">05 — The Bug That Nearly Stopped Us</div>
+  <h2>ldmatrix.x2.trans:<br>when half the matrix goes missing</h2>
+  <p class="body-text">
+    PTX's <code>ldmatrix.sync.aligned.m8n8.x2.trans</code> loads two 8×8 matrices. 
+    Threads 0-7 provide addresses for matrix 0, threads 8-15 for matrix 1. 
+    Our code used <code>lane_id % 8</code> for both groups — making threads 8-15 
+    load identical data to threads 0-7.
+  </p>
+  <p class="body-text">
+    The result: only half the K-dimension was loaded, duplicated into both halves. 
+    Rows 0-7 of the output looked correct (they only needed the first half), 
+    but rows 8-15 were corrupted. The identity matrix test made it obvious — 
+    row 8 showed values 1-8 instead of 65-72.
+  </p>
+
+  <div class="code-block" data-lang="PTX Fix">
+    <code>
+<span class="cm">// BUG: threads 8-15 duplicate threads 0-7</span>
+<span class="kw">int</span> k_row = lane_id % <span class="num">8</span>;
+<span class="fn">ldmatrix_x2_trans</span>(b0, b1,
+    smem_k + (ni * <span class="num">8</span> + k_row) * KV_STRIDE + ki * <span class="num">16</span>);
+
+<span class="cm">// FIX: matrix 1 reads the next 8 columns</span>
+<span class="kw">int</span> k_row = lane_id % <span class="num">8</span>;
+<span class="kw">int</span> <span class="acc">mat</span> = (lane_id / <span class="num">8</span>) % <span class="num">2</span>;
+<span class="fn">ldmatrix_x2_trans</span>(b0, b1,
+    smem_k + (ni * <span class="num">8</span> + k_row) * KV_STRIDE + ki * <span class="num">16</span> + <span class="acc">mat * 8</span>);
+    </code>
+  </div>
+</section>
+
+<!-- ===================== PROFILING ===================== -->
+<section>
+  <div class="section-label">06 — Profiling with Nsight Compute</div>
+  <h2>The profiler doesn't lie</h2>
+  <p class="body-text">
+    Every optimization was validated with <code>ncu</code>. Three metrics told the whole story: 
+    tensor core utilization, shared memory throughput, and active warps.
+  </p>
+
+  <table class="profile-table">
+    <thead>
+      <tr>
+        <th>Metric</th>
+        <th>B=1 smem_s</th>
+        <th>B=4 smem_s</th>
+        <th>B=4 In-Register</th>
+        <th>Change</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Tensor Cores Active</td>
+        <td class="hot">8.5%</td>
+        <td class="warm">17.9%</td>
+        <td class="highlight">50.1%</td>
+        <td>5.9×</td>
+      </tr>
+      <tr>
+        <td>L1/Smem Throughput</td>
+        <td>15.2%</td>
+        <td>31.3%</td>
+        <td class="highlight">32.5%</td>
+        <td>No longer bottleneck</td>
+      </tr>
+      <tr>
+        <td>Active Warps</td>
+        <td class="hot">9.1%</td>
+        <td>15.6%</td>
+        <td class="highlight">29.7%</td>
+        <td>3.3×</td>
+      </tr>
+      <tr>
+        <td>TFLOPS</td>
+        <td>37.3</td>
+        <td>45.2</td>
+        <td class="highlight">125.2</td>
+        <td style="color: var(--gold); font-weight: 700;">2.8×</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p class="body-text">
+    At 8.5% tensor core utilization, the MMA units were idle 91% of the time — starved by 
+    shared memory traffic and synchronization barriers. Eliminating smem_s freed the pipeline, 
+    letting tensor cores sustain 50% activity. The remaining 50% is the irreducible cost of 
+    softmax, P write, and global memory access.
+  </p>
+</section>
+
+<!-- ===================== ARCHITECTURE ===================== -->
+<section>
+  <div class="section-label">07 — What Consumer Blackwell Can't Do</div>
+  <h2>The datacenter features<br>we worked without</h2>
+  <p class="body-text">
+    Examining DeepSeek's production kernels for H100 (sm_90) and B200 (sm_100) revealed 
+    an entirely different class of hardware. Here's what was available to them but not to us.
+  </p>
+
+  <div class="concept-grid">
+    <div class="concept-card">
+      <div class="icon">🔄</div>
+      <h3>WGMMA</h3>
+      <p>Warp Group MMA — 128 threads issue a single matrix multiply. B operand reads directly from shared memory, eliminating register pressure entirely. 4× wider than our 32-thread MMA.</p>
+    </div>
+    <div class="concept-card">
+      <div class="icon">📦</div>
+      <h3>TMA</h3>
+      <p>Tensor Memory Accelerator — hardware DMA that copies tiles from global to shared memory with zero thread involvement. Address generation, bounds checking, and swizzling all in silicon.</p>
+    </div>
+    <div class="concept-card">
+      <div class="icon">🧵</div>
+      <h3>Warp Specialization</h3>
+      <p>Dedicated TMA warps load data while math warps compute — true pipeline parallelism. ClusterTransactionBarrier synchronizes across warp groups with minimal overhead.</p>
+    </div>
+    <div class="concept-card">
+      <div class="icon">🧠</div>
+      <h3>TMEM (sm_100)</h3>
+      <p>Tensor Memory — a hardware-managed register file separate from the standard RF. B200's UMMA reads operands directly from TMEM, eliminating shared memory for the B matrix entirely.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== SHARED MEMORY LAYOUT ===================== -->
+<section>
+  <div class="section-label">08 — Memory Architecture</div>
+  <h2>Shared memory layout evolution</h2>
+  
+  <div class="diagram-wrapper">
+    <div class="diagram-title">Before: 54KB with smem_s</div>
+    <div class="smem-layout" id="smemBefore">
+      <div class="smem-block">
+        <div class="smem-label">smem_q</div>
+        <div class="smem-bar" style="width: 170px; background: var(--accent3);" data-w="170">9.2 KB</div>
+      </div>
+      <div class="smem-block">
+        <div class="smem-label">smem_k</div>
+        <div class="smem-bar" style="width: 170px; background: #78dce8;" data-w="170">9.2 KB</div>
+      </div>
+      <div class="smem-block">
+        <div class="smem-label">smem_v</div>
+        <div class="smem-bar" style="width: 170px; background: #78dce8;" data-w="170">9.2 KB</div>
+      </div>
+      <div class="smem-block">
+        <div class="smem-label">smem_s</div>
+        <div class="smem-bar" style="width: 300px; background: var(--hot);" data-w="300">16 KB ← ELIMINATED</div>
+      </div>
+      <div class="smem-block">
+        <div class="smem-label">smem_p</div>
+        <div class="smem-bar" style="width: 170px; background: var(--accent2);" data-w="170">9.2 KB</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="diagram-wrapper">
+    <div class="diagram-title">After: 38KB — in-register softmax</div>
+    <div class="smem-layout" id="smemAfter">
+      <div class="smem-block">
+        <div class="smem-label">smem_q</div>
+        <div class="smem-bar" style="width: 170px; background: var(--accent3);" data-w="170">9.2 KB</div>
+      </div>
+      <div class="smem-block">
+        <div class="smem-label">smem_k</div>
+        <div class="smem-bar" style="width: 170px; background: #78dce8;" data-w="170">9.2 KB</div>
+      </div>
+      <div class="smem-block">
+        <div class="smem-label">smem_v</div>
+        <div class="smem-bar" style="width: 170px; background: #78dce8;" data-w="170">9.2 KB</div>
+      </div>
+      <div class="smem-block">
+        <div class="smem-label">smem_p</div>
+        <div class="smem-bar" style="width: 170px; background: var(--accent2);" data-w="170">9.2 KB</div>
+      </div>
+      <div class="smem-block">
+        <div class="smem-label">exchange</div>
+        <div class="smem-bar" style="width: 18px; background: var(--accent);" data-w="18">1 KB</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== MMA REGISTER LAYOUT ===================== -->
+<section>
+  <div class="section-label">09 — PTX MMA Register Layout</div>
+  <h2>The layout that made it possible</h2>
+  <p class="body-text">
+    <code>mma.sync.aligned.m16n8k16</code> produces a 16×8 output tile. Each of the 32 threads 
+    holds exactly 4 float values at deterministic positions. This known layout is what enables 
+    in-register softmax — we can compute row-wise operations without ever touching shared memory.
+  </p>
+
+  <div class="diagram-wrapper">
+    <div class="diagram-title">Thread → Output Element Mapping</div>
+    <div style="font-family: var(--mono); font-size: 0.75rem; color: var(--dim); margin-bottom: 1rem;">
+      Each thread t holds: d0=C[row0,col0] d1=C[row0,col1] d2=C[row1,col0] d3=C[row1,col1]<br>
+      row0 = (t/4)%8 &nbsp;&nbsp; row1 = row0+8 &nbsp;&nbsp; col0 = (t%4)*2 &nbsp;&nbsp; col1 = col0+1
+    </div>
+    <div class="warp-visual" id="warpVis"></div>
+    <div style="display: flex; gap: 2rem; margin-top: 1rem; font-family: var(--mono); font-size: 0.7rem; color: var(--dim);">
+      <span>■ <span style="color: var(--accent)">Rows 0-7 (d0, d1)</span></span>
+      <span>■ <span style="color: var(--accent2)">Rows 8-15 (d2, d3)</span></span>
+    </div>
+  </div>
+
+  <p class="body-text">
+    Four threads share each row (varying in lane_id%4). A shuffle reduction with 
+    <code>__shfl_xor_sync</code> across delta 1 and 2 gives the partial max/sum for 32 columns. 
+    One tiny smem exchange between warp halves completes the full 64-column reduction.
+  </p>
+</section>
+
+<!-- ===================== FOOTER ===================== -->
+<div class="footer">
+  <div class="big-num">125.2</div>
+  <p>TFLOPS · FP16 Flash Attention · RTX 5080</p>
+  <p style="margin-top: 0.5rem; font-size: 0.75rem; color: #444;">
+    Hand-written PTX · In-Register Softmax · 53% of Theoretical Peak
+  </p>
+</div>
+
+<!-- ===================== SCRIPTS ===================== -->
+<script>
+// Intersection Observer for scroll animations
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(entry => {
+    if (entry.isIntersecting) {
+      entry.target.classList.add('visible');
+      
+      // Animate perf bars
+      if (entry.target.id === 'perfChart') {
+        entry.target.querySelectorAll('.perf-bar').forEach((bar, i) => {
+          setTimeout(() => {
+            bar.style.width = bar.dataset.width + '%';
+          }, i * 150);
+        });
+      }
+    }
+  });
+}, { threshold: 0.2 });
+
+// Observe timeline items
+document.querySelectorAll('.timeline-item').forEach((item, i) => {
+  item.style.transitionDelay = (i * 0.15) + 's';
+  observer.observe(item);
+});
+
+// Observe perf chart
+const perfChart = document.getElementById('perfChart');
+if (perfChart) observer.observe(perfChart);
+
+// Generate warp visualization (16x8 output tile)
+const warpVis = document.getElementById('warpVis');
+if (warpVis) {
+  for (let row = 0; row < 16; row++) {
+    for (let col = 0; col < 8; col++) {
+      const cell = document.createElement('div');
+      cell.className = 'warp-cell';
+      
+      // Find which thread owns this cell
+      const localRow = row % 8;
+      const isRow1 = row >= 8;
+      const colPair = Math.floor(col / 2);
+      const threadId = localRow * 4 + colPair;
+      
+      const isTop = row < 8;
+      cell.style.background = isTop 
+        ? `rgba(0,255,136,${0.3 + (threadId/32)*0.5})`
+        : `rgba(255,107,53,${0.3 + (threadId/32)*0.5})`;
+      cell.textContent = `t${threadId}`;
+      cell.style.animationDelay = `${(row * 8 + col) * 20}ms`;
+      warpVis.appendChild(cell);
+    }
+  }
+}
+
+// Smooth reveal on scroll for all sections
+document.querySelectorAll('section').forEach(section => {
+  observer.observe(section);
+  section.style.opacity = '0';
+  section.style.transform = 'translateY(20px)';
+  section.style.transition = 'all 0.8s cubic-bezier(0.16, 1, 0.3, 1)';
+});
+
+// Override section visible state
+const sectionObserver = new IntersectionObserver((entries) => {
+  entries.forEach(entry => {
+    if (entry.isIntersecting) {
+      entry.target.style.opacity = '1';
+      entry.target.style.transform = 'translateY(0)';
+    }
+  });
+}, { threshold: 0.1 });
+
+document.querySelectorAll('section').forEach(s => sectionObserver.observe(s));
+</script>
+
+</body>
+</html>
