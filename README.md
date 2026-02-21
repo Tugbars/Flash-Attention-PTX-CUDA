@@ -3,7 +3,7 @@
 "100%">
 </p>
 
-<h1 align="center">Flash Attention CUDA</h1>
+<h1 align="center">Flash Attention PTX/CUDA</h1>
 
 <p align="center">
   <strong>Hand-written PTX flash attention kernel achieving 136 TFLOPS on RTX 5080</strong><br>
