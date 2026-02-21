@@ -75,12 +75,17 @@ __global__ void flash_attention_wmma_kernel(
     const half* V_head = V + head_offset;
     half*       O_head = O + head_offset;
 
-    // -- Load Q tile (persistent) -------------------------------------------
-    for (int idx = tid; idx < BLOCK_M * D_HEAD; idx += THREADS) {
-        int row = idx / D_HEAD, col = idx % D_HEAD;
-        int g = q_start + row;
-        smem_q[row * Q_STRIDE + col] =
-            (g < seq_len) ? Q_head[g * D_HEAD + col] : __float2half(0.0f);
+    // -- Load Q tile (persistent, vectorized 128-bit) ------------------------
+    {
+        constexpr int VEC_COLS_Q = D_HEAD / 8;
+        for (int idx = tid; idx < BLOCK_M * VEC_COLS_Q; idx += THREADS) {
+            int row = idx / VEC_COLS_Q, col = idx % VEC_COLS_Q;
+            int g = q_start + row;
+            uint4 val = (g < seq_len)
+                ? reinterpret_cast<const uint4*>(Q_head + g * D_HEAD)[col]
+                : make_uint4(0, 0, 0, 0);
+            reinterpret_cast<uint4*>(smem_q + row * Q_STRIDE)[col] = val;
+        }
     }
     __syncthreads();
 
@@ -121,20 +126,27 @@ __global__ void flash_attention_wmma_kernel(
         const int kv_start = kv_tile * BLOCK_N;
         const int kv_count = min(BLOCK_N, seq_len - kv_start);
 
-        // === Load K,V tiles (all warps) ====================================
-        for (int idx = tid; idx < BLOCK_N * D_HEAD; idx += THREADS) {
-            int row = idx / D_HEAD, col = idx % D_HEAD;
+        // === Load K,V tiles (all warps, vectorized 128-bit loads) ===========
+        // D_HEAD=64 halfs = 128 bytes per row = 8 uint4s per row
+        constexpr int VEC_COLS = D_HEAD / 8;  // 8 halfs per uint4
+        static_assert(KV_STRIDE * sizeof(half) % sizeof(uint4) == 0,
+                      "KV_STRIDE must be uint4-aligned");
+
+        for (int idx = tid; idx < BLOCK_N * VEC_COLS; idx += THREADS) {
+            int row = idx / VEC_COLS, col = idx % VEC_COLS;
             int g = kv_start + row;
-            smem_k[row * KV_STRIDE + col] =
-                (g < seq_len && row < kv_count) ? K_head[g * D_HEAD + col]
-                                                 : __float2half(0.0f);
+            uint4 val = (g < seq_len && row < kv_count)
+                ? reinterpret_cast<const uint4*>(K_head + g * D_HEAD)[col]
+                : make_uint4(0, 0, 0, 0);
+            reinterpret_cast<uint4*>(smem_k + row * KV_STRIDE)[col] = val;
         }
-        for (int idx = tid; idx < BLOCK_N * D_HEAD; idx += THREADS) {
-            int row = idx / D_HEAD, col = idx % D_HEAD;
+        for (int idx = tid; idx < BLOCK_N * VEC_COLS; idx += THREADS) {
+            int row = idx / VEC_COLS, col = idx % VEC_COLS;
             int g = kv_start + row;
-            smem_v[row * KV_STRIDE + col] =
-                (g < seq_len && row < kv_count) ? V_head[g * D_HEAD + col]
-                                                 : __float2half(0.0f);
+            uint4 val = (g < seq_len && row < kv_count)
+                ? reinterpret_cast<const uint4*>(V_head + g * D_HEAD)[col]
+                : make_uint4(0, 0, 0, 0);
+            reinterpret_cast<uint4*>(smem_v + row * KV_STRIDE)[col] = val;
         }
         __syncthreads();
 
