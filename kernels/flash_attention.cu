@@ -252,12 +252,9 @@ __global__ void flash_attention_wmma_kernel(
         __syncthreads();
 
         // === Step D: O += P * V via WMMA ===================================
-        // Reuse smem_s as O buffer (smem_s no longer needed — probs are in smem_p)
+        // Each (mi,di) tile is computed by exactly one warp — no conflicts,
+        // no need to zero first. Just write directly.
         float* smem_o = smem_s;
-
-        for (int idx = tid; idx < BLOCK_M * D_HEAD; idx += THREADS)
-            smem_o[idx] = 0.0f;
-        __syncthreads();
 
         for (int tile_idx = warp_id; tile_idx < TOTAL_PV_TILES; tile_idx += NUM_WARPS) {
             int mi = tile_idx / TILES_D;
