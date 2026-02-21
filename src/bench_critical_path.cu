@@ -58,6 +58,51 @@ static void fill_ones(half* d_ptr, size_t n) {
     cudaMemcpy(d_ptr, h.data(), n * sizeof(half), cudaMemcpyHostToDevice);
 }
 
+// ============================================================================
+// Deinterleave: [N, 3*d] -> Q[N,d], K[N,d], V[N,d]
+// Vectorized with half2 loads/stores
+// ============================================================================
+__global__ void deinterleave_qkv_kernel(
+    const half* __restrict__ qkv,   // [N, 3*d_model]
+    half* __restrict__ Q,           // [N, d_model]
+    half* __restrict__ K,           // [N, d_model]
+    half* __restrict__ V,           // [N, d_model]
+    int N, int d_model)
+{
+    const int stride_3d = 3 * d_model;
+    // Each thread handles 2 elements (half2)
+    const int d_model_h2 = d_model / 2;
+    const int total_h2 = N * d_model_h2;
+    
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total_h2;
+         idx += gridDim.x * blockDim.x)
+    {
+        int row = idx / d_model_h2;
+        int col_h2 = idx % d_model_h2;
+        int col = col_h2 * 2;
+        
+        const half2* src = (const half2*)(qkv + row * stride_3d);
+        half2* dst_q = (half2*)(Q + row * d_model);
+        half2* dst_k = (half2*)(K + row * d_model);
+        half2* dst_v = (half2*)(V + row * d_model);
+        
+        dst_q[col_h2] = src[(col) / 2];
+        dst_k[col_h2] = src[(d_model + col) / 2];
+        dst_v[col_h2] = src[(2 * d_model + col) / 2];
+    }
+}
+
+void launch_deinterleave_qkv(const half* qkv, half* Q, half* K, half* V,
+                              int N, int d_model, cudaStream_t stream = 0) {
+    int d_model_h2 = d_model / 2;
+    int total = N * d_model_h2;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    blocks = std::min(blocks, 1024);
+    deinterleave_qkv_kernel<<<blocks, threads, 0, stream>>>(qkv, Q, K, V, N, d_model);
+}
+
 template<typename Fn>
 static float bench_kernel(Fn&& fn, int warmup = 10, int iters = 50) {
     for (int i = 0; i < warmup; i++) fn();
@@ -90,13 +135,13 @@ int main() {
     printf("================================================================\n\n");
 
     // --- Model Config ---
-    // GPT-2 medium / LLaMA-like small
-    const int d_model  = 768;
-    const int n_heads  = 12;
-    const int d_head   = 64;  // d_model / n_heads
-    const int d_ffn    = 2048; // SwiGLU: 2/3 * 4 * d_model
-    const int seq_len  = 512;
-    const int batch    = 4;
+    // LLaMA-7B scale (d_head=64 for flash attn v9 compatibility, so 64 heads instead of 32x128)
+    const int d_model  = 4096;
+    const int n_heads  = 64;   // LLaMA uses 32x128, we use 64x64 (same d_model, FA v9 compatible)
+    const int d_head   = 64;   // FA v9 constraint
+    const int d_ffn    = 11008; // LLaMA-7B FFN width
+    const int seq_len  = 2048;
+    const int batch    = 1;
     const int N        = batch * seq_len;  // Total tokens
 
     printf("  Config: d=%d, H=%d, d_h=%d, d_ffn=%d, B=%d, S=%d, N=%d\n\n",
@@ -107,6 +152,8 @@ int main() {
     half *d_Q, *d_K, *d_V, *d_attn_out;
     half *d_ffn_gate, *d_ffn_up, *d_ffn_inter, *d_ffn_out;
     half *d_Wq, *d_Wk, *d_Wv, *d_Wo, *d_Wgate, *d_Wup, *d_Wdown;
+    half *d_Wqkv;    // Fused [3*d_model, d_model]
+    half *d_QKV;     // Fused output [N, 3*d_model]
     half *d_ln1_gamma, *d_ln1_beta, *d_ln2_gamma, *d_ln2_beta;
     float *d_attn_lse;
 
@@ -133,6 +180,8 @@ int main() {
     cudaMalloc(&d_Wgate, (size_t)d_ffn * d_model * sizeof(half));
     cudaMalloc(&d_Wup,   (size_t)d_ffn * d_model * sizeof(half));
     cudaMalloc(&d_Wdown, (size_t)d_model * d_ffn * sizeof(half));
+    cudaMalloc(&d_Wqkv, (size_t)3 * d_model * d_model * sizeof(half));
+    cudaMalloc(&d_QKV,  (size_t)N * 3 * d_model * sizeof(half));
     cudaMalloc(&d_ln1_gamma, d_model * sizeof(half));
     cudaMalloc(&d_ln1_beta,  d_model * sizeof(half));
     cudaMalloc(&d_ln2_gamma, d_model * sizeof(half));
@@ -147,6 +196,7 @@ int main() {
     fill_random(d_Wgate, (size_t)d_ffn * d_model);
     fill_random(d_Wup, (size_t)d_ffn * d_model);
     fill_random(d_Wdown, (size_t)d_model * d_ffn);
+    fill_random(d_Wqkv, (size_t)3 * d_model * d_model);
     fill_ones(d_ln1_gamma, d_model);
     fill_ones(d_ln1_beta, d_model);  // beta=1 is wrong but doesn't matter for timing
     fill_ones(d_ln2_gamma, d_model);
@@ -243,6 +293,47 @@ int main() {
                N, d_model, d_model, ms, tflops, 100 * tflops / peak_tflops);
     }
 
+    printf("\n  --- Fused QKV ---\n");
+
+    float fused_qkv_gemm_ms, deinterleave_ms;
+
+    // 7a. Fused QKV GEMM: [N, d_model] x [3*d_model, d_model]^T -> [N, 3*d_model]
+    {
+        float ms = bench_kernel([&]{
+            gemm.gemm_nt(d_ln_out, d_Wqkv, d_QKV, N, 3 * d_model, d_model);
+        });
+        fused_qkv_gemm_ms = ms;
+        double flops = 2.0 * N * 3 * d_model * d_model;
+        double tflops = flops / (ms * 1e-3) / 1e12;
+        printf("  QKV fused GEMM [%d x %d x %d]:  %.3f ms  %.1f TFLOPS (%.0f%%)\n",
+               N, 3 * d_model, d_model, ms, tflops, 100 * tflops / peak_tflops);
+    }
+
+    // 7b. Deinterleave: [N, 3*d] -> Q, K, V
+    {
+        float ms = bench_kernel([&]{
+            launch_deinterleave_qkv(d_QKV, d_Q, d_K, d_V, N, d_model);
+        });
+        deinterleave_ms = ms;
+        double bytes = (double)N * 3 * d_model * sizeof(half) * 2;  // read + write
+        double gbps = bytes / (ms * 1e-3) / 1e9;
+        printf("  Deinterleave [%d x %d]:          %.3f ms  (%.0f GB/s)\n",
+               N, 3 * d_model, ms, gbps);
+    }
+
+    // 7c. Total fused vs separate
+    {
+        float separate_ms = 3 * bench_kernel([&]{
+            gemm.gemm_nt(d_ln_out, d_Wq, d_Q, N, d_model, d_model);
+        });
+        float fused_total = fused_qkv_gemm_ms + deinterleave_ms;
+        printf("  Separate Q+K+V:  %.3f ms\n", separate_ms);
+        printf("  Fused QKV+split: %.3f ms  (%.1f%% %s)\n",
+               fused_total,
+               100 * fabsf(fused_total - separate_ms) / separate_ms,
+               fused_total < separate_ms ? "faster" : "slower");
+    }
+
     // 8. Attention output: [N, d_model] x [d_model, d_model]^T
     {
         float ms = bench_kernel([&]{ gemm.gemm_nt(d_attn_out, d_Wo, d_ffn_out, N, d_model, d_model); });
@@ -318,10 +409,9 @@ int main() {
         ln1.eps = 1e-5f; ln1.use_rmsnorm = false; ln1.stream = 0;
         launch_fused_layernorm(ln1);
 
-        // Step 2: Q, K, V projections
-        gemm.gemm_nt(d_ln_out, d_Wq, d_Q, N, d_model, d_model);
-        gemm.gemm_nt(d_ln_out, d_Wk, d_K, N, d_model, d_model);
-        gemm.gemm_nt(d_ln_out, d_Wv, d_V, N, d_model, d_model);
+        // Step 2: Fused QKV projection + deinterleave
+        gemm.gemm_nt(d_ln_out, d_Wqkv, d_QKV, N, 3 * d_model, d_model);
+        launch_deinterleave_qkv(d_QKV, d_Q, d_K, d_V, N, d_model);
 
         // Step 3: RoPE
         launch_rope(d_Q, d_K, rope, batch * n_heads, seq_len, 0, 0);
@@ -369,8 +459,9 @@ int main() {
     float layer_ms = bench_kernel(run_full_layer, 5, 30);
 
     // Total FLOPs for one layer:
-    // 4 GEMM [N,d,d] + 2 GEMM [N,d_ffn,d] + 1 GEMM [N,d,d_ffn] + FlashAttn
-    double gemm_flops = 4.0 * (2.0 * N * d_model * d_model)       // Q,K,V,O projections
+    // 1 fused QKV GEMM [N,3d,d] + 1 GEMM [N,d,d] + 2 GEMM [N,d_ffn,d] + 1 GEMM [N,d,d_ffn] + FlashAttn
+    double gemm_flops = 1.0 * (2.0 * N * 3 * d_model * d_model)   // fused QKV
+                      + 1.0 * (2.0 * N * d_model * d_model)       // O projection
                       + 2.0 * (2.0 * N * d_ffn * d_model)         // gate + up
                       + 1.0 * (2.0 * N * d_model * d_ffn);        // down
     double attn_flops = 4.0 * batch * n_heads * (double)seq_len * seq_len * d_head;
@@ -384,7 +475,7 @@ int main() {
 
     // Compute sum of individual kernel times for comparison
     printf("\n--- Summary ---\n\n");
-    printf("  GEMM shapes tested at transformer-realistic sizes\n");
+    printf("  Fused QKV projection (1 GEMM + deinterleave vs 3 GEMMs)\n");
     printf("  FlashAttn v9 with PTX mma.sync.m16n8k16\n");
     printf("  Fused LN+residual, vectorized SwiGLU\n");
     printf("  All on single stream, no overlap\n");
@@ -396,6 +487,7 @@ int main() {
     cudaFree(d_ffn_gate); cudaFree(d_ffn_up); cudaFree(d_ffn_inter); cudaFree(d_ffn_out);
     cudaFree(d_Wq); cudaFree(d_Wk); cudaFree(d_Wv); cudaFree(d_Wo);
     cudaFree(d_Wgate); cudaFree(d_Wup); cudaFree(d_Wdown);
+    cudaFree(d_Wqkv); cudaFree(d_QKV);
     cudaFree(d_ln1_gamma); cudaFree(d_ln1_beta);
     cudaFree(d_ln2_gamma); cudaFree(d_ln2_beta);
     cudaFree(d_attn_lse);
