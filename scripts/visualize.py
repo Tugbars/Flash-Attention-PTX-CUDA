@@ -86,15 +86,26 @@ def plot_attention_heatmap(P, save_path):
     B, H, S, _ = P.shape
     b = 0  # First batch
 
-    fig, axes = plt.subplots(1, H, figsize=(4 * H, 4), facecolor=COLORS['bg'])
+    head_names = ['Head 0: Local', 'Head 1: Strided', 'Head 2: Global+Anchor', 'Head 3: Block']
+    if H != 4:
+        head_names = [f'Head {h}' for h in range(H)]
+
+    fig, axes = plt.subplots(1, H, figsize=(4.5 * H, 4.5), facecolor=COLORS['bg'])
     fig.suptitle('Attention Weights by Head (Causal Mask)',
                  color=COLORS['fg'], fontsize=14, fontweight='bold', y=1.02)
 
     for h in range(H):
         ax = axes[h] if H > 1 else axes
-        im = ax.imshow(P[b, h], cmap=attention_cmap, aspect='auto',
-                       interpolation='nearest', vmin=0)
-        style_axis(ax, f'Head {h}')
+        # Log-scale to reveal structure: log(P + eps)
+        P_h = P[b, h].copy()
+        P_log = np.log10(P_h + 1e-8)
+        # Per-head normalization
+        vmin = np.percentile(P_log[P_h > 1e-8], 1) if np.any(P_h > 1e-8) else -8
+        vmax = np.max(P_log)
+
+        im = ax.imshow(P_log, cmap=attention_cmap, aspect='auto',
+                       interpolation='nearest', vmin=vmin, vmax=vmax)
+        style_axis(ax, head_names[h] if h < len(head_names) else f'Head {h}')
         ax.set_xlabel('Key Position', color=COLORS['dim'], fontsize=8)
         if h == 0:
             ax.set_ylabel('Query Position', color=COLORS['dim'], fontsize=8)
@@ -117,18 +128,22 @@ def plot_attention_detail(P, save_path):
     fig = plt.figure(figsize=(14, 5), facecolor=COLORS['bg'])
     gs = gridspec.GridSpec(1, 3, width_ratios=[1, 1, 0.8], wspace=0.3)
 
-    # Full attention matrix
+    # Full attention matrix (log scale)
     ax1 = fig.add_subplot(gs[0])
-    im = ax1.imshow(P[b, h], cmap=attention_cmap, aspect='auto', vmin=0)
-    style_axis(ax1, f'Full Attention (Head 0)')
+    P_log = np.log10(P[b, h] + 1e-8)
+    vmin = np.percentile(P_log[P[b,h] > 1e-8], 1) if np.any(P[b,h] > 1e-8) else -8
+    im = ax1.imshow(P_log, cmap=attention_cmap, aspect='auto', vmin=vmin)
+    style_axis(ax1, f'Full Attention (Head 0, log₁₀)')
     ax1.set_xlabel('Key Position', color=COLORS['dim'], fontsize=8)
     ax1.set_ylabel('Query Position', color=COLORS['dim'], fontsize=8)
 
-    # Zoomed: first 32x32
+    # Zoomed: first 64x64
     ax2 = fig.add_subplot(gs[1])
-    zoom = min(32, S)
-    im2 = ax2.imshow(P[b, h, :zoom, :zoom], cmap=attention_cmap, aspect='auto', vmin=0)
-    style_axis(ax2, f'Zoomed (0:{zoom})')
+    zoom = min(64, S)
+    P_zoom = np.log10(P[b, h, :zoom, :zoom] + 1e-8)
+    vmin_z = np.percentile(P_zoom[P[b,h,:zoom,:zoom] > 1e-8], 1) if np.any(P[b,h,:zoom,:zoom] > 1e-8) else -8
+    im2 = ax2.imshow(P_zoom, cmap=attention_cmap, aspect='auto', vmin=vmin_z)
+    style_axis(ax2, f'Zoomed (0:{zoom}, log₁₀)')
     ax2.set_xlabel('Key Position', color=COLORS['dim'], fontsize=8)
     ax2.set_ylabel('Query Position', color=COLORS['dim'], fontsize=8)
 
@@ -344,37 +359,44 @@ def main():
     print("  Flash Attention Visualization")
     print("=" * 60)
 
+    # Data directory: default to current dir, or pass as argument
+    data_dir = sys.argv[1] if len(sys.argv) > 1 else '.'
+    print(f"\n  Data directory: {os.path.abspath(data_dir)}")
+
     # Check for data files
     required = ['attention_weights.bin', 'output_gpu.bin', 'output_ref.bin']
-    missing = [f for f in required if not os.path.exists(f)]
+    missing = [f for f in required if not os.path.exists(os.path.join(data_dir, f))]
     if missing:
         print(f"\nError: Missing data files: {missing}")
-        print("Run ./flash_demo first to generate them.")
+        print(f"Run flash_demo first, then: python visualize.py <build_dir>")
+        print(f"Example: python scripts/visualize.py build/")
         sys.exit(1)
 
-    os.makedirs('figures', exist_ok=True)
+    fig_dir = os.path.join(data_dir, 'figures')
+    os.makedirs(fig_dir, exist_ok=True)
 
     # Load data
     print("\nLoading data...")
-    P = read_binary('attention_weights.bin')
-    O_gpu = read_binary('output_gpu.bin')
-    O_ref = read_binary('output_ref.bin')
+    P = read_binary(os.path.join(data_dir, 'attention_weights.bin'))
+    O_gpu = read_binary(os.path.join(data_dir, 'output_gpu.bin'))
+    O_ref = read_binary(os.path.join(data_dir, 'output_ref.bin'))
     print(f"  Attention weights: {P.shape}")
     print(f"  GPU output:        {O_gpu.shape}")
     print(f"  CPU reference:     {O_ref.shape}")
 
     # Generate figures
     print("\nGenerating figures...")
-    plot_attention_heatmap(P, 'figures/attention_heatmap.png')
-    plot_attention_detail(P, 'figures/attention_detail.png')
-    plot_error_analysis(O_ref, O_gpu, 'figures/error_analysis.png')
-    plot_head_comparison(P, 'figures/head_comparison.png')
+    plot_attention_heatmap(P, os.path.join(fig_dir, 'attention_heatmap.png'))
+    plot_attention_detail(P, os.path.join(fig_dir, 'attention_detail.png'))
+    plot_error_analysis(O_ref, O_gpu, os.path.join(fig_dir, 'error_analysis.png'))
+    plot_head_comparison(P, os.path.join(fig_dir, 'head_comparison.png'))
 
-    if os.path.exists('perf_data.csv'):
-        plot_performance('perf_data.csv', 'figures/performance.png')
+    perf_csv = os.path.join(data_dir, 'perf_data.csv')
+    if os.path.exists(perf_csv):
+        plot_performance(perf_csv, os.path.join(fig_dir, 'performance.png'))
 
     print(f"\n{'=' * 60}")
-    print(f"  All figures saved to figures/")
+    print(f"  All figures saved to {fig_dir}/")
     print(f"{'=' * 60}")
 
 
