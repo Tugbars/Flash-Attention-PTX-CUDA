@@ -47,11 +47,20 @@ target_compile_options(flash_attention PRIVATE
 )
 
 # ============================================================================
-# Demo Executable
+# Demo — Runs kernel, dumps visualization data
 # ============================================================================
 add_executable(flash_demo src/demo.cu)
 target_link_libraries(flash_demo PRIVATE flash_attention)
 target_include_directories(flash_demo PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+# ============================================================================
+# Benchmark — Correctness tests + performance suite
+# ============================================================================
+add_executable(flash_bench src/bench.cu)
+target_link_libraries(flash_bench PRIVATE flash_attention)
+target_include_directories(flash_bench PRIVATE
     ${CMAKE_SOURCE_DIR}/include
 )
 
