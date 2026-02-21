@@ -1,6 +1,6 @@
 <p align="center">
-  <img width="2681" height="696" alt="attention_heatmap" src="https://github.com/user-attachments/assets/e6bd7a71-9023-4b7f-9464-19c25097f1c9" />
-"100%">
+  <img width="2681" height="696" alt="attention_heatmap" src="https://github.com/user-attachments/assets/e6bd7a71-9023-4b7f-9464-19c25097f1c9""100%" />
+
 </p>
 
 <h1 align="center">Flash Attention PTX/CUDA</h1>
