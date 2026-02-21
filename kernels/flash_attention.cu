@@ -13,7 +13,7 @@
 //   BLOCK_M = 64 query rows per threadblock
 //   BLOCK_N = 64 KV rows per tile iteration
 //   D_HEAD  = 64 head dimension (tiled in 16-wide WMMA chunks)
-//   8 warps per block (256 threads)
+//   8 warps per block (256 threads) edited
 // ============================================================================
 
 #include <cuda_fp16.h>
