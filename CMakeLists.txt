@@ -80,6 +80,16 @@ target_include_directories(transformer_bench PRIVATE
 )
 
 # ============================================================================
+# Flash Attention Demo
+# ============================================================================
+add_executable(flash_demo src/demo.cu)
+target_link_libraries(flash_demo PRIVATE cuda_transformer)
+target_include_directories(flash_demo PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CUTLASS_INCLUDE_DIR}
+)
+
+# ============================================================================
 # Install
 # ============================================================================
 install(TARGETS cuda_transformer ARCHIVE DESTINATION lib)
