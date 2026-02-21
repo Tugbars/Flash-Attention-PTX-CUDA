@@ -154,6 +154,142 @@ void benchmark_layernorm(int N, int D, int warmup = 10, int iters = 1000)
     cudaFree(beta); cudaFree(output); cudaFree(res_out);
 }
 
+
+// ============================================================================
+// Minimal PTX MMA + ldmatrix test
+// Tests a single 16x8 = 16x16 * 16x8 multiplication
+// with known values, prints results for verification.
+// Add to main.cu before main(), call as: test_ptx_mma();
+// ============================================================================
+
+__device__ __forceinline__ void test_ldmatrix_x4(
+    uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3,
+    const void* smem_ptr)
+{
+    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+        : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+
+__device__ __forceinline__ void test_ldmatrix_x2_trans(
+    uint32_t& r0, uint32_t& r1, const void* smem_ptr)
+{
+    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];"
+        : "=r"(r0), "=r"(r1) : "r"(addr));
+}
+
+__device__ __forceinline__ void test_ptx_mma_m16n8k16(
+    float& d0, float& d1, float& d2, float& d3,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1,
+    float c0, float c1, float c2, float c3)
+{
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};"
+        : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+          "r"(b0), "r"(b1),
+          "f"(c0), "f"(c1), "f"(c2), "f"(c3));
+}
+
+// Test kernel: compute C = A * B where A is 16x16, B is 16x8
+// A is row-major, B is col-major (for MMA)
+// Use identity-like test: A[i][j] = (i == j) ? 1 : 0 (identity)
+// Then C should equal the first 16 rows of B
+__global__ void test_mma_kernel(float* result) {
+    const int lane_id = threadIdx.x;
+    constexpr int PAD = 8;
+    constexpr int A_STRIDE = 16 + PAD;
+    constexpr int B_STRIDE = 8 + PAD;
+
+    __shared__ half smem_a[16 * A_STRIDE];  // 16x16 row-major + pad
+    __shared__ half smem_b[16 * B_STRIDE];  // 16x8 row-major + pad (ldmatrix.trans will handle)
+
+    // Fill A = identity matrix (16x16)
+    for (int idx = lane_id; idx < 16 * A_STRIDE; idx += 32) {
+        int r = idx / A_STRIDE, c = idx % A_STRIDE;
+        smem_a[idx] = (c < 16 && r == c) ? __float2half(1.0f) : __float2half(0.0f);
+    }
+
+    // Fill B with known values: B[row][col] = row * 8 + col + 1
+    // B is 16 rows x 8 cols, stored row-major
+    for (int idx = lane_id; idx < 16 * B_STRIDE; idx += 32) {
+        int r = idx / B_STRIDE, c = idx % B_STRIDE;
+        smem_b[idx] = (c < 8) ? __float2half((float)(r * 8 + c + 1)) : __float2half(0.0f);
+    }
+    __syncthreads();
+
+    // Load A via ldmatrix.x4
+    uint32_t a0, a1, a2, a3;
+    {
+        int row = lane_id % 16;
+        int col = (lane_id / 16) * 8;
+        test_ldmatrix_x4(a0, a1, a2, a3, smem_a + row * A_STRIDE + col);
+    }
+
+    // Load B via ldmatrix.x2.trans
+    uint32_t b0, b1;
+    {
+        int row = lane_id % 8;
+        test_ldmatrix_x2_trans(b0, b1, smem_b + row * B_STRIDE);
+    }
+
+    // MMA: C = A * B
+    float d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+    test_ptx_mma_m16n8k16(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, 0, 0, 0, 0);
+
+    // Thread t holds:
+    //   d0: C[row0, col0], d1: C[row0, col1]
+    //   d2: C[row1, col0], d3: C[row1, col1]
+    // where row0 = (lane_id/4)%8, row1 = row0+8
+    //       col0 = (lane_id%4)*2, col1 = col0+1
+    int row0 = (lane_id / 4) % 8;
+    int row1 = row0 + 8;
+    int col0 = (lane_id % 4) * 2;
+    int col1 = col0 + 1;
+
+    // Write results: result[row * 8 + col]
+    result[row0 * 8 + col0] = d0;
+    result[row0 * 8 + col1] = d1;
+    result[row1 * 8 + col0] = d2;
+    result[row1 * 8 + col1] = d3;
+}
+
+void test_ptx_mma() {
+    printf("=== PTX MMA + ldmatrix Test ===\n");
+    printf("  C = I(16x16) * B(16x8), B[r][c] = r*8+c+1\n");
+    printf("  Expected: C = B\n\n");
+
+    float* d_result;
+    cudaMalloc(&d_result, 16 * 8 * sizeof(float));
+    cudaMemset(d_result, 0, 16 * 8 * sizeof(float));
+
+    test_mma_kernel<<<1, 32>>>(d_result);
+    cudaDeviceSynchronize();
+
+    float h_result[128];
+    cudaMemcpy(h_result, d_result, 128 * sizeof(float), cudaMemcpyDeviceToHost);
+
+    bool pass = true;
+    for (int r = 0; r < 16; r++) {
+        printf("  Row %2d: ", r);
+        for (int c = 0; c < 8; c++) {
+            float got = h_result[r * 8 + c];
+            float expected = (float)(r * 8 + c + 1);
+            printf("%6.1f", got);
+            if (fabsf(got - expected) > 0.5f) pass = false;
+        }
+        printf("\n");
+    }
+    printf("\n  Result: %s\n\n", pass ? "PASS" : "FAIL");
+
+    cudaFree(d_result);
+}
+
 void verify_flash_attention(int batch_size, int n_heads, int seq_len, int d_head) {
     printf("=== Flash Attention Correctness Check ===\n");
     printf("  B=%d, H=%d, S=%d, D=%d\n", batch_size, n_heads, seq_len, d_head);
@@ -367,6 +503,7 @@ int main(int argc, char** argv) {
     config.n_heads = 12;
     config.d_head  = 64;
 
+    test_ptx_mma();
     verify_flash_attention(1, 1, 64, 64);
 
     
