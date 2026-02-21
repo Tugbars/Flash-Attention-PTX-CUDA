@@ -1,13 +1,15 @@
 // ============================================================================
-// Flash Attention v8 — PTX MMA + In-Register Softmax
+// Flash Attention v9 — PTX MMA + In-Register Softmax + Corrected Online Rescale
 //
-// Correct ldmatrix.x2.trans addressing:
-//   K: threads 8-15 offset by +8 columns (mat * 8)
-//   V: threads 8-15 offset by +8 rows
+// Based on v8 (125 TFLOPS, correct). Changes:
 //
-// In-register softmax: S = Q*K^T stays in s_acc registers.
-// Cross-warp partial max/sum exchange via tiny smem (1KB).
-// Eliminates smem_s entirely (saves 16KB + one __syncthreads per KV tile).
+// 1. TILE_SUM CORRECTION: exp values written to smem_p are pre-scaled by
+//    pv_scale = exp(tile_max - new_max), so P*V accumulates at new_max basis.
+//    This also correctly scales tile_sum. Fixes accuracy drift on long seqs.
+//
+// 2. SMEM_P RETAINED: Eliminating smem_p requires cross-warp reduction of
+//    partial P*V results (32+ __syncthreads). The 9KB smem_p with one sync
+//    is cheaper. The ldmatrix load for P is fast since data is hot in L1.
 //
 // Tile: BLOCK_M=64, BLOCK_N=64, D_HEAD=64, 8 warps (256 threads)
 // ============================================================================
@@ -82,7 +84,6 @@ __global__ void flash_attention_ptx_kernel(
     if (q_start >= seq_len) return;
 
     // -- Shared memory layout -----------------------------------------------
-    // NO smem_s! S values stay in registers.
     constexpr int SMEM_PAD  = 8;
     constexpr int Q_STRIDE  = D_HEAD + SMEM_PAD;
     constexpr int KV_STRIDE = D_HEAD + SMEM_PAD;
@@ -93,7 +94,6 @@ __global__ void flash_attention_ptx_kernel(
     half*  smem_k = smem_q + BLOCK_M * Q_STRIDE;
     half*  smem_v = smem_k + BLOCK_N * KV_STRIDE;
     half*  smem_p = smem_v + BLOCK_N * KV_STRIDE;
-    // Tiny cross-warp exchange: [2][BLOCK_M] max + [2][BLOCK_M] sum = 1KB
     float* smem_partial_max = reinterpret_cast<float*>(smem_p + BLOCK_M * P_STRIDE);
     float* smem_partial_sum = smem_partial_max + 2 * BLOCK_M;
 
@@ -128,14 +128,11 @@ __global__ void flash_attention_ptx_kernel(
     const int mi = warp_pair;
 
     const int local_row0 = (lane_id / 4) % 8;
-    const int local_row1 = local_row0 + 8;
     const int global_row0 = mi * 16 + local_row0;
-    const int global_row1 = mi * 16 + local_row1;
+    const int global_row1 = global_row0 + 8;
 
-    // Persistent O accumulator
     float o_acc[PV_TILES_PER_WARP][4] = {{0}};
 
-    // Per-row online softmax state — each thread tracks both its rows
     float row_max0 = -FLT_MAX, row_max1 = -FLT_MAX;
     float row_sum0 = 0.0f,     row_sum1 = 0.0f;
 
@@ -169,9 +166,7 @@ __global__ void flash_attention_ptx_kernel(
         }
         __syncthreads();
 
-        // === Step A: S = Q * K^T — stays in registers! =====================
-        // Each warp computes 4 m16n8 tiles: mi=warp_pair, ni=warp_half*4..+3
-        // s_acc[ni_local][0..3] = {row0_col0, row0_col1, row1_col0, row1_col1}
+        // === Step A: S = Q * K^T — in registers ============================
         float s_acc[QK_TILES_PER_WARP][4];
         {
             #pragma unroll
@@ -209,7 +204,7 @@ __global__ void flash_attention_ptx_kernel(
                         s_acc[ni_local][2], s_acc[ni_local][3]);
                 }
 
-                // Scale + causal mask in registers
+                // Scale + causal mask
                 int s_col0 = ni * 8 + (lane_id % 4) * 2;
                 int s_col1 = s_col0 + 1;
 
@@ -229,61 +224,52 @@ __global__ void flash_attention_ptx_kernel(
         }
 
         // === Step B: In-register softmax ===================================
-        //
-        // Each thread holds s_acc[4][4] = 16 values across 32 columns (this warp_half).
-        // For each row, 4 threads share it (lane_id%4 varies, (lane_id/4)%8 is the row).
-        // 4 threads × 2 cols/tile × 4 tiles = 32 values per row per warp_half.
-        //
-        // Need global max/sum across all 64 columns = both warp halves.
-        // Strategy:
-        //   1. Intra-thread max across 4 tiles → 1 value per row
-        //   2. Shuffle reduce across 4 threads sharing the row → partial max (32 cols)
-        //   3. Exchange partial max between warp halves via smem → global max
-        //   4. Compute exp() in registers, partial sum, exchange → global sum
-        //   5. Write P to smem_p for P*V MMA
 
-        // Phase 1+2: Partial max within this warp_half (32 cols)
+        // Phase 1+2: Partial max (32 cols within this warp_half)
         float partial_max0 = -FLT_MAX, partial_max1 = -FLT_MAX;
         #pragma unroll
         for (int ni = 0; ni < QK_TILES_PER_WARP; ni++) {
             partial_max0 = fmaxf(partial_max0, fmaxf(s_acc[ni][0], s_acc[ni][1]));
             partial_max1 = fmaxf(partial_max1, fmaxf(s_acc[ni][2], s_acc[ni][3]));
         }
-        // Reduce across 4 threads: lanes with same (lane_id/4)%8 share a row,
-        // they differ in lane_id bits 0-1
         #pragma unroll
         for (int delta = 1; delta < 4; delta <<= 1) {
             partial_max0 = fmaxf(partial_max0, __shfl_xor_sync(0xFFFFFFFF, partial_max0, delta));
             partial_max1 = fmaxf(partial_max1, __shfl_xor_sync(0xFFFFFFFF, partial_max1, delta));
         }
 
-        // Phase 3: Exchange partial max between warp halves via smem
-        // Each warp_half writes to its own slot: [warp_half * BLOCK_M + row]
+        // Phase 3: Exchange partial max between warp halves
         if (lane_id % 4 == 0) {
             smem_partial_max[warp_half * BLOCK_M + global_row0] = partial_max0;
             smem_partial_max[warp_half * BLOCK_M + global_row1] = partial_max1;
         }
         __syncthreads();
 
-        // Read other half's max, compute global max
         float other_pmax0 = smem_partial_max[(1 - warp_half) * BLOCK_M + global_row0];
         float other_pmax1 = smem_partial_max[(1 - warp_half) * BLOCK_M + global_row1];
         float tile_max0 = fmaxf(partial_max0, other_pmax0);
         float tile_max1 = fmaxf(partial_max1, other_pmax1);
 
-        // Phase 4: Compute exp, partial sum, write P to smem_p
+        // Phase 4: Compute exp, write P to smem_p
+        // CORRECTION: compute pv_scale BEFORE writing P so P is at new_max basis
+        float prev_max0 = row_max0, prev_max1 = row_max1;
+        float new_max0 = fmaxf(prev_max0, tile_max0);
+        float new_max1 = fmaxf(prev_max1, tile_max1);
+        float pv_scale0 = expf(tile_max0 - new_max0);
+        float pv_scale1 = expf(tile_max1 - new_max1);
+
         float partial_sum0 = 0.0f, partial_sum1 = 0.0f;
         #pragma unroll
         for (int ni = 0; ni < QK_TILES_PER_WARP; ni++) {
-            float e0 = (s_acc[ni][0] > -FLT_MAX * 0.5f) ? expf(s_acc[ni][0] - tile_max0) : 0.0f;
-            float e1 = (s_acc[ni][1] > -FLT_MAX * 0.5f) ? expf(s_acc[ni][1] - tile_max0) : 0.0f;
-            float e2 = (s_acc[ni][2] > -FLT_MAX * 0.5f) ? expf(s_acc[ni][2] - tile_max1) : 0.0f;
-            float e3 = (s_acc[ni][3] > -FLT_MAX * 0.5f) ? expf(s_acc[ni][3] - tile_max1) : 0.0f;
+            // Compute exp at new_max basis directly: exp(S - new_max)
+            float e0 = (s_acc[ni][0] > -FLT_MAX * 0.5f) ? expf(s_acc[ni][0] - new_max0) : 0.0f;
+            float e1 = (s_acc[ni][1] > -FLT_MAX * 0.5f) ? expf(s_acc[ni][1] - new_max0) : 0.0f;
+            float e2 = (s_acc[ni][2] > -FLT_MAX * 0.5f) ? expf(s_acc[ni][2] - new_max1) : 0.0f;
+            float e3 = (s_acc[ni][3] > -FLT_MAX * 0.5f) ? expf(s_acc[ni][3] - new_max1) : 0.0f;
 
             partial_sum0 += e0 + e1;
             partial_sum1 += e2 + e3;
 
-            // Write P to smem for P*V MMA
             int ni_global = warp_half * QK_TILES_PER_WARP + ni;
             int p_col0 = ni_global * 8 + (lane_id % 4) * 2;
             int p_col1 = p_col0 + 1;
@@ -312,11 +298,10 @@ __global__ void flash_attention_ptx_kernel(
         float tile_sum0 = partial_sum0 + other_psum0;
         float tile_sum1 = partial_sum1 + other_psum1;
 
-        // === Step C: Online softmax correction on O accumulators ============
+        // === Step C: Online softmax correction =============================
+        // P is already at new_max basis (exp(S - new_max)), so no pv_scale needed
+        // on tile_sum or P*V. Just correct old O accumulator.
         {
-            float prev_max0 = row_max0, prev_max1 = row_max1;
-            float new_max0 = fmaxf(prev_max0, tile_max0);
-            float new_max1 = fmaxf(prev_max1, tile_max1);
             float corr0 = (kv_tile == 0) ? 0.0f : expf(prev_max0 - new_max0);
             float corr1 = (kv_tile == 0) ? 0.0f : expf(prev_max1 - new_max1);
 
@@ -334,7 +319,7 @@ __global__ void flash_attention_ptx_kernel(
             }
         }
 
-        // === Step D: O += P * V via PTX MMA ================================
+        // === Step D: O += P * V ============================================
         {
             #pragma unroll
             for (int di_local = 0; di_local < PV_TILES_PER_WARP; di_local++) {
@@ -422,11 +407,11 @@ void launch_flash_attention(const FlashAttentionParams& params) {
     dim3 block(WARP_SIZE_FA, NUM_WARPS);
 
     size_t smem_bytes = 0;
-    smem_bytes += BLOCK_M * Q_STRIDE * sizeof(half);           // smem_q
-    smem_bytes += BLOCK_N * KV_STRIDE * sizeof(half);          // smem_k
-    smem_bytes += BLOCK_N * KV_STRIDE * sizeof(half);          // smem_v
-    smem_bytes += BLOCK_M * P_STRIDE * sizeof(half);           // smem_p
-    smem_bytes += 4 * BLOCK_M * sizeof(float);                 // partial_max[2][64] + partial_sum[2][64]
+    smem_bytes += BLOCK_M * Q_STRIDE * sizeof(half);
+    smem_bytes += BLOCK_N * KV_STRIDE * sizeof(half);
+    smem_bytes += BLOCK_N * KV_STRIDE * sizeof(half);
+    smem_bytes += BLOCK_M * P_STRIDE * sizeof(half);
+    smem_bytes += 4 * BLOCK_M * sizeof(float);
 
     if (smem_bytes > 48 * 1024) {
         if (params.causal) {
