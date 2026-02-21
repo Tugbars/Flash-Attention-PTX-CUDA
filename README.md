@@ -46,7 +46,7 @@ Consumer Blackwell (sm_120) lacks the datacenter features that make H100/B200 at
 
 Measured on RTX 5080 (84 SMs, 234.8 TFLOPS FP16 theoretical peak).
 
-For context, Flash Attention 2 on the A100 (datacenter Ampere with dedicated TMA hardware) achieves approximately 60% tensor core utilization. This consumer Blackwell kernel reaches 58% without WGMMA, TMA, or warp specialization — using only tools available on consumer silicon.
+For context, Flash Attention 2 on the A100 (datacenter Ampere with dedicated TMA hardware) achieves approximately 60% tensor core utilization. This consumer Blackwell kernel reaches 58% without WGMMA, TMA, or warp specialization, using only tools available on consumer silicon.
 
 ### Optimization progression
 
