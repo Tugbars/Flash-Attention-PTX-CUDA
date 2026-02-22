@@ -642,6 +642,21 @@ int main(int argc, char** argv) {
     int prompt_len = static_cast<int>(prompt_tokens.size());
     printf("\nPrompt: \"%s\" → %d tokens\n", args.prompt.c_str(), prompt_len);
 
+    // Print encoded tokens for debugging
+    printf("  Token IDs: [");
+    for (int i = 0; i < prompt_len && i < 40; i++) {
+        printf("%d", prompt_tokens[i]);
+        if (i < prompt_len - 1) printf(", ");
+    }
+    if (prompt_len > 40) printf("...");
+    printf("]\n");
+    printf("  Decoded back: \"");
+    for (int i = 0; i < prompt_len && i < 40; i++) {
+        std::string tok = tokenizer.decode_token(prompt_tokens[i]);
+        printf("%s", tok.c_str());
+    }
+    printf("\"\n");
+
     if (prompt_len >= cfg.max_seq_len) {
         fprintf(stderr, "Prompt too long (%d tokens, max %d)\n",
                 prompt_len, cfg.max_seq_len);
@@ -699,6 +714,18 @@ int main(int argc, char** argv) {
             cfg.d_model, prompt_len);
     }
 
+    // DIAGNOSTIC: check embedding output
+    {
+        std::vector<half> h_embed(16);
+        cudaMemcpyAsync(h_embed.data(), sc.hidden, 16 * sizeof(half),
+                        cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+        printf("  [DIAG] First 8 embedding values: ");
+        for (int i = 0; i < 8; i++)
+            printf("%.4f ", __half2float(h_embed[i]));
+        printf("\n");
+    }
+
     // Forward pass (prefill: all prompt tokens at once, always eager)
     forward_pass(model, sc, kv, gemm, rope,
                  1, prompt_len, 0, stream);
@@ -714,6 +741,42 @@ int main(int argc, char** argv) {
     float prefill_ms = std::chrono::duration<float, std::milli>(t_prefill - t_start).count();
     printf("  Prefill: %.1f ms (%.0f tok/s)\n",
            prefill_ms, prompt_len * 1000.0f / prefill_ms);
+
+    // ── DIAGNOSTIC: print top-10 logits after prefill ────────────────────
+    {
+        // Find min/max/mean
+        float lmin = h_logits[0], lmax = h_logits[0], lsum = 0;
+        for (int i = 0; i < cfg.vocab_size; i++) {
+            lmin = std::min(lmin, h_logits[i]);
+            lmax = std::max(lmax, h_logits[i]);
+            lsum += h_logits[i];
+        }
+        float lmean = lsum / cfg.vocab_size;
+        printf("\n  [DIAG] Logits: min=%.2f max=%.2f mean=%.4f\n", lmin, lmax, lmean);
+
+        // Check for NaN/Inf
+        int nan_count = 0, inf_count = 0;
+        for (int i = 0; i < cfg.vocab_size; i++) {
+            if (std::isnan(h_logits[i])) nan_count++;
+            if (std::isinf(h_logits[i])) inf_count++;
+        }
+        if (nan_count || inf_count)
+            printf("  [DIAG] WARNING: %d NaN, %d Inf in logits!\n", nan_count, inf_count);
+
+        // Top-10 tokens
+        std::vector<std::pair<float, int>> scored(cfg.vocab_size);
+        for (int i = 0; i < cfg.vocab_size; i++)
+            scored[i] = {h_logits[i], i};
+        std::partial_sort(scored.begin(), scored.begin() + 10, scored.end(),
+                          [](auto& a, auto& b) { return a.first > b.first; });
+        printf("  [DIAG] Top-10 after prefill:\n");
+        for (int i = 0; i < 10; i++) {
+            std::string tok = tokenizer.decode_token(scored[i].second);
+            printf("    %2d. id=%6d logit=%8.3f  \"%s\"\n",
+                   i+1, scored[i].second, scored[i].first, tok.c_str());
+        }
+        printf("\n");
+    }
 
     // ── 6. Decode loop ───────────────────────────────────────────────────
     printf("\n--- Generation (%s) ---\n", use_graph ? "CUDA graph" : "eager");

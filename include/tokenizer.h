@@ -157,12 +157,19 @@ public:
         // Detect special tokens
         for (uint32_t i = 0; i < vocab_size; i++) {
             const auto& tok = id_to_token_[i];
-            if (tok == "<|begin_of_text|>") bos_id = i;
-            else if (tok == "<|end_of_text|>") eos_id = i;
-            else if (tok == "<s>" && bos_id < 0) bos_id = i;
-            else if (tok == "</s>" && eos_id < 0) eos_id = i;
+            // BOS tokens (in priority order)
+            if (tok == "<|begin_of_text|>") bos_id = i;         // Llama 3
+            else if (tok == "<s>" && bos_id < 0) bos_id = i;    // Llama 2, Mistral
+
+            // EOS tokens (in priority order)
+            if (tok == "<|end_of_text|>") eos_id = i;            // Llama 3
+            else if (tok == "<|endoftext|>" && eos_id < 0) eos_id = i;  // Qwen, GPT
+            else if (tok == "<|end▁of▁sentence|>" && eos_id < 0) eos_id = i;  // DeepSeek
+            else if (tok == "</s>" && eos_id < 0) eos_id = i;    // Llama 2, Mistral
         }
 
+        // Override from model config if provided (more reliable than string matching)
+        // This is done in main after loading config, but print what we found here
         printf("  BOS=%d, EOS=%d\n", bos_id, eos_id);
         return true;
     }
