@@ -489,6 +489,90 @@ def print_summary(forge_config: dict, hf_tensors: dict):
 
 
 # =============================================================================
+# Vocab Export — write .forge.vocab file for C tokenizer
+# =============================================================================
+def export_vocab(model_path: str, output_path: str):
+    """Export tokenizer vocab and merges to .forge.vocab format.
+    
+    Reads tokenizer.json (HuggingFace format) and writes a simple text file:
+      Line 1: vocab_size
+      Line 2: n_merges
+      Lines:  id<TAB>base64(token_bytes)
+      Lines:  id1<SPACE>id2  (merge pairs)
+    """
+    import base64
+
+    tok_path = os.path.join(model_path, "tokenizer.json")
+    if not os.path.exists(tok_path):
+        print(f"  WARNING: tokenizer.json not found in {model_path}")
+        print(f"  Vocab file not created. You can add it manually later.")
+        return
+
+    print(f"\n  Exporting tokenizer from {tok_path}")
+    with open(tok_path) as f:
+        tok_data = json.load(f)
+
+    model_data = tok_data.get("model", {})
+    vocab = model_data.get("vocab", {})
+    merges = model_data.get("merges", [])
+
+    # Also collect added_tokens (special tokens)
+    added_tokens = tok_data.get("added_tokens", [])
+    for at in added_tokens:
+        content = at.get("content", "")
+        at_id = at.get("id", -1)
+        if content and at_id >= 0:
+            vocab[content] = at_id
+
+    vocab_size = len(vocab)
+    n_merges = len(merges)
+    print(f"  Vocab: {vocab_size} tokens, {n_merges} merges")
+
+    # Build id→token_bytes mapping
+    # In tiktoken/BPE, vocab keys are the token strings (which may contain
+    # arbitrary bytes). We store them as base64 to be safe in a text file.
+    id_to_bytes = {}
+    for token_str, token_id in vocab.items():
+        # token_str is the string representation of the token bytes
+        token_bytes = token_str.encode("utf-8")
+        id_to_bytes[token_id] = token_bytes
+
+    # Parse merges: each merge is "tokenA tokenB" where tokenA/tokenB are
+    # token strings. We need to map them to IDs.
+    merge_pairs = []
+    for merge_str in merges:
+        # Merges are "token_a token_b" but tokens can contain spaces,
+        # so split on the FIRST space only
+        parts = merge_str.split(" ", 1)
+        if len(parts) != 2:
+            continue
+        a_str, b_str = parts
+        a_id = vocab.get(a_str, -1)
+        b_id = vocab.get(b_str, -1)
+        if a_id >= 0 and b_id >= 0:
+            merge_pairs.append((a_id, b_id))
+
+    print(f"  Valid merge pairs: {len(merge_pairs)}")
+
+    # Write .forge.vocab
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(f"{vocab_size}\n")
+        f.write(f"{len(merge_pairs)}\n")
+
+        # Write vocab entries sorted by ID
+        for token_id in sorted(id_to_bytes.keys()):
+            token_bytes = id_to_bytes[token_id]
+            b64 = base64.b64encode(token_bytes).decode("ascii")
+            f.write(f"{token_id}\t{b64}\n")
+
+        # Write merge pairs
+        for a_id, b_id in merge_pairs:
+            f.write(f"{a_id} {b_id}\n")
+
+    print(f"  Written to {output_path}")
+
+
+# =============================================================================
 # Main
 # =============================================================================
 def main():
@@ -519,6 +603,26 @@ def main():
 
     # Write .forge file
     write_forge(args.output, forge_config, tensors)
+
+    # Export tokenizer vocab
+    vocab_path = args.output + ".vocab"
+    if args.gguf:
+        print(f"\n  NOTE: GGUF vocab export not yet supported.")
+        print(f"  Convert from HuggingFace for tokenizer support.")
+    else:
+        model_dir = args.model if os.path.isdir(args.model) else None
+        if model_dir is None:
+            # Was downloaded from hub — find the cached dir
+            try:
+                from huggingface_hub import snapshot_download
+                model_dir = snapshot_download(
+                    args.model,
+                    allow_patterns=["tokenizer.json", "tokenizer_config.json"],
+                )
+            except Exception:
+                model_dir = None
+        if model_dir:
+            export_vocab(model_dir, vocab_path)
 
     print("\nDone. Run inference with:")
     print(f"  ./transformer_engine {args.output} \"Your prompt here\"")
