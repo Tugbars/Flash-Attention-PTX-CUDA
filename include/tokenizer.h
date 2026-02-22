@@ -138,6 +138,26 @@ public:
             token_to_id_[token_bytes] = id;
         }
 
+        // Build byte-to-token-ID mapping
+        // For each single-byte token in the vocab, record its ID
+        byte_to_id_.resize(256, UINT32_MAX);
+        for (uint32_t i = 0; i < vocab_size; i++) {
+            const auto& tok = id_to_token_[i];
+            if (tok.size() == 1) {
+                uint8_t byte = static_cast<uint8_t>(tok[0]);
+                if (byte_to_id_[byte] == UINT32_MAX) {
+                    byte_to_id_[byte] = i;
+                }
+            }
+        }
+
+        // Count how many byte tokens were found
+        int byte_count = 0;
+        for (int i = 0; i < 256; i++) {
+            if (byte_to_id_[i] != UINT32_MAX) byte_count++;
+        }
+        printf("  Byte tokens mapped: %d/256\n", byte_count);
+
         // Merge rules: id1<SPACE>id2 (priority = line order)
         merges_.reserve(n_merges);
         for (uint32_t i = 0; i < n_merges; i++) {
@@ -155,16 +175,39 @@ public:
         }
 
         // Detect special tokens
+        // DeepSeek uses fullwidth ｜ (U+FF5C, UTF-8: EF BD 9C) and ▁ (U+2581, UTF-8: E2 96 81)
+        // We build the expected strings at runtime to avoid NVCC char range issues
+        std::string ds_bos = "<";
+        ds_bos += '\xef'; ds_bos += '\xbd'; ds_bos += '\x9c';  // ｜
+        ds_bos += "begin";
+        ds_bos += '\xe2'; ds_bos += '\x96'; ds_bos += '\x81';  // ▁
+        ds_bos += "of";
+        ds_bos += '\xe2'; ds_bos += '\x96'; ds_bos += '\x81';  // ▁
+        ds_bos += "text";
+        ds_bos += '\xef'; ds_bos += '\xbd'; ds_bos += '\x9c';  // ｜
+        ds_bos += ">";
+
+        std::string ds_eos = "<";
+        ds_eos += '\xef'; ds_eos += '\xbd'; ds_eos += '\x9c';  // ｜
+        ds_eos += "end";
+        ds_eos += '\xe2'; ds_eos += '\x96'; ds_eos += '\x81';  // ▁
+        ds_eos += "of";
+        ds_eos += '\xe2'; ds_eos += '\x96'; ds_eos += '\x81';  // ▁
+        ds_eos += "sentence";
+        ds_eos += '\xef'; ds_eos += '\xbd'; ds_eos += '\x9c';  // ｜
+        ds_eos += ">";
+
         for (uint32_t i = 0; i < vocab_size; i++) {
             const auto& tok = id_to_token_[i];
             // BOS tokens (in priority order)
             if (tok == "<|begin_of_text|>") bos_id = i;         // Llama 3
+            else if (tok == ds_bos) bos_id = i;                  // DeepSeek
             else if (tok == "<s>" && bos_id < 0) bos_id = i;    // Llama 2, Mistral
 
             // EOS tokens (in priority order)
             if (tok == "<|end_of_text|>") eos_id = i;            // Llama 3
+            else if (tok == ds_eos) { eos_id = i; }              // DeepSeek
             else if (tok == "<|endoftext|>" && eos_id < 0) eos_id = i;  // Qwen, GPT
-            else if (tok == "<|end▁of▁sentence|>" && eos_id < 0) eos_id = i;  // DeepSeek
             else if (tok == "</s>" && eos_id < 0) eos_id = i;    // Llama 2, Mistral
         }
 
@@ -217,9 +260,15 @@ public:
                 continue;
             }
 
-            // Start with individual bytes
+            // Start with individual bytes mapped to their vocab IDs
             for (uint8_t byte : word) {
-                word_ids.push_back(static_cast<uint32_t>(byte));
+                uint32_t id = byte_to_id_[byte];
+                if (id == UINT32_MAX) {
+                    // Byte not in vocab — shouldn't happen with a proper BPE vocab
+                    // Fall back to raw byte value
+                    id = static_cast<uint32_t>(byte);
+                }
+                word_ids.push_back(id);
             }
 
             // Apply BPE merges greedily
@@ -259,6 +308,7 @@ public:
 private:
     std::vector<std::string> id_to_token_;
     std::unordered_map<std::string, uint32_t> token_to_id_;
+    std::vector<uint32_t> byte_to_id_;  // byte value → token ID
 
     struct MergePair { uint32_t a, b; };
     std::vector<MergePair> merges_;

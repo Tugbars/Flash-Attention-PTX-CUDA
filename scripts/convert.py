@@ -549,14 +549,48 @@ def export_vocab(model_path: str, output_path: str):
     n_merges = len(merges)
     print(f"  Vocab: {vocab_size} tokens, {n_merges} merges")
 
-    # Build id→token_bytes mapping
-    # In tiktoken/BPE, vocab keys are the token strings (which may contain
-    # arbitrary bytes). We store them as base64 to be safe in a text file.
+    # Build the GPT-2 byte ↔ unicode mapping
+    # tiktoken/Qwen tokenizers use this: each byte 0-255 is represented by a
+    # specific Unicode character. We need to reverse this to get raw bytes.
+    def _gpt2_bytes_to_unicode():
+        bs = list(range(ord("!"), ord("~")+1)) + \
+             list(range(0xA1, 0xAD)) + list(range(0xAE, 0x100))
+        cs = list(bs)
+        n = 0
+        for b in range(256):
+            if b not in bs:
+                bs.append(b)
+                cs.append(256 + n)
+                n += 1
+        return dict(zip(bs, [chr(c) for c in cs]))
+
+    byte_to_unicode = _gpt2_bytes_to_unicode()
+    unicode_to_byte = {v: k for k, v in byte_to_unicode.items()}
+
+    def decode_gpt2_token(token_str):
+        """Decode a GPT-2/tiktoken token string to raw bytes.
+        
+        Each character in the token string maps to a byte via the GPT-2 mapping.
+        If a character isn't in the mapping, fall back to UTF-8 encoding.
+        """
+        raw_bytes = bytearray()
+        for ch in token_str:
+            if ch in unicode_to_byte:
+                raw_bytes.append(unicode_to_byte[ch])
+            else:
+                # Not in GPT-2 mapping — encode as UTF-8 (for CJK, special tokens etc.)
+                raw_bytes.extend(ch.encode("utf-8"))
+        return bytes(raw_bytes)
+
+    # Build id->token_bytes mapping using GPT-2 decoding
     id_to_bytes = {}
     for token_str, token_id in vocab.items():
-        # token_str is the string representation of the token bytes
-        token_bytes = token_str.encode("utf-8")
+        token_bytes = decode_gpt2_token(token_str)
         id_to_bytes[token_id] = token_bytes
+
+    # Verify: count single-byte tokens (should be close to 256 for a good BPE vocab)
+    single_byte_count = sum(1 for b in id_to_bytes.values() if len(b) == 1)
+    print(f"  Single-byte tokens: {single_byte_count}/256")
 
     # Parse merges: each merge is "tokenA tokenB" where tokenA/tokenB are
     # token strings. We need to map them to IDs.
