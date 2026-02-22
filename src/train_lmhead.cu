@@ -409,21 +409,9 @@ struct TrainArgs {
 
 TrainArgs parse_args(int argc, char** argv) {
     TrainArgs args;
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <model.forge> --data <train.txt> [options]\n", argv[0]);
-        fprintf(stderr, "Options:\n");
-        fprintf(stderr, "  --data FILE       Training text file\n");
-        fprintf(stderr, "  --lr F            Learning rate (default: 1e-4)\n");
-        fprintf(stderr, "  --steps N         Training steps (default: 100)\n");
-        fprintf(stderr, "  --seq-len N       Sequence length (default: 128)\n");
-        fprintf(stderr, "  --wd F            Weight decay (default: 0.01)\n");
-        fprintf(stderr, "  --log-every N     Log interval (default: 10)\n");
-        fprintf(stderr, "  --seed N          RNG seed (default: 42)\n");
-        exit(1);
-    }
 
-    args.model_path = argv[1];
-    for (int i = 2; i < argc; i++) {
+    // Parse explicit arguments first
+    for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--data") == 0 && i+1 < argc)
             args.data_path = argv[++i];
         else if (strcmp(argv[i], "--lr") == 0 && i+1 < argc)
@@ -438,7 +426,79 @@ TrainArgs parse_args(int argc, char** argv) {
             args.log_every = atoi(argv[++i]);
         else if (strcmp(argv[i], "--seed") == 0 && i+1 < argc)
             args.seed = strtoull(argv[++i], nullptr, 10);
+        else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: %s [model.forge] [options]\n", argv[0]);
+            printf("  Auto-discovers .forge and .txt files in current directory.\n\n");
+            printf("Options:\n");
+            printf("  --data FILE       Training text file (default: first .txt found)\n");
+            printf("  --lr F            Learning rate (default: 1e-4)\n");
+            printf("  --steps N         Training steps (default: 100)\n");
+            printf("  --seq-len N       Sequence length (default: 128)\n");
+            printf("  --wd F            Weight decay (default: 0.01)\n");
+            printf("  --log-every N     Log interval (default: 10)\n");
+            printf("  --seed N          RNG seed (default: 42)\n");
+            exit(0);
+        }
+        else if (argv[i][0] != '-') {
+            // Positional arg — model path
+            args.model_path = argv[i];
+        }
     }
+
+    // Auto-discover .forge file if not specified
+    if (args.model_path.empty()) {
+        // Search current directory and parent for .forge files
+        auto find_forge = [](const char* dir) -> std::string {
+#ifdef _WIN32
+            WIN32_FIND_DATAA fd;
+            std::string pattern = std::string(dir) + "\\*.forge";
+            HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+            if (h != INVALID_HANDLE_VALUE) {
+                std::string result = std::string(dir) + "\\" + fd.cFileName;
+                FindClose(h);
+                return result;
+            }
+#else
+            // POSIX: use glob or opendir
+            // Simple approach: try common names
+#endif
+            return "";
+        };
+        args.model_path = find_forge(".");
+        if (args.model_path.empty()) args.model_path = find_forge("..");
+        if (args.model_path.empty()) {
+            fprintf(stderr, "No .forge file found. Specify: %s <model.forge>\n", argv[0]);
+            exit(1);
+        }
+        printf("Auto-discovered model: %s\n", args.model_path.c_str());
+    }
+
+    // Auto-discover training data if not specified
+    if (args.data_path.empty()) {
+        auto find_txt = [](const char* dir) -> std::string {
+#ifdef _WIN32
+            WIN32_FIND_DATAA fd;
+            std::string pattern = std::string(dir) + "\\*.txt";
+            HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+            if (h != INVALID_HANDLE_VALUE) {
+                std::string result = std::string(dir) + "\\" + fd.cFileName;
+                FindClose(h);
+                return result;
+            }
+#else
+            // POSIX fallback
+#endif
+            return "";
+        };
+        args.data_path = find_txt(".");
+        if (args.data_path.empty()) args.data_path = find_txt("..");
+        if (args.data_path.empty()) {
+            fprintf(stderr, "No .txt data file found. Specify: --data <file.txt>\n");
+            exit(1);
+        }
+        printf("Auto-discovered data: %s\n", args.data_path.c_str());
+    }
+
     return args;
 }
 

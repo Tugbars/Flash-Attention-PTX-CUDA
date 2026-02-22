@@ -404,24 +404,9 @@ struct InferenceArgs {
 
 InferenceArgs parse_args(int argc, char** argv) {
     InferenceArgs args;
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <model.forge> \"prompt\" [options]\n", argv[0]);
-        fprintf(stderr, "Options:\n");
-        fprintf(stderr, "  --temp T        Temperature (default: 0.7)\n");
-        fprintf(stderr, "  --top-k K       Top-K (default: 50)\n");
-        fprintf(stderr, "  --top-p P       Top-P (default: 0.9)\n");
-        fprintf(stderr, "  --max-tokens N  Max tokens (default: 256)\n");
-        fprintf(stderr, "  --seed S        RNG seed (default: random)\n");
-        fprintf(stderr, "  --rep-pen P     Repetition penalty (default: 1.1)\n");
-        fprintf(stderr, "  --no-graph      Disable CUDA graph acceleration\n");
-        fprintf(stderr, "  --bench         Run eager vs graph decode benchmark\n");
-        exit(1);
-    }
 
-    args.model_path = argv[1];
-    args.prompt = argv[2];
-
-    for (int i = 3; i < argc; i++) {
+    // Parse all arguments
+    for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--temp") == 0 && i+1 < argc)
             args.temperature = atof(argv[++i]);
         else if (strcmp(argv[i], "--top-k") == 0 && i+1 < argc)
@@ -438,7 +423,60 @@ InferenceArgs parse_args(int argc, char** argv) {
             args.no_graph = true;
         else if (strcmp(argv[i], "--bench") == 0)
             args.bench = true;
+        else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: %s [model.forge] [\"prompt\"] [options]\n", argv[0]);
+            printf("  Auto-discovers .forge file in current directory.\n");
+            printf("  Default prompt: \"The future of artificial intelligence\"\n\n");
+            printf("Options:\n");
+            printf("  --temp T        Temperature (default: 0.7)\n");
+            printf("  --top-k K       Top-K (default: 50)\n");
+            printf("  --top-p P       Top-P (default: 0.9)\n");
+            printf("  --max-tokens N  Max tokens (default: 256)\n");
+            printf("  --seed S        RNG seed (default: random)\n");
+            printf("  --rep-pen P     Repetition penalty (default: 1.1)\n");
+            printf("  --no-graph      Disable CUDA graph acceleration\n");
+            printf("  --bench         Run eager vs graph decode benchmark\n");
+            exit(0);
+        }
+        else if (argv[i][0] != '-') {
+            // Positional args: first is model, second is prompt
+            if (args.model_path.empty())
+                args.model_path = argv[i];
+            else if (args.prompt.empty())
+                args.prompt = argv[i];
+        }
     }
+
+    // Auto-discover .forge file
+    if (args.model_path.empty()) {
+#ifdef _WIN32
+        WIN32_FIND_DATAA fd;
+        HANDLE h = FindFirstFileA(".\\*.forge", &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            args.model_path = std::string(".\\") + fd.cFileName;
+            FindClose(h);
+        }
+        if (args.model_path.empty()) {
+            h = FindFirstFileA("..\\*.forge", &fd);
+            if (h != INVALID_HANDLE_VALUE) {
+                args.model_path = std::string("..\\") + fd.cFileName;
+                FindClose(h);
+            }
+        }
+#endif
+        if (args.model_path.empty()) {
+            fprintf(stderr, "No .forge file found. Specify: %s <model.forge>\n", argv[0]);
+            exit(1);
+        }
+        printf("Auto-discovered model: %s\n", args.model_path.c_str());
+    }
+
+    // Default prompt
+    if (args.prompt.empty()) {
+        args.prompt = "The future of artificial intelligence";
+        printf("Using default prompt: \"%s\"\n", args.prompt.c_str());
+    }
+
     return args;
 }
 
