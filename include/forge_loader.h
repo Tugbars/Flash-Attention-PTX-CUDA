@@ -40,6 +40,20 @@
 namespace transformer {
 
 // ============================================================================
+// CUDA_CHECK macro (if not already defined by tensor.h)
+// ============================================================================
+#ifndef CUDA_CHECK
+#define CUDA_CHECK(call) do { \
+    cudaError_t err = (call); \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA error at %s:%d: %s\n", \
+                __FILE__, __LINE__, cudaGetErrorString(err)); \
+        exit(1); \
+    } \
+} while(0)
+#endif
+
+// ============================================================================
 // .forge file structures (must match convert.py exactly)
 // ============================================================================
 
@@ -48,7 +62,8 @@ static constexpr uint32_t FORGE_VERSION = 1;
 static constexpr uint32_t FORGE_HEADER_SIZE = 512;
 
 // Packed model config — 96 bytes, matches convert.py's pack_model_config
-struct __attribute__((packed)) ForgeModelConfig {
+#pragma pack(push, 1)
+struct ForgeModelConfig {
     int32_t d_model;
     int32_t n_heads;
     int32_t n_kv_heads;
@@ -69,7 +84,7 @@ struct __attribute__((packed)) ForgeModelConfig {
 };
 static_assert(sizeof(ForgeModelConfig) == 96, "ForgeModelConfig must be 96 bytes");
 
-struct __attribute__((packed)) ForgeHeader {
+struct ForgeHeader {
     uint32_t magic;
     uint32_t version;
     uint32_t header_size;
@@ -79,12 +94,13 @@ struct __attribute__((packed)) ForgeHeader {
 };
 static_assert(sizeof(ForgeHeader) == 512, "ForgeHeader must be 512 bytes");
 
-struct __attribute__((packed)) ForgeTensorEntry {
+struct ForgeTensorEntry {
     char     name[64];
     uint64_t offset;
     uint64_t nbytes;
 };
 static_assert(sizeof(ForgeTensorEntry) == 80, "ForgeTensorEntry must be 80 bytes");
+#pragma pack(pop)
 
 // ============================================================================
 // Per-layer device weight pointers

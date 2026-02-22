@@ -24,15 +24,15 @@
 //   4. Copy logits to CPU → sample → print token → loop
 // ============================================================================
 
-#include "include/forge_loader.h"
-#include "include/tokenizer.h"
-#include "include/sampler.h"
-#include "include/tensor.h"
-#include "include/gemm_operations.h"
-#include "include/flash_attention.h"
-#include "include/layer_norm.h"
-#include "include/rotary_embedding.h"
-#include "include/activation_kernels.h"
+#include "forge_loader.h"
+#include "tokenizer.h"
+#include "sampler.h"
+#include "tensor.h"
+#include "gemm_operations.h"
+#include "flash_attention.h"
+#include "layer_norm.h"
+#include "rotary_embedding.h"
+#include "activation_kernels.h"
 
 #include <cstdio>
 #include <cstdlib>

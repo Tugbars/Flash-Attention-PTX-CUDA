@@ -19,14 +19,14 @@
 // window is sampled and used as input (tokens 0..N-1) → target (tokens 1..N).
 // ============================================================================
 
-#include "include/forge_loader.h"
-#include "include/tokenizer.h"
-#include "include/tensor.h"
-#include "include/gemm_operations.h"
-#include "include/flash_attention.h"
-#include "include/layer_norm.h"
-#include "include/rotary_embedding.h"
-#include "include/activation_kernels.h"
+#include "forge_loader.h"
+#include "tokenizer.h"
+#include "tensor.h"
+#include "gemm_operations.h"
+#include "flash_attention.h"
+#include "layer_norm.h"
+#include "rotary_embedding.h"
+#include "activation_kernels.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -591,36 +591,26 @@ int main(int argc, char** argv) {
         }
 
         // d_lm_head [d, vocab] = hidden^T [d, seq_len] × d_logits [seq_len, vocab]
-        // In cuBLAS NT terms: A=[seq_len, d_model], B=[seq_len, vocab], C=[d_model, vocab]
-        // C = A^T × B → use gemm with transA
-        // Actually easier: use gemm_nt differently:
-        //   We want C[d,V] = A^T[d,S] × B[S,V]
-        //   cuBLAS: C = alpha * op(A) * op(B) + beta * C
-        //   With CUBLAS_OP_T on A and CUBLAS_OP_N on B:
-        //   C[d,V] = A^T[d,S] × B[S,V]
-        //
-        // We'll use a direct cublasHgemm call:
+        // Use a standalone cuBLAS handle for this non-NT GEMM
         {
-            cublasHandle_t handle = gemm.get_handle();
-            cublasSetStream(handle, stream);
-            half alpha_h = __float2half(1.0f / args.seq_len);  // normalize by seq_len
+            cublasHandle_t bwd_handle;
+            cublasCreate(&bwd_handle);
+            cublasSetStream(bwd_handle, stream);
+            cublasSetMathMode(bwd_handle, CUBLAS_TENSOR_OP_MATH);
+
+            half alpha_h = __float2half(1.0f / args.seq_len);
             half beta_h  = __float2half(0.0f);
-            // A = sc.ln_out [seq_len, d_model] — we want A^T
-            // B = sc.d_logits_fp16 [seq_len, vocab_size]
-            // C = sc.d_lm_head [d_model, vocab_size]
-            // cuBLAS is column-major, so we express row-major as transposed:
-            //   Row-major [M,K] = Col-major [K,M]^T
-            // We want: C_rm[d,V] = A_rm^T[d,S] × B_rm[S,V]
-            //   In col-major: C_cm[V,d] = B_cm[V,S] × A_cm[d,S]^T
-            //   → cublasHgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
-            //                  V, d, S, &alpha, B, V, A, d, &beta, C, V)
-            cublasHgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+            // Row-major C[d,V] = A^T[d,S] × B[S,V]
+            // Col-major: C_cm[V,d] = B_cm[V,S] × A_cm[d,S]^T
+            cublasHgemm(bwd_handle, CUBLAS_OP_N, CUBLAS_OP_T,
                         cfg.vocab_size, cfg.d_model, args.seq_len,
                         &alpha_h,
-                        sc.d_logits_fp16, cfg.vocab_size,  // B
-                        sc.ln_out, cfg.d_model,            // A
+                        sc.d_logits_fp16, cfg.vocab_size,
+                        sc.ln_out, cfg.d_model,
                         &beta_h,
-                        sc.d_lm_head, cfg.vocab_size);     // C
+                        sc.d_lm_head, cfg.vocab_size);
+
+            cublasDestroy(bwd_handle);
         }
 
         // AdamW update on lm_head
