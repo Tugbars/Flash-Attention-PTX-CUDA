@@ -42,7 +42,7 @@ static const uint8_t b64_table[256] = {
     64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
     64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
     64,64,64,64,64,64,64,64,64,64,64,62,64,64,64,63,
-    52,53,54,55,56,57,58,59,60,61,64,64,64, 0,64,64,
+    52,53,54,55,56,57,58,59,60,61,64,64,64,64,64,64,
     64, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
     15,16,17,18,19,20,21,22,23,24,25,64,64,64,64,64,
     64,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
@@ -135,7 +135,20 @@ public:
             }
             uint32_t id = std::stoul(line.substr(0, tab));
             std::string b64 = line.substr(tab + 1);
+            
+            // Strip trailing \r if present (Windows line endings)
+            if (!b64.empty() && b64.back() == '\r') b64.pop_back();
+            
             std::string token_bytes = base64_decode(b64);
+            
+            // Debug: print a few entries
+            if (i < 3 || id == 72 || id == 39) {
+                printf("  [DEBUG] vocab[%u]: id=%u b64='%s' decoded_len=%d bytes=",
+                       i, id, b64.c_str(), (int)token_bytes.size());
+                for (uint8_t c : token_bytes) printf("%02x ", c);
+                printf("\n");
+            }
+            
             entries.push_back({id, token_bytes});
             if (id > max_id) max_id = id;
         }
@@ -151,6 +164,18 @@ public:
         // For each single-byte token in the vocab, record its ID
         byte_to_id_.resize(256, UINT32_MAX);
         uint32_t actual_size = static_cast<uint32_t>(id_to_token_.size());
+        
+        // Debug: print first few token lengths to diagnose
+        printf("  [DEBUG] First 10 token lengths: ");
+        for (uint32_t i = 0; i < 10 && i < actual_size; i++) {
+            printf("%d ", (int)id_to_token_[i].size());
+        }
+        printf("\n");
+        // Print tokens around ID 72 (expected 'H' in raw byte mapping)
+        printf("  [DEBUG] Token ID 72: len=%d bytes=", (int)id_to_token_[72].size());
+        for (uint8_t c : id_to_token_[72]) printf("%02x ", c);
+        printf("\n");
+        
         for (uint32_t i = 0; i < actual_size; i++) {
             const auto& tok = id_to_token_[i];
             if (tok.size() == 1) {
