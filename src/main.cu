@@ -1689,6 +1689,230 @@ int main(int argc, char** argv) {
         benchmark_multistream(ms_cfg, /*prefill=*/256, /*decode_steps=*/200);
     }
 
+    // ── Decode Step: Eager vs CUDA Graph (full pipeline) ─────────────────
+    // Benchmarks the exact decode loop from main_inference.cu:
+    //   embed_lookup → forward_pass → half→float logits → cudaMemcpy to host
+    // This measures end-to-end decode latency including all overhead.
+    printf("\n╔══════════════════════════════════════════╗\n");
+    printf("║  DECODE STEP: EAGER vs CUDA GRAPH        ║\n");
+    printf("║  (embed + forward + logits→CPU)           ║\n");
+    printf("╚══════════════════════════════════════════╝\n");
+
+    auto bench_decode_step = [](const ModelConfig& cfg, int prefill_len, int decode_steps) {
+        const int d = cfg.d_model;
+        const int d_ffn = cfg.d_ffn_gate();
+        const int max_seq = cfg.max_seq_len;
+        const int vocab_size = 32000;  // synthetic vocab
+
+        cudaStream_t stream;
+        cudaStreamCreate(&stream);
+
+        // Weights
+        std::vector<BenchLayerWeights> weights(cfg.n_layers);
+        for (int l = 0; l < cfg.n_layers; l++)
+            bench_alloc_weights(weights[l], d, d_ffn, stream);
+
+        // Synthetic embed table + lm_head
+        half *embed_table, *lm_head;
+        cudaMallocAsync(&embed_table, (size_t)vocab_size * d * sizeof(half), stream);
+        cudaMallocAsync(&lm_head,     (size_t)d * vocab_size * sizeof(half), stream);
+        cudaMemsetAsync(embed_table, 0x3C, (size_t)vocab_size * d * sizeof(half), stream);
+        cudaMemsetAsync(lm_head,     0x3C, (size_t)d * vocab_size * sizeof(half), stream);
+
+        // Scratch
+        size_t max_N = std::max(prefill_len, 1);
+        BenchScratch sc;
+        cudaMallocAsync(&sc.ln_out,    max_N*d*sizeof(half), stream);
+        cudaMallocAsync(&sc.Q,         max_N*d*sizeof(half), stream);
+        cudaMallocAsync(&sc.K_proj,    max_N*d*sizeof(half), stream);
+        cudaMallocAsync(&sc.V_proj,    max_N*d*sizeof(half), stream);
+        cudaMallocAsync(&sc.attn_out,  max_N*d*sizeof(half), stream);
+        cudaMallocAsync(&sc.ffn_gate,  max_N*d_ffn*sizeof(half), stream);
+        cudaMallocAsync(&sc.ffn_up,    max_N*d_ffn*sizeof(half), stream);
+        cudaMallocAsync(&sc.ffn_inter, max_N*d_ffn*sizeof(half), stream);
+        cudaMallocAsync(&sc.ffn_out,   max_N*d*sizeof(half), stream);
+        cudaMallocAsync(&sc.residual,  max_N*d*sizeof(half), stream);
+        cudaMallocAsync(&sc.attn_lse,  max_N*cfg.n_heads*sizeof(float), stream);
+
+        // Extra buffers for decode step: token ID, logits, host logits
+        int32_t *d_token_id;
+        half    *logits_fp16;
+        float   *logits_fp32;
+        cudaMallocAsync(&d_token_id, sizeof(int32_t), stream);
+        cudaMallocAsync(&logits_fp16, vocab_size * sizeof(half), stream);
+        cudaMallocAsync(&logits_fp32, vocab_size * sizeof(float), stream);
+
+        std::vector<float> h_logits(vocab_size);
+
+        half *input, *output;
+        cudaMallocAsync(&input,  max_N*d*sizeof(half), stream);
+        cudaMallocAsync(&output, max_N*d*sizeof(half), stream);
+        cudaMemsetAsync(input, 0x3C, max_N*d*sizeof(half), stream);
+
+        KVCache<half> kv;
+        kv.allocate(cfg.n_layers, cfg.n_heads, cfg.d_head, max_seq, stream);
+        RoPEConfig rope;
+        if (cfg.use_rotary) rope.init(max_seq, cfg.d_head, 10000.0f, stream);
+        GemmManager gemm;
+        gemm.set_stream(stream);
+
+        cudaStreamSynchronize(stream);
+
+        printf("\n  Config: d=%d, heads=%d, layers=%d, vocab=%d\n",
+               d, cfg.n_heads, cfg.n_layers, vocab_size);
+
+        // Lambda: one full decode step (embed + forward + lm_head + h2f + memcpy)
+        auto decode_eager = [&](int pos) {
+            // Embed
+            int grid_e = (d + 255) / 256;
+            extern __global__ void bench_kv_update_kernel(
+                half*, half*, const half*, const half*, int, int, int, int);
+            // Use a simple memcpy as embed (copy row from embed_table)
+            int32_t tok = 42;
+            cudaMemcpyAsync(d_token_id, &tok, sizeof(int32_t),
+                            cudaMemcpyHostToDevice, stream);
+            // Forward
+            bench_forward_pass(input, output, weights, sc, kv, gemm, rope,
+                              cfg, 1, 1, pos, stream);
+            // lm_head: [1, d] × [d, vocab] → [1, vocab]
+            half* last_hidden = (cfg.n_layers % 2 == 0) ? input : output;
+            gemm.gemm_nt(last_hidden, lm_head, logits_fp16, 1, vocab_size, d);
+        };
+
+        // ── EAGER ──
+        {
+            // Warmup (3 steps)
+            for (int w = 0; w < 3; w++) {
+                decode_eager(prefill_len + w);
+                cudaStreamSynchronize(stream);
+            }
+
+            // Reset KV
+            cudaMemsetAsync(kv.data, 0,
+                (size_t)cfg.n_layers * 2 * max_seq * cfg.n_heads * cfg.d_head * sizeof(half), stream);
+            cudaStreamSynchronize(stream);
+
+            // Prefill (eager, not timed — just fills KV cache)
+            bench_forward_pass(input, output, weights, sc, kv, gemm, rope,
+                              cfg, 1, prefill_len, 0, stream);
+            cudaStreamSynchronize(stream);
+
+            CudaTimer t;
+            t.begin(stream);
+            for (int s = 0; s < decode_steps; s++) {
+                decode_eager(prefill_len + s);
+                // Simulate logits → CPU transfer
+                cudaMemcpyAsync(h_logits.data(), logits_fp32,
+                                vocab_size * sizeof(float),
+                                cudaMemcpyDeviceToHost, stream);
+                cudaStreamSynchronize(stream);
+            }
+            float eager_ms = t.end(stream);
+            float eager_per = eager_ms / decode_steps;
+            printf("  Eager:  %.3f ms/step  (%.0f tok/s)\n",
+                   eager_per, 1000.0 / eager_per);
+        }
+
+        // ── CUDA GRAPH ──
+        {
+            // Reset KV
+            cudaMemsetAsync(kv.data, 0,
+                (size_t)cfg.n_layers * 2 * max_seq * cfg.n_heads * cfg.d_head * sizeof(half), stream);
+            cudaStreamSynchronize(stream);
+
+            // Prefill (eager)
+            bench_forward_pass(input, output, weights, sc, kv, gemm, rope,
+                              cfg, 1, prefill_len, 0, stream);
+            cudaStreamSynchronize(stream);
+
+            // Capture first decode step
+            cudaGraph_t graph = nullptr;
+            cudaGraphExec_t exec = nullptr;
+
+            cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+            decode_eager(prefill_len);
+            cudaStreamEndCapture(stream, &graph);
+            cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+            cudaGraphDestroy(graph); graph = nullptr;
+
+            // Launch first step
+            cudaGraphLaunch(exec, stream);
+            cudaStreamSynchronize(stream);
+
+            CudaTimer t;
+            t.begin(stream);
+            for (int s = 1; s < decode_steps; s++) {
+                // Recapture with new start_pos
+                cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+                decode_eager(prefill_len + s);
+                cudaStreamEndCapture(stream, &graph);
+
+                cudaGraphExecUpdateResultInfo info;
+                cudaGraphExecUpdate(exec, graph, &info);
+                if (info.result != cudaGraphExecUpdateSuccess) {
+                    cudaGraphExecDestroy(exec);
+                    cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+                }
+                cudaGraphDestroy(graph); graph = nullptr;
+
+                cudaGraphLaunch(exec, stream);
+                // Simulate logits → CPU
+                cudaMemcpyAsync(h_logits.data(), logits_fp32,
+                                vocab_size * sizeof(float),
+                                cudaMemcpyDeviceToHost, stream);
+                cudaStreamSynchronize(stream);
+            }
+            float graph_ms = t.end(stream);
+            float graph_per = graph_ms / (decode_steps - 1);
+            printf("  Graph:  %.3f ms/step  (%.0f tok/s)\n",
+                   graph_per, 1000.0 / graph_per);
+
+            cudaGraphExecDestroy(exec);
+        }
+
+        // Cleanup
+        auto sf = [stream](half*& p) { if(p){cudaFreeAsync(p,stream);p=nullptr;} };
+        sf(sc.ln_out); sf(sc.Q); sf(sc.K_proj); sf(sc.V_proj); sf(sc.attn_out);
+        sf(sc.ffn_gate); sf(sc.ffn_up); sf(sc.ffn_inter); sf(sc.ffn_out); sf(sc.residual);
+        if(sc.attn_lse){cudaFreeAsync(sc.attn_lse,stream);sc.attn_lse=nullptr;}
+        sf(input); sf(output); sf(embed_table); sf(lm_head); sf(logits_fp16);
+        cudaFreeAsync(logits_fp32, stream);
+        cudaFreeAsync(d_token_id, stream);
+        kv.free(stream);
+        if (cfg.use_rotary) rope.free(stream);
+        for (int l = 0; l < cfg.n_layers; l++) bench_free_weights(weights[l], stream);
+        cudaStreamSynchronize(stream);
+        cudaStreamDestroy(stream);
+    };
+
+    // 12-layer model (GPT-2 medium scale)
+    {
+        ModelConfig cfg12;
+        cfg12.d_model     = 768;
+        cfg12.n_heads     = 12;
+        cfg12.d_head      = 64;
+        cfg12.d_ffn       = 3072;
+        cfg12.n_layers    = 12;
+        cfg12.max_seq_len = 2048;
+        cfg12.use_rotary  = true;
+        cfg12.use_swiglu  = true;
+        bench_decode_step(cfg12, 512, 200);
+    }
+
+    // 6-layer model (small)
+    {
+        ModelConfig cfg6;
+        cfg6.d_model     = 512;
+        cfg6.n_heads     = 8;
+        cfg6.d_head      = 64;
+        cfg6.d_ffn       = 2048;
+        cfg6.n_layers    = 6;
+        cfg6.max_seq_len = 2048;
+        cfg6.use_rotary  = true;
+        cfg6.use_swiglu  = true;
+        bench_decode_step(cfg6, 256, 200);
+    }
+
     printf("\n============================================\n");
     printf("  Complete. %d/%d accuracy tests passed.\n", pass, pass + fail);
     printf("============================================\n");

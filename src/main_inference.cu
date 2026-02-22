@@ -308,6 +308,85 @@ void forward_pass(
 }
 
 // ============================================================================
+// Decode step — GPU work for a single token (embed + forward + logits)
+//
+// Factored out so it can be called directly (eager) or captured into a graph.
+// All pointers are stable across calls; only start_pos changes (scalar param).
+// ============================================================================
+void decode_step_gpu(
+    ForgeModel& model,
+    InferenceScratch& sc,
+    KVCache<half>& kv,
+    GemmManager& gemm,
+    RoPEConfig& rope,
+    int start_pos,
+    cudaStream_t stream)
+{
+    const auto& cfg = model.config;
+
+    // Embedding lookup (1 token — ID already in sc.d_token_ids)
+    {
+        int grid = (cfg.d_model + 255) / 256;
+        embed_lookup_kernel<<<grid, 256, 0, stream>>>(
+            model.embed_tokens, sc.d_token_ids, sc.hidden,
+            cfg.d_model, 1);
+    }
+
+    // Forward pass (batch=1, seq_len=1)
+    forward_pass(model, sc, kv, gemm, rope, 1, 1, start_pos, stream);
+}
+
+// ============================================================================
+// CUDA Graph manager for decode
+// ============================================================================
+struct DecodeGraphManager {
+    cudaGraph_t     graph      = nullptr;
+    cudaGraphExec_t exec       = nullptr;
+    bool            captured   = false;
+    cudaStream_t    stream     = nullptr;
+
+    // Capture the first decode step, then replay with updated params
+    void capture_or_update(
+        ForgeModel& model, InferenceScratch& sc, KVCache<half>& kv,
+        GemmManager& gemm, RoPEConfig& rope, int start_pos)
+    {
+        if (!captured) {
+            // First call: capture
+            cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+            decode_step_gpu(model, sc, kv, gemm, rope, start_pos, stream);
+            cudaStreamEndCapture(stream, &graph);
+            cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+            captured = true;
+        } else {
+            // Subsequent calls: recapture + update (topology same, params differ)
+            cudaGraph_t new_graph;
+            cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+            decode_step_gpu(model, sc, kv, gemm, rope, start_pos, stream);
+            cudaStreamEndCapture(stream, &new_graph);
+
+            cudaGraphExecUpdateResultInfo info;
+            cudaGraphExecUpdate(exec, new_graph, &info);
+            if (info.result != cudaGraphExecUpdateSuccess) {
+                // Topology changed (shouldn't happen) — reinstantiate
+                cudaGraphExecDestroy(exec);
+                cudaGraphInstantiate(&exec, new_graph, nullptr, nullptr, 0);
+            }
+            cudaGraphDestroy(new_graph);
+        }
+    }
+
+    void launch() {
+        cudaGraphLaunch(exec, stream);
+    }
+
+    void destroy() {
+        if (exec)  cudaGraphExecDestroy(exec);
+        if (graph) cudaGraphDestroy(graph);
+        exec = nullptr; graph = nullptr; captured = false;
+    }
+};
+
+// ============================================================================
 // Parse command line
 // ============================================================================
 struct InferenceArgs {
@@ -319,6 +398,8 @@ struct InferenceArgs {
     int    max_tokens    = 256;
     uint64_t seed        = 0;
     float  rep_penalty   = 1.1f;
+    bool   no_graph      = false;    // --no-graph: disable CUDA graphs
+    bool   bench         = false;    // --bench: run decode benchmark
 };
 
 InferenceArgs parse_args(int argc, char** argv) {
@@ -332,6 +413,8 @@ InferenceArgs parse_args(int argc, char** argv) {
         fprintf(stderr, "  --max-tokens N  Max tokens (default: 256)\n");
         fprintf(stderr, "  --seed S        RNG seed (default: random)\n");
         fprintf(stderr, "  --rep-pen P     Repetition penalty (default: 1.1)\n");
+        fprintf(stderr, "  --no-graph      Disable CUDA graph acceleration\n");
+        fprintf(stderr, "  --bench         Run eager vs graph decode benchmark\n");
         exit(1);
     }
 
@@ -351,6 +434,10 @@ InferenceArgs parse_args(int argc, char** argv) {
             args.seed = strtoull(argv[++i], nullptr, 10);
         else if (strcmp(argv[i], "--rep-pen") == 0 && i+1 < argc)
             args.rep_penalty = atof(argv[++i]);
+        else if (strcmp(argv[i], "--no-graph") == 0)
+            args.no_graph = true;
+        else if (strcmp(argv[i], "--bench") == 0)
+            args.bench = true;
     }
     return args;
 }
@@ -430,6 +517,10 @@ int main(int argc, char** argv) {
     sampler.rep_penalty = args.rep_penalty;
     sampler.seed = args.seed;
 
+    bool use_graph = !args.no_graph;
+    DecodeGraphManager graph_mgr;
+    graph_mgr.stream = stream;
+
     cudaStreamSynchronize(stream);
 
     // ── 5. Prefill ───────────────────────────────────────────────────────
@@ -450,7 +541,7 @@ int main(int argc, char** argv) {
             cfg.d_model, prompt_len);
     }
 
-    // Forward pass (prefill: all prompt tokens at once)
+    // Forward pass (prefill: all prompt tokens at once, always eager)
     forward_pass(model, sc, kv, gemm, rope,
                  1, prompt_len, 0, stream);
 
@@ -467,7 +558,7 @@ int main(int argc, char** argv) {
            prefill_ms, prompt_len * 1000.0f / prefill_ms);
 
     // ── 6. Decode loop ───────────────────────────────────────────────────
-    printf("\n--- Generation ---\n");
+    printf("\n--- Generation (%s) ---\n", use_graph ? "CUDA graph" : "eager");
 
     // Print prompt
     printf("%s", args.prompt.c_str());
@@ -481,7 +572,7 @@ int main(int argc, char** argv) {
     auto t_decode_start = std::chrono::high_resolution_clock::now();
 
     for (int step = 0; step < args.max_tokens; step++) {
-        // Sample next token
+        // Sample next token (CPU — runs while GPU was doing previous step)
         int ctx_start = std::max(0, (int)all_tokens.size() - 128);
         int ctx_len = (int)all_tokens.size() - ctx_start;
         int32_t next_token = sampler.sample(
@@ -500,24 +591,19 @@ int main(int argc, char** argv) {
         printf("%s", token_text.c_str());
         fflush(stdout);
 
-        // Prepare next forward pass (single token)
-        int32_t token_on_gpu;
+        // Upload token ID to GPU
         cudaMemcpyAsync(sc.d_token_ids, &next_token,
                         sizeof(int32_t), cudaMemcpyHostToDevice, stream);
 
-        // Embedding lookup (1 token)
-        {
-            int grid = (cfg.d_model + 255) / 256;
-            embed_lookup_kernel<<<grid, 256, 0, stream>>>(
-                model.embed_tokens, sc.d_token_ids, sc.hidden,
-                cfg.d_model, 1);
+        // GPU decode step — eager or graph
+        if (use_graph) {
+            graph_mgr.capture_or_update(model, sc, kv, gemm, rope, pos);
+            graph_mgr.launch();
+        } else {
+            decode_step_gpu(model, sc, kv, gemm, rope, pos, stream);
         }
 
-        // Forward pass (decode: 1 token)
-        forward_pass(model, sc, kv, gemm, rope,
-                     1, 1, pos, stream);
-
-        // Get logits
+        // Copy logits back
         cudaMemcpyAsync(h_logits.data(), sc.logits_fp32,
                         cfg.vocab_size * sizeof(float),
                         cudaMemcpyDeviceToHost, stream);
@@ -531,6 +617,7 @@ int main(int argc, char** argv) {
     float decode_ms = std::chrono::duration<float, std::milli>(t_end - t_decode_start).count();
 
     printf("\n\n--- Stats ---\n");
+    printf("  Mode:       %s\n", use_graph ? "CUDA graph" : "eager");
     printf("  Prefill:    %d tokens in %.1f ms (%.0f tok/s)\n",
            prompt_len, prefill_ms, prompt_len * 1000.0f / prefill_ms);
     if (generated > 0) {
@@ -541,6 +628,7 @@ int main(int argc, char** argv) {
     printf("  Total:      %d tokens generated\n", generated);
 
     // ── 7. Cleanup ───────────────────────────────────────────────────────
+    graph_mgr.destroy();
     sc.free(stream);
     kv.free(stream);
     if (cfg.use_rotary) rope.free(stream);

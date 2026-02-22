@@ -4,14 +4,16 @@
 
 <p align="center">
   <strong>High-performance transformer inference for consumer NVIDIA GPUs</strong><br>
-  Hand-written PTX attention · Fused kernels · CUDA graphs · ~3,500 lines of readable CUDA
+  Hand-written PTX attention · GQA · Fused kernels · CUDA graphs · ~4,000 lines of readable CUDA
 </p>
 
 <p align="center">
   <a href="#performance">Performance</a> ·
   <a href="#architecture-overview">Architecture</a> ·
   <a href="#flash-attention-deep-dive">Flash Attention</a> ·
+  <a href="#grouped-query-attention-gqa">GQA</a> ·
   <a href="#cuda-graphs">CUDA Graphs</a> ·
+  <a href="#weight-loading">Weight Loading</a> ·
   <a href="#building">Building</a> ·
   <a href="#roadmap">Roadmap</a>
 </p>
@@ -45,12 +47,14 @@ Benchmarked on **RTX 5080** (84 SMs, sm_120, 234.8 TFLOPS FP16 theoretical, CUDA
 
 | Kernel | Config | Latency | Throughput |
 |--------|--------|--------:|----------:|
-| Flash Attention | B=4, H=12, S=2048, D=64 | 0.381 ms | **135.3 TFLOPS** |
-| Flash Attention | B=1, H=12, S=4096, D=64 | 0.404 ms | 127.5 TFLOPS |
-| GEMM (FFN up) | 2048 × 3072 × 768 | 0.057 ms | **168.5 TFLOPS** |
-| GEMM (FFN down) | 2048 × 768 × 3072 | 0.066 ms | 147.1 TFLOPS |
-| GEMM (QKV) | 2048 × 768 × 768 | 0.025 ms | 97.7 TFLOPS |
-| LayerNorm | 2048 tokens × 768 dim | 0.013 ms | **1,234 GB/s** |
+| Flash Attention (MHA) | B=4, H=32, S=2048, D=64 | 1.150 ms | 119.5 TFLOPS |
+| Flash Attention (GQA 4:1) | B=4, Hq=32, Hkv=8, S=2048, D=64 | 1.016 ms | **135.3 TFLOPS** |
+| Flash Attention (MHA) | B=1, H=32, S=2048, D=64 | 0.271 ms | 126.9 TFLOPS |
+| Flash Attention (GQA 4:1) | B=1, Hq=32, Hkv=8, S=2048, D=64 | 0.264 ms | 130.4 TFLOPS |
+| GEMM (FFN up) | 2048 × 3072 × 768 | 0.059 ms | **163.7 TFLOPS** |
+| GEMM (FFN down) | 2048 × 768 × 3072 | 0.066 ms | 147.2 TFLOPS |
+| GEMM (QKV) | 2048 × 768 × 768 | 0.023 ms | 107.0 TFLOPS |
+| LayerNorm | 2048 tokens × 768 dim | 0.013 ms | **1,220 GB/s** |
 
 ### End-to-End Forward Pass
 
@@ -66,7 +70,7 @@ CUDA graphs eliminate ~170–216 μs of kernel launch overhead per forward pass 
 
 ### Accuracy (vs FP32 CPU Reference)
 
-22/22 tests passing.
+26/26 tests passing.
 
 | Module | NRMSE | Max Abs Error |
 |--------|------:|-------------:|
@@ -77,9 +81,12 @@ CUDA graphs eliminate ~170–216 μs of kernel launch overhead per forward pass 
 | SwiGLU | 0.0004 | 0.005 |
 | GELU | 0.0003 | 0.002 |
 | SiLU | 0.0003 | 0.004 |
-| Flash Attention | 0.0237 | 0.008 |
+| Flash Attention (MHA) | 0.0237 | 0.008 |
+| Flash Attention (GQA 4:1) | 0.0222 | 0.010 |
 
 Flash Attention NRMSE is higher due to FP16 error compounding across Q×K^T → softmax → P×V.
+GQA NRMSE is slightly lower than MHA — shared KV heads mean FP16 quantization noise is
+correlated rather than independent, reducing random error accumulation.
 Zero bad elements across all tests.
 
 ## Architecture Overview
@@ -87,21 +94,26 @@ Zero bad elements across all tests.
 ```
 cuda-transformer/
 ├── include/
-│   ├── transformer_config.h       # Model config, tuning constants
+│   ├── transformer_config.h       # Model config (GQA, SwiGLU, RoPE), tuning constants
 │   ├── tensor.h                   # Tensor wrapper, KVCache, CUDA_CHECK
 │   ├── gemm_operations.h          # cuBLAS + optional CUTLASS dispatch
-│   ├── flash_attention.h          # FlashAttentionParams struct
+│   ├── flash_attention.h          # FlashAttentionParams struct (MHA + GQA)
 │   ├── layer_norm.h               # LayerNorm / RMSNorm params
 │   ├── rotary_embedding.h         # RoPE config + launch wrappers
-│   └── activation_kernels.h       # SwiGLU, GELU, SiLU launchers
+│   ├── activation_kernels.h       # SwiGLU, GELU, SiLU launchers
+│   ├── forge_loader.h             # .forge model loader (mmap + GPU upload)
+│   ├── tokenizer.h                # BPE tokenizer (tiktoken-compatible)
+│   └── sampler.h                  # Top-k, top-p, temperature sampling
 ├── kernels/
-│   ├── flash_attention.cu         # PTX m16n8k16 MMA, in-register softmax
+│   ├── flash_attention.cu         # PTX m16n8k16 MMA, in-register softmax, GQA
 │   ├── layer_norm.cu              # Single-pass fused LN + residual + bias
 │   ├── rotary_embedding.cu        # Precomputed cos/sin RoPE tables
 │   └── activation_kernels.cu      # Vectorized half2 activations
 ├── transformer_block.cu           # Forward pass orchestration + CUDA graphs
+├── main_inference.cu              # End-to-end inference binary
+├── convert.py                     # Safetensors / GGUF → .forge + vocab converter
 ├── tests/
-│   └── main.cu                    # 22 accuracy tests + kernel & E2E benchmarks
+│   └── main.cu                    # 26 accuracy tests + kernel & E2E benchmarks
 └── README.md
 ```
 
@@ -131,6 +143,14 @@ cuda-transformer/
 
 7. **Quantization Ready** — FP8 E4M3 GEMM path via CUTLASS, gated behind `ENABLE_FP8`
    compile flag. FP16 weights + FP32 accumulation as default.
+
+8. **GQA / MQA** — Grouped-Query Attention with configurable `n_kv_heads`. Multiple Q
+   heads share the same KV head, reducing KV cache size by the group ratio (4× for Llama 3.2).
+   At batch=4 with 32:8 GQA, L2 cache reuse gives a 13% throughput win over MHA.
+
+9. **Zero-Copy Weight Loading** — `.forge` binary format with mmap-based loader. Python
+   converter reads safetensors or GGUF, pre-transposes weights to column-major NT layout,
+   and writes a flat FP16 binary. C loader mmaps + bulk `cudaMemcpyAsync` to GPU.
 
 ## Flash Attention Deep Dive
 
@@ -222,6 +242,67 @@ on the A100 (which has dedicated TMA hardware) achieves approximately 60%.
 | L1/smem throughput | 31.3% | 32.5% | 32.5% |
 | Active warps | 15.6% | 29.7% | ~32% |
 
+## Grouped-Query Attention (GQA)
+
+### Why GQA
+
+Standard Multi-Head Attention (MHA) gives every head its own Q, K, and V projections.
+Llama 3.2 1B has 32 attention heads — with MHA, that's 32 separate K and V matrices
+stored in the KV cache at every position. For long sequences, this dominates VRAM usage.
+
+GQA shares K and V across groups of Q heads. With 32 Q heads and 8 KV heads (4:1 ratio),
+Q heads 0–3 all read from KV head 0, heads 4–7 from KV head 1, and so on. The KV cache
+shrinks by 4× while Q projections stay full-width — the model retains expressiveness on
+the query side while dramatically reducing memory and bandwidth requirements.
+
+### Kernel Implementation
+
+The change is a single index mapping in the Flash Attention kernel. The grid still launches
+one threadblock per Q head — the MMA operations, softmax, tiling are all unchanged. Only
+the K/V base pointer computation differs:
+
+```c
+// MHA: Q and KV use the same head index
+int kv_bh_idx = bh_idx;
+
+// GQA: multiple Q heads map to one KV head
+int batch_idx = bh_idx / n_q_heads;
+int q_head    = bh_idx % n_q_heads;
+int kv_head   = q_head * n_kv_heads / n_q_heads;
+int kv_bh_idx = batch_idx * n_kv_heads + kv_head;
+```
+
+When `n_kv_heads == n_q_heads`, `kv_bh_idx == bh_idx` — GQA degenerates to MHA with
+zero overhead. The kernel is fully backward compatible.
+
+### Performance: MHA vs GQA
+
+Same Q head count (32), same sequence length (2048), same FLOPs. Only the KV sharing ratio changes.
+
+| Config | KV Heads | Ratio | B=1 Latency | B=1 TFLOPS | B=4 Latency | B=4 TFLOPS |
+|--------|:--------:|:-----:|----------:|----------:|-----------:|----------:|
+| MHA | 32 | 1:1 | 0.271 ms | 126.9 | 1.150 ms | 119.5 |
+| GQA | 8 | 4:1 | 0.264 ms | 130.4 | 1.016 ms | **135.3** |
+| GQA | 4 | 8:1 | 0.269 ms | 127.8 | — | — |
+| MQA | 1 | 32:1 | 0.267 ms | 128.7 | — | — |
+
+At B=1, all configurations are compute-bound — the 32 threadblocks fit comfortably in L2
+regardless of KV sharing. At B=4, GQA 4:1 is **13% faster** because 4 Q heads read the
+same K/V tiles from L2 cache instead of each loading their own from DRAM. That's 4×
+less global memory traffic for K/V loads.
+
+### Supported Configurations
+
+The engine supports any `n_kv_heads` that evenly divides `n_heads`:
+
+| Model | Q Heads | KV Heads | Ratio | Status |
+|-------|:-------:|:--------:|:-----:|:------:|
+| Llama 3.2 1B/3B | 32 | 8 | 4:1 | ✅ Tested |
+| Llama 3.1 8B/70B | 32 | 8 | 4:1 | ✅ Compatible |
+| Mistral 7B | 32 | 8 | 4:1 | ✅ Compatible |
+| Phi-3 | 32 | 32 | 1:1 (MHA) | ✅ Compatible |
+| Any MQA model | H | 1 | H:1 | ✅ Compatible |
+
 ## CUDA Graphs
 
 ### Why Graphs Matter for Decode
@@ -273,6 +354,116 @@ making capture/update topology stable regardless of batch size.
 
 The absolute savings (~170–216 μs) are consistent across models, confirming this is
 launch overhead elimination independent of kernel compute time.
+
+## Weight Loading
+
+### The .forge Format
+
+Rather than parsing safetensors JSON headers or GGUF metadata at runtime in C, the engine
+uses a custom `.forge` binary format designed for instant loading:
+
+```
+┌─────────────────────────────────────────────────┐
+│ Header (512 bytes)                              │
+│   magic "FRGE" · version · model config (96B)   │
+│   d_model, n_heads, n_kv_heads, d_ffn, vocab,  │
+│   rope_theta, rms_norm_eps, bos/eos token IDs   │
+├─────────────────────────────────────────────────┤
+│ Tensor Table (n_tensors × 80 bytes)             │
+│   64-char name · uint64 offset · uint64 nbytes  │
+├─────────────────────────────────────────────────┤
+│ Tensor Data (128-byte aligned, FP16)            │
+│   Pre-transposed to column-major NT layout      │
+└─────────────────────────────────────────────────┘
+```
+
+The C loader (`forge_loader.h`) mmaps the file, validates the header, then bulk-transfers
+all tensors to GPU via `cudaMemcpyAsync`. For a 1B-parameter model (~2.5 GB FP16), loading
+takes under a second. After the transfer completes, the file is unmapped — all data lives
+on GPU as raw `half*` pointers ready for cuBLAS.
+
+### Conversion Pipeline
+
+A Python script (`convert.py`) serves as the universal adapter between the model ecosystem
+and the engine's native format:
+
+```bash
+# From HuggingFace model (safetensors)
+python convert.py --model meta-llama/Llama-3.2-1B --output llama-1b.forge
+
+# From local safetensors directory
+python convert.py --model ./my-model/ --output model.forge
+
+# From GGUF file (auto-dequantizes quantized weights to FP16)
+python convert.py --gguf model-q8.gguf --output model.forge
+```
+
+The converter handles: safetensors JSON header parsing, GGUF metadata extraction,
+tensor name mapping (HF-style `model.layers.N.self_attn.q_proj.weight` and GGUF-style
+`blk.N.attn_q.weight` both map to `layers.N.wq`), row-major → column-major transposition
+for cuBLAS NT layout, BF16/FP32 → FP16 conversion, and tied embedding resolution.
+
+### Why a Custom Format
+
+| Approach | Parse in C | Transpose at runtime | External deps |
+|----------|:----------:|:--------------------:|:-------------:|
+| Load safetensors directly | JSON parser needed | Yes, every startup | safetensors C lib |
+| Load GGUF directly | Complex binary parser | Yes + dequantize | ggml headers |
+| **.forge (this)** | **4-byte magic check** | **Pre-transposed** | **None** |
+
+## Usage
+
+### Quick Start
+
+```bash
+# 1. Convert model (downloads from HuggingFace, ~2.5 GB for 1B)
+pip install safetensors huggingface_hub
+python convert.py --model meta-llama/Llama-3.2-1B --output llama-1b.forge
+
+# 2. Build inference binary
+nvcc -O3 -arch=sm_120 \
+    kernels/flash_attention.cu \
+    kernels/layer_norm.cu \
+    kernels/rotary_embedding.cu \
+    kernels/activation_kernels.cu \
+    main_inference.cu \
+    -lcublas -o inference
+
+# 3. Run
+./inference llama-1b.forge "The future of artificial intelligence"
+```
+
+### Sampling Options
+
+```bash
+# Greedy (deterministic)
+./inference llama-1b.forge "2 + 2 =" --temp 0
+
+# Creative (high temperature, wide nucleus)
+./inference llama-1b.forge "Write a poem about" --temp 1.0 --top-p 0.95 --top-k 100
+
+# Focused (low temperature, tight nucleus)
+./inference llama-1b.forge "Explain quantum computing:" --temp 0.3 --top-p 0.8
+
+# Reproducible (fixed seed)
+./inference llama-1b.forge "Once upon a time" --seed 42 --max-tokens 512
+```
+
+### Compatible Models
+
+Any model using the standard Llama architecture works with zero engine changes:
+
+| Model | Params | FP16 Size | Command |
+|-------|-------:|----------:|---------|
+| Llama 3.2 1B | 1.2B | 2.5 GB | `--model meta-llama/Llama-3.2-1B` |
+| Llama 3.2 3B | 3.2B | 6.4 GB | `--model meta-llama/Llama-3.2-3B` |
+| Llama 3.1 8B | 8.0B | 16 GB | `--model meta-llama/Llama-3.1-8B` |
+| DeepSeek-R1-Distill-Llama-8B | 8.0B | 16 GB | `--model deepseek-ai/DeepSeek-R1-Distill-Llama-8B` |
+| Mistral 7B v0.3 | 7.2B | 14 GB | `--model mistralai/Mistral-7B-v0.3` |
+| Qwen 2.5 7B | 7.6B | 15 GB | `--model Qwen/Qwen2.5-7B` |
+
+The 8B models require ~16 GB VRAM (fits on RTX 5080). The 1B model leaves ample
+headroom for long KV caches.
 
 ## Building
 
@@ -348,15 +539,16 @@ The engine does one thing: run a forward pass as fast as possible.
 - [x] SwiGLU / GELU / SiLU activations (vectorized half2)
 - [x] GEMM dispatch (cuBLAS + CUTLASS paths)
 - [x] CUDA graph capture / update / replay
+- [x] GQA / MQA (grouped-query / multi-query attention)
+- [x] Weight loading (.forge format, safetensors + GGUF converter)
+- [x] Tokenizer (BPE, tiktoken-compatible, Llama 3 / Mistral / Qwen)
+- [x] Sampling (top-k, top-p, temperature, repetition penalty)
+- [x] End-to-end inference binary (prefill + autoregressive decode)
 - [x] Full forward pass orchestration
-- [x] Accuracy test suite (22 tests, FP32 CPU reference)
-- [x] End-to-end benchmarks (eager vs graph)
-- [ ] Weight loading (safetensors / GGUF)
-- [ ] Tokenizer integration
-- [ ] Sampling (top-k, top-p, temperature)
+- [x] Accuracy test suite (26 tests, FP32 CPU reference)
+- [x] End-to-end benchmarks (eager vs graph, MHA vs GQA)
+- [x] ~~Multi-stream pipelining~~ (tested — cuBLAS saturates SMs even for decode GEMMs, concurrent streams cause contention not overlap)
 - [ ] FP8 quantization (code paths exist, need Linux + CUTLASS)
-- [ ] GQA / MQA (grouped-query / multi-query attention)
-- [ ] Multi-stream pipelining
 - [ ] Speculative decoding
 - [ ] CMake build system
 
