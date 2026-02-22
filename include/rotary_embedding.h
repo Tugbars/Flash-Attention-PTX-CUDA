@@ -1,35 +1,40 @@
 #pragma once
 
-// ============================================================================
-// Rotary Position Embedding (RoPE) — Header (declarations + launch wrapper)
-// ============================================================================
-
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include "transformer_config.h"
-#include "tensor.h"
+#include <cstdio>
+
+#ifndef CUDA_CHECK
+#define CUDA_CHECK(call)                                                      \
+    do {                                                                      \
+        cudaError_t err = (call);                                             \
+        if (err != cudaSuccess) {                                             \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n",                     \
+                    __FILE__, __LINE__, cudaGetErrorString(err));             \
+            abort();                                                          \
+        }                                                                     \
+    } while (0)
+#endif
 
 namespace transformer {
 
-// ============================================================================
-// RoPE Manager — precomputed sin/cos tables
-// ============================================================================
 struct RoPEConfig {
-    float* cos_table = nullptr;   // Device memory
-    float* sin_table = nullptr;
+    float* cos_table = nullptr;  // [max_seq, d_head/2]
+    float* sin_table = nullptr;  // [max_seq, d_head/2]
     int    max_seq   = 0;
     int    d_head    = 0;
     float  base      = 10000.0f;
 
-    // Defined in kernels/rotary_embedding.cu
-    void init(int max_seq_len, int head_dim, float rope_base = 10000.0f,
+    // Allocate tables and precompute cos/sin values
+    void init(int max_seq_len, int head_dim, float rope_base,
               cudaStream_t stream = nullptr);
+
     void free(cudaStream_t stream = nullptr);
 };
 
-// Defined in kernels/rotary_embedding.cu
+// Apply RoPE to Q and K tensors in-place (separate head counts for GQA)
 void launch_rope(half* Q, half* K, const RoPEConfig& rope,
-                 int batch_heads, int seq_len, int start_pos,
+                 int q_heads, int kv_heads, int seq_len, int start_pos,
                  cudaStream_t stream);
 
 } // namespace transformer

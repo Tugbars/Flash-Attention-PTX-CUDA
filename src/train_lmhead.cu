@@ -335,7 +335,7 @@ void frozen_forward(
 
         // RoPE
         if (cfg.use_rotary) {
-            launch_rope(Q, K_proj, rope, nh, seq_len, 0, stream);
+            launch_rope(Q, K_proj, rope, nh, nkv, seq_len, 0, stream);
         }
 
         // Attention (no KV cache — use K_proj/V_proj directly)

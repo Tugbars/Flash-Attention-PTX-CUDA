@@ -49,18 +49,20 @@ namespace transformer {
 // Launch Parameters
 // ============================================================================
 struct FlashAttentionParams {
-    const half* Q;           // [B*H_q, S, D] query matrix (FP16)
-    const half* K;           // [B*H_kv, S, D] key matrix (FP16)
-    const half* V;           // [B*H_kv, S, D] value matrix (FP16)
-    half*       O;           // [B*H_q, S, D] output matrix (FP16)
-    float*      L;           // [B*H_q, S]    log-sum-exp (FP32, optional — can be nullptr)
+    const half* Q;           // [B*H_q, q_len, D] query matrix (FP16)
+    const half* K;           // [B*H_kv, kv_len, D] key matrix (FP16)
+    const half* V;           // [B*H_kv, kv_len, D] value matrix (FP16)
+    half*       O;           // [B*H_q, q_len, D] output matrix (FP16)
+    float*      L;           // [B*H_q, q_len]    log-sum-exp (FP32, optional)
     int         batch_size;
     int         num_heads;   // Q heads (H_q)
     int         num_kv_heads;// KV heads (H_kv). If 0 or == num_heads, MHA mode.
-    int         seq_len;
+    int         seq_len;     // For prefill: q_len == kv_len == seq_len
+    int         q_len;       // Number of query positions (0 = use seq_len)
+    int         kv_len;      // Number of key/value positions (0 = use seq_len)
     int         d_head;      // Must be 64
     float       scale;       // Typically 1.0f / sqrtf(d_head)
-    bool        causal;      // true = causal mask (upper triangle masked)
+    bool        causal;
     cudaStream_t stream;
 };
 

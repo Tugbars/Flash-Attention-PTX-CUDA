@@ -80,18 +80,25 @@ struct InferenceScratch {
     half*  logits_fp16;  // [vocab_size]            lm_head output
     float* logits_fp32;  // [vocab_size]            for CPU sampling
 
+    // Transpose buffers for [S,H*D] ↔ [H,S,D] layout conversion
+    half*  q_transposed;  // [max_seq * d_model]   Q in [H,S,D] layout
+    half*  k_transposed;  // [max_seq * d_kv]      K in [H,S,D] layout
+    half*  v_transposed;  // [max_seq * d_kv]      V in [H,S,D] layout
+    half*  o_transposed;  // [max_seq * d_model]   attn output in [H,S,D]
+
     int32_t* d_token_ids; // [max_seq]              device token IDs
 
     void allocate(const ForgeModelConfig& cfg, cudaStream_t stream) {
         size_t max_n = cfg.max_seq_len;
         size_t d = cfg.d_model;
+        size_t d_kv = cfg.n_kv_heads * cfg.d_head;
         size_t d_ffn = cfg.d_ffn;
         size_t V = cfg.vocab_size;
 
         cudaMallocAsync(&hidden,      max_n * d * sizeof(half), stream);
         cudaMallocAsync(&hidden2,     max_n * d * sizeof(half), stream);
         cudaMallocAsync(&ln_out,      max_n * d * sizeof(half), stream);
-        cudaMallocAsync(&qkv,         max_n * 3 * d * sizeof(half), stream);
+        cudaMallocAsync(&qkv,         max_n * (d + 2 * d_kv) * sizeof(half), stream);
         cudaMallocAsync(&attn_out,    max_n * d * sizeof(half), stream);
         cudaMallocAsync(&attn_lse,    max_n * cfg.n_heads * sizeof(float), stream);
         cudaMallocAsync(&ffn_gate,    max_n * d_ffn * sizeof(half), stream);
@@ -101,6 +108,10 @@ struct InferenceScratch {
         cudaMallocAsync(&residual,    max_n * d * sizeof(half), stream);
         cudaMallocAsync(&logits_fp16, V * sizeof(half), stream);
         cudaMallocAsync(&logits_fp32, V * sizeof(float), stream);
+        cudaMallocAsync(&q_transposed, max_n * d * sizeof(half), stream);
+        cudaMallocAsync(&k_transposed, max_n * d_kv * sizeof(half), stream);
+        cudaMallocAsync(&v_transposed, max_n * d_kv * sizeof(half), stream);
+        cudaMallocAsync(&o_transposed, max_n * d * sizeof(half), stream);
         cudaMallocAsync(&d_token_ids, max_n * sizeof(int32_t), stream);
     }
 
@@ -111,7 +122,10 @@ struct InferenceScratch {
         cudaFreeAsync(ffn_gate, stream);   cudaFreeAsync(ffn_up, stream);
         cudaFreeAsync(ffn_inter, stream);  cudaFreeAsync(ffn_out, stream);
         cudaFreeAsync(residual, stream);   cudaFreeAsync(logits_fp16, stream);
-        cudaFreeAsync(logits_fp32, stream); cudaFreeAsync(d_token_ids, stream);
+        cudaFreeAsync(logits_fp32, stream);
+        cudaFreeAsync(q_transposed, stream); cudaFreeAsync(k_transposed, stream);
+        cudaFreeAsync(v_transposed, stream); cudaFreeAsync(o_transposed, stream);
+        cudaFreeAsync(d_token_ids, stream);
     }
 };
 
@@ -121,6 +135,44 @@ struct InferenceScratch {
 __global__ void half_to_float_kernel(const half* in, float* out, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = __half2float(in[i]);
+}
+
+// ============================================================================
+// Layout transpose: [S, H*D] → [H, S, D] (row-major GEMM output → FA input)
+// Also used as: [H, S, D] → [S, H*D] (FA output → row-major for GEMM)
+// ============================================================================
+__global__ void transpose_shd_to_hsd(
+    const half* __restrict__ src,  // [S, H*D]  or [H, S, D]
+    half*       __restrict__ dst,  // [H, S, D] or [S, H*D]
+    int S, int H, int D, bool shd_to_hsd)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = S * H * D;
+    if (idx >= total) return;
+
+    int s, h, d;
+    if (shd_to_hsd) {
+        // src is [S, H*D]: idx → (s, h, d) → dst[h*S*D + s*D + d]
+        s = idx / (H * D);
+        h = (idx / D) % H;
+        d = idx % D;
+        dst[h * S * D + s * D + d] = src[idx];
+    } else {
+        // src is [H, S, D]: idx → (h, s, d) → dst[s*H*D + h*D + d]
+        h = idx / (S * D);
+        s = (idx / D) % S;
+        d = idx % D;
+        dst[s * H * D + h * D + d] = src[idx];
+    }
+}
+
+static void launch_transpose(const half* src, half* dst,
+                              int S, int H, int D, bool shd_to_hsd,
+                              cudaStream_t stream) {
+    int total = S * H * D;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+    transpose_shd_to_hsd<<<grid, block, 0, stream>>>(src, dst, S, H, D, shd_to_hsd);
 }
 
 // ============================================================================
@@ -140,23 +192,32 @@ __global__ void residual_add_kernel(
 // ============================================================================
 // KV cache update kernel
 // ============================================================================
+// KV cache update — writes to [n_kv_heads, max_seq, d_head] layout
+// Source (from GEMM): [seq_len, n_kv_heads * d_head] row-major
+// Dest (cache):       [n_kv_heads, max_seq, d_head]   — matches FA's [B*H, S, D]
 __global__ void kv_cache_update_kernel(
     half* k_cache, half* v_cache,
     const half* k_new, const half* v_new,
-    int d_kv, int seq_len, int start_pos, int max_seq)
+    int n_kv_heads, int d_head, int seq_len, int start_pos, int max_seq)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int d_kv = n_kv_heads * d_head;
     int total = seq_len * d_kv;
     if (idx >= total) return;
 
+    // Source: [seq_len, n_kv_heads * d_head] row-major
     int s = idx / d_kv;
-    int d = idx % d_kv;
-    int cache_pos = (start_pos + s) * d_kv + d;
+    int h = (idx / d_head) % n_kv_heads;
+    int d = idx % d_head;
+
+    // Dest: [n_kv_heads, max_seq, d_head]
+    int dst = h * max_seq * d_head + (start_pos + s) * d_head + d;
+    int src = s * d_kv + h * d_head + d;
 
     if (blockIdx.y == 0)
-        k_cache[cache_pos] = k_new[s * d_kv + d];
+        k_cache[dst] = k_new[src];
     else
-        v_cache[cache_pos] = v_new[s * d_kv + d];
+        v_cache[dst] = v_new[src];
 }
 
 // ============================================================================
@@ -207,40 +268,99 @@ void forward_pass(
         gemm.gemm_nt(sc.ln_out, w.wk, K_proj,  N, d_kv, d);
         gemm.gemm_nt(sc.ln_out, w.wv, V_proj,  N, d_kv, d);
 
-        // 3. RoPE (applied to Q and K)
-        if (cfg.use_rotary) {
-            // Q: [N, nh * dh] — apply RoPE to all Q heads
-            launch_rope(Q, K_proj, rope, batch_size * nh,
-                       seq_len, start_pos, stream);
-            // Note: K has nkv heads, but RoPE is applied per-head identically
-            // We need a separate RoPE call for K with nkv heads
-            // For now, RoPE is applied to Q (nh heads) and K (nkv heads) together
-            // This works because launch_rope processes BH*seq_len*d_head elements
+        // 3. Layout: GEMM outputs [S, H*D] row-major.
+        //    RoPE and FA expect [H, S, D].
+        //    For seq_len=1 (decode), these are identical.
+        //    For prefill, transpose Q and K_proj now.
+
+        // Q → [nh, seq_len, dh], K_proj → [nkv, seq_len, dh], V_proj stays [S, nkv*dh]
+        half* rope_Q;
+        half* rope_K;
+        bool need_transpose = (seq_len > 1);
+
+        if (need_transpose) {
+            launch_transpose(Q, sc.q_transposed, seq_len, nh, dh, true, stream);
+            launch_transpose(K_proj, sc.k_transposed, seq_len, nkv, dh, true, stream);
+            rope_Q = sc.q_transposed;
+            rope_K = sc.k_transposed;
+        } else {
+            rope_Q = Q;
+            rope_K = K_proj;
         }
 
-        // 4. KV cache update
+        // 4. RoPE (applied in [H, S, D] layout)
+        if (cfg.use_rotary) {
+            launch_rope(rope_Q, rope_K, rope,
+                       batch_size * nh, batch_size * nkv,
+                       seq_len, start_pos, stream);
+        }
+
+        // 5. KV cache update
+        // After RoPE, K is in [nkv, seq_len, dh] layout (if transposed) or [1, nkv*dh] (decode)
+        // Cache is [nkv, max_seq, dh] — for decode, just copy directly.
+        // For prefill, K is already in [H, S, D] — write each head's seq slice into cache.
         {
             half* k_cache = kv.get(l, 0);
             half* v_cache = kv.get(l, 1);
-            int total = seq_len * d_kv;
-            dim3 grid((total + 255) / 256, 2);
-            kv_cache_update_kernel<<<grid, 256, 0, stream>>>(
-                k_cache, v_cache, K_proj, V_proj,
-                d_kv, seq_len, start_pos, cfg.max_seq_len);
+
+            if (need_transpose) {
+                // rope_K is [nkv, seq_len, dh] — copy each head's block into cache
+                // Cache layout: [nkv, max_seq, dh]
+                for (int h = 0; h < nkv; h++) {
+                    half* src_k = rope_K + (size_t)h * seq_len * dh;
+                    half* dst_k = k_cache + (size_t)h * cfg.max_seq_len * dh + (size_t)start_pos * dh;
+                    cudaMemcpyAsync(dst_k, src_k, seq_len * dh * sizeof(half),
+                                    cudaMemcpyDeviceToDevice, stream);
+                }
+                // V_proj is still [S, nkv*dh] — need to transpose then copy
+                launch_transpose(V_proj, sc.v_transposed, seq_len, nkv, dh, true, stream);
+                for (int h = 0; h < nkv; h++) {
+                    half* src_v = sc.v_transposed + (size_t)h * seq_len * dh;
+                    half* dst_v = v_cache + (size_t)h * cfg.max_seq_len * dh + (size_t)start_pos * dh;
+                    cudaMemcpyAsync(dst_v, src_v, seq_len * dh * sizeof(half),
+                                    cudaMemcpyDeviceToDevice, stream);
+                }
+            } else {
+                // Decode: seq_len=1, [1, nkv*dh] == [nkv, 1, dh]
+                // Write into cache at [h, start_pos, :] for each head
+                for (int h = 0; h < nkv; h++) {
+                    half* src_k = rope_K + h * dh;
+                    half* dst_k = k_cache + (size_t)h * cfg.max_seq_len * dh + (size_t)start_pos * dh;
+                    cudaMemcpyAsync(dst_k, src_k, dh * sizeof(half),
+                                    cudaMemcpyDeviceToDevice, stream);
+
+                    half* src_v = V_proj + h * dh;
+                    half* dst_v = v_cache + (size_t)h * cfg.max_seq_len * dh + (size_t)start_pos * dh;
+                    cudaMemcpyAsync(dst_v, src_v, dh * sizeof(half),
+                                    cudaMemcpyDeviceToDevice, stream);
+                }
+            }
         }
 
-        // 5. Flash Attention (GQA)
+        // 6. Flash Attention (GQA)
+        // Q: [nh, seq_len, dh] (transposed) or [nh, 1, dh] (decode) ✓
+        // KV cache: [nkv, max_seq, dh] ✓
+        // FA expects [B*H, S, D] ✓
         {
             int total_len = start_pos + seq_len;
+
             FlashAttentionParams fa = {};
-            fa.Q = Q; fa.K = kv.get(l, 0); fa.V = kv.get(l, 1);
-            fa.O = sc.attn_out; fa.L = sc.attn_lse;
+            fa.Q = rope_Q; fa.K = kv.get(l, 0); fa.V = kv.get(l, 1);
+            fa.O = need_transpose ? sc.o_transposed : sc.attn_out;
+            fa.L = sc.attn_lse;
             fa.batch_size = batch_size; fa.num_heads = nh;
             fa.num_kv_heads = nkv;
-            fa.seq_len = total_len; fa.d_head = dh;
+            fa.q_len = seq_len; fa.kv_len = total_len;
+            fa.seq_len = 0;  // unused — using q_len/kv_len
+            fa.d_head = dh;
             fa.scale = 1.0f / sqrtf((float)dh);
             fa.causal = true; fa.stream = stream;
             launch_flash_attention(fa);
+
+            if (need_transpose) {
+                // Transpose output back: [nh, seq_len, dh] → [seq_len, nh*dh]
+                launch_transpose(sc.o_transposed, sc.attn_out, seq_len, nh, dh, false, stream);
+            }
         }
 
         // 6. Attention output projection

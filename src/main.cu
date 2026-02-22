@@ -431,7 +431,7 @@ bool verify_rope(int batch_heads, int seq_len, int d_head, int start_pos) {
     rope.init(start_pos + seq_len + 64, d_head, base, nullptr);
     cudaDeviceSynchronize();
 
-    launch_rope(d_Q, d_K, rope, batch_heads, seq_len, start_pos, nullptr);
+    launch_rope(d_Q, d_K, rope, batch_heads, batch_heads, seq_len, start_pos, nullptr);
     cudaDeviceSynchronize();
 
     download_fp16(d_Q, h_Q_gpu, total);
@@ -964,7 +964,7 @@ static void bench_forward_pass(
 
         // 3. RoPE
         if (cfg.use_rotary)
-            launch_rope(sc.Q, sc.K_proj, rope, batch_size*nh, seq_len, start_pos, stream);
+            launch_rope(sc.Q, sc.K_proj, rope, batch_size*nh, batch_size*nh, seq_len, start_pos, stream);
 
         // 4. KV cache update (kernel, graph-safe)
         { half* kc = kv.get(l,0); half* vc = kv.get(l,1);
@@ -1286,7 +1286,7 @@ static void bench_forward_multistream(
 
         // 3. RoPE (on s0, needs Q and K)
         if (cfg.use_rotary)
-            launch_rope(sc.Q, sc.K_proj, rope, batch_size*nh, seq_len, start_pos, s0);
+            launch_rope(sc.Q, sc.K_proj, rope, batch_size*nh, batch_size*nh, seq_len, start_pos, s0);
 
         // 4. KV cache update (on s0)
         { half* kc = kv.get(l,0); half* vc = kv.get(l,1);

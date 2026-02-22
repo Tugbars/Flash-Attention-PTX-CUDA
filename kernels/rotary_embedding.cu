@@ -10,8 +10,7 @@
 namespace transformer {
 
 __global__ void apply_rotary_embedding_kernel(
-    half*       __restrict__ Q,
-    half*       __restrict__ K,
+    half*       __restrict__ QorK,
     const float* __restrict__ cos_table,
     const float* __restrict__ sin_table,
     const int   seq_len,
@@ -35,18 +34,10 @@ __global__ void apply_rotary_embedding_kernel(
     int dim0 = pair_idx * 2;
     int dim1 = pair_idx * 2 + 1;
 
-    {
-        float q0 = __half2float(Q[base_offset + dim0]);
-        float q1 = __half2float(Q[base_offset + dim1]);
-        Q[base_offset + dim0] = __float2half(q0 * cos_val - q1 * sin_val);
-        Q[base_offset + dim1] = __float2half(q0 * sin_val + q1 * cos_val);
-    }
-    {
-        float k0 = __half2float(K[base_offset + dim0]);
-        float k1 = __half2float(K[base_offset + dim1]);
-        K[base_offset + dim0] = __float2half(k0 * cos_val - k1 * sin_val);
-        K[base_offset + dim1] = __float2half(k0 * sin_val + k1 * cos_val);
-    }
+    float x0 = __half2float(QorK[base_offset + dim0]);
+    float x1 = __half2float(QorK[base_offset + dim1]);
+    QorK[base_offset + dim0] = __float2half(x0 * cos_val - x1 * sin_val);
+    QorK[base_offset + dim1] = __float2half(x0 * sin_val + x1 * cos_val);
 }
 
 __global__ void precompute_rope_table_kernel(
@@ -96,17 +87,29 @@ void RoPEConfig::free(cudaStream_t stream) {
 }
 
 void launch_rope(half* Q, half* K, const RoPEConfig& rope,
-                 int batch_heads, int seq_len, int start_pos,
+                 int q_heads, int kv_heads, int seq_len, int start_pos,
                  cudaStream_t stream) {
     int half_d = rope.d_head / 2;
     int total  = seq_len * half_d;
     int block  = 256;
     int grid_x = (total + block - 1) / block;
-    dim3 grid(grid_x, batch_heads);
 
-    apply_rotary_embedding_kernel<<<grid, block, 0, stream>>>(
-        Q, K, rope.cos_table, rope.sin_table,
-        seq_len, rope.d_head, start_pos);
+    // Apply RoPE to Q (q_heads heads)
+    {
+        dim3 grid(grid_x, q_heads);
+        apply_rotary_embedding_kernel<<<grid, block, 0, stream>>>(
+            Q, rope.cos_table, rope.sin_table,
+            seq_len, rope.d_head, start_pos);
+    }
+
+    // Apply RoPE to K (kv_heads heads — may differ from q_heads in GQA)
+    {
+        dim3 grid(grid_x, kv_heads);
+        apply_rotary_embedding_kernel<<<grid, block, 0, stream>>>(
+            K, rope.cos_table, rope.sin_table,
+            seq_len, rope.d_head, start_pos);
+    }
+
     CUDA_CHECK(cudaGetLastError());
 }
 

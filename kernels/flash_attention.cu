@@ -94,7 +94,8 @@ __global__ void flash_attention_ptx_kernel(
     const half* __restrict__ V,
     half*       __restrict__ O,
     float*      __restrict__ LSE,
-    const int   seq_len,
+    const int   q_len,       // number of query positions
+    const int   kv_len,      // number of key/value positions (>= q_len for decode)
     const int   n_kv_heads,
     const int   n_q_heads,
     const float scale)
@@ -106,7 +107,7 @@ __global__ void flash_attention_ptx_kernel(
     const int lane_id = threadIdx.x;
     constexpr int THREADS = WARP_SIZE_FA * NUM_WARPS;
 
-    if (q_start >= seq_len) return;
+    if (q_start >= q_len) return;
 
     // -- Shared memory layout ------------------------------------------------
     // Padding by 8 halfs avoids bank conflicts on 16-byte aligned ldmatrix.
@@ -142,8 +143,8 @@ __global__ void flash_attention_ptx_kernel(
     const int kv_head   = q_head * n_kv_heads / n_q_heads;
     const int kv_bh_idx = batch_idx * n_kv_heads + kv_head;
 
-    const size_t q_head_offset  = static_cast<size_t>(bh_idx)    * seq_len * D_HEAD;
-    const size_t kv_head_offset = static_cast<size_t>(kv_bh_idx) * seq_len * D_HEAD;
+    const size_t q_head_offset  = static_cast<size_t>(bh_idx)    * q_len  * D_HEAD;
+    const size_t kv_head_offset = static_cast<size_t>(kv_bh_idx) * kv_len * D_HEAD;
     const half* Q_head = Q + q_head_offset;
     const half* K_head = K + kv_head_offset;
     const half* V_head = V + kv_head_offset;
@@ -156,7 +157,7 @@ __global__ void flash_attention_ptx_kernel(
         for (int idx = tid; idx < BLOCK_M * VEC_COLS; idx += THREADS) {
             int row = idx / VEC_COLS, col = idx % VEC_COLS;
             int g = q_start + row;
-            uint4 val = (g < seq_len)
+            uint4 val = (g < q_len)
                 ? reinterpret_cast<const uint4*>(Q_head + g * D_HEAD)[col]
                 : make_uint4(0, 0, 0, 0);
             reinterpret_cast<uint4*>(smem_q + row * Q_STRIDE)[col] = val;
@@ -170,8 +171,8 @@ __global__ void flash_attention_ptx_kernel(
     //   warp_half=0 → Q*K^T columns 0-31  (ni tiles 0-3)
     //   warp_half=1 → Q*K^T columns 32-63 (ni tiles 4-7)
     // For P*V, they split the D dimension similarly.
-    constexpr int QK_TILES_PER_WARP = 4;  // 4 × m16n8 = 32 N-cols per half
-    constexpr int PV_TILES_PER_WARP = 4;  // 4 × m16n8 = 32 D-cols per half
+    constexpr int QK_TILES_PER_WARP = 4;         // 4 × m16n8 = 32 N-cols per half
+    constexpr int PV_TILES_PER_WARP = D_HEAD / 16; // D_HEAD/8 total, /2 per half
     constexpr int TILES_K  = D_HEAD / 16; // k-tiles for Q*K^T
     constexpr int TILES_BN = BLOCK_N / 16;// k-tiles for P*V
 
@@ -195,12 +196,16 @@ __global__ void flash_attention_ptx_kernel(
     // -- KV tile loop --------------------------------------------------------
     // Flash attention's outer loop: iterate over KV in BLOCK_N chunks.
     // Causal: stop early when all keys are beyond the query positions.
-    const int kv_end = CAUSAL ? min(q_start + BLOCK_M, seq_len) : seq_len;
+    // q_offset: maps Q position to absolute sequence position for causal mask.
+    //   During prefill: q_len == kv_len, so q_offset = 0.
+    //   During decode:  q_len < kv_len, Q represents the last q_len positions.
+    const int q_offset = kv_len - q_len;
+    const int kv_end = CAUSAL ? min(q_offset + q_start + BLOCK_M, kv_len) : kv_len;
     const int num_kv_tiles = (kv_end + BLOCK_N - 1) / BLOCK_N;
 
     for (int kv_tile = 0; kv_tile < num_kv_tiles; kv_tile++) {
         const int kv_start = kv_tile * BLOCK_N;
-        const int kv_count = min(BLOCK_N, seq_len - kv_start);
+        const int kv_count = min(BLOCK_N, kv_len - kv_start);
 
         // ================================================================
         // Load K and V tiles from global memory → shared memory
@@ -211,7 +216,7 @@ __global__ void flash_attention_ptx_kernel(
             for (int idx = tid; idx < BLOCK_N * VEC_COLS; idx += THREADS) {
                 int row = idx / VEC_COLS, col = idx % VEC_COLS;
                 int g = kv_start + row;
-                uint4 val = (g < seq_len && row < kv_count)
+                uint4 val = (g < kv_len && row < kv_count)
                     ? reinterpret_cast<const uint4*>(K_head + g * D_HEAD)[col]
                     : make_uint4(0, 0, 0, 0);
                 reinterpret_cast<uint4*>(smem_k + row * KV_STRIDE)[col] = val;
@@ -219,7 +224,7 @@ __global__ void flash_attention_ptx_kernel(
             for (int idx = tid; idx < BLOCK_N * VEC_COLS; idx += THREADS) {
                 int row = idx / VEC_COLS, col = idx % VEC_COLS;
                 int g = kv_start + row;
-                uint4 val = (g < seq_len && row < kv_count)
+                uint4 val = (g < kv_len && row < kv_count)
                     ? reinterpret_cast<const uint4*>(V_head + g * D_HEAD)[col]
                     : make_uint4(0, 0, 0, 0);
                 reinterpret_cast<uint4*>(smem_v + row * KV_STRIDE)[col] = val;
@@ -285,10 +290,10 @@ __global__ void flash_attention_ptx_kernel(
                     s_acc[ni_local][i] *= scale;
 
                 if (CAUSAL) {
-                    if (kv_start + s_col0 > q_start + global_row0) s_acc[ni_local][0] = -FLT_MAX;
-                    if (kv_start + s_col1 > q_start + global_row0) s_acc[ni_local][1] = -FLT_MAX;
-                    if (kv_start + s_col0 > q_start + global_row1) s_acc[ni_local][2] = -FLT_MAX;
-                    if (kv_start + s_col1 > q_start + global_row1) s_acc[ni_local][3] = -FLT_MAX;
+                    if (kv_start + s_col0 > q_offset + q_start + global_row0) s_acc[ni_local][0] = -FLT_MAX;
+                    if (kv_start + s_col1 > q_offset + q_start + global_row0) s_acc[ni_local][1] = -FLT_MAX;
+                    if (kv_start + s_col0 > q_offset + q_start + global_row1) s_acc[ni_local][2] = -FLT_MAX;
+                    if (kv_start + s_col1 > q_offset + q_start + global_row1) s_acc[ni_local][3] = -FLT_MAX;
                 }
                 if (s_col0 >= kv_count) { s_acc[ni_local][0] = -FLT_MAX; s_acc[ni_local][2] = -FLT_MAX; }
                 if (s_col1 >= kv_count) { s_acc[ni_local][1] = -FLT_MAX; s_acc[ni_local][3] = -FLT_MAX; }
@@ -464,11 +469,11 @@ __global__ void flash_attention_ptx_kernel(
             int gq0 = q_start + global_row0;
             int gq1 = q_start + global_row1;
 
-            if (gq0 < seq_len) {
+            if (gq0 < q_len) {
                 O_head[gq0 * D_HEAD + col0] = __float2half(o_acc[di_local][0] * inv_sum0);
                 O_head[gq0 * D_HEAD + col1] = __float2half(o_acc[di_local][1] * inv_sum0);
             }
-            if (gq1 < seq_len) {
+            if (gq1 < q_len) {
                 O_head[gq1 * D_HEAD + col0] = __float2half(o_acc[di_local][2] * inv_sum1);
                 O_head[gq1 * D_HEAD + col1] = __float2half(o_acc[di_local][3] * inv_sum1);
             }
@@ -478,10 +483,10 @@ __global__ void flash_attention_ptx_kernel(
         if (lane_id % 4 == 0 && LSE != nullptr) {
             int gq0 = q_start + global_row0;
             int gq1 = q_start + global_row1;
-            if (gq0 < seq_len)
-                LSE[bh_idx * seq_len + gq0] = row_max0 + logf(fmaxf(row_sum0, 1e-10f));
-            if (gq1 < seq_len)
-                LSE[bh_idx * seq_len + gq1] = row_max1 + logf(fmaxf(row_sum1, 1e-10f));
+            if (gq0 < q_len)
+                LSE[bh_idx * q_len + gq0] = row_max0 + logf(fmaxf(row_sum0, 1e-10f));
+            if (gq1 < q_len)
+                LSE[bh_idx * q_len + gq1] = row_max1 + logf(fmaxf(row_sum1, 1e-10f));
         }
     }
 }
@@ -492,57 +497,80 @@ __global__ void flash_attention_ptx_kernel(
 void launch_flash_attention(const FlashAttentionParams& params) {
     constexpr int BLOCK_M   = 64;
     constexpr int BLOCK_N   = 64;
-    constexpr int D_HEAD    = 64;
     constexpr int NUM_WARPS = 8;
-    constexpr int SMEM_PAD  = 8;
-    constexpr int Q_STRIDE  = D_HEAD + SMEM_PAD;
-    constexpr int KV_STRIDE = D_HEAD + SMEM_PAD;
-    constexpr int P_STRIDE  = BLOCK_N + SMEM_PAD;
 
-    const int grid_x = (params.seq_len + BLOCK_M - 1) / BLOCK_M;
+    // Resolve q_len / kv_len (0 means use seq_len for backward compat)
+    const int q_len  = (params.q_len  > 0) ? params.q_len  : params.seq_len;
+    const int kv_len = (params.kv_len > 0) ? params.kv_len : params.seq_len;
+
+    const int grid_x = (q_len + BLOCK_M - 1) / BLOCK_M;
     const int grid_y = params.batch_size * params.num_heads;
     dim3 grid(grid_x, grid_y);
-    dim3 block(WARP_SIZE_FA, NUM_WARPS);  // 32 × 8 = 256 threads
+    dim3 block(WARP_SIZE_FA, NUM_WARPS);
 
-    // GQA: resolve n_kv_heads (0 or equal to num_heads means MHA)
     const int n_kv_heads = (params.num_kv_heads > 0 && params.num_kv_heads < params.num_heads)
                            ? params.num_kv_heads : params.num_heads;
     const int n_q_heads  = params.num_heads;
 
-    // Compute dynamic shared memory requirement
-    size_t smem_bytes = 0;
-    smem_bytes += BLOCK_M * Q_STRIDE * sizeof(half);   // smem_q
-    smem_bytes += BLOCK_N * KV_STRIDE * sizeof(half);  // smem_k
-    smem_bytes += BLOCK_N * KV_STRIDE * sizeof(half);  // smem_v
-    smem_bytes += BLOCK_M * P_STRIDE * sizeof(half);   // smem_p
-    smem_bytes += 4 * BLOCK_M * sizeof(float);         // partial_max + partial_sum
+    // Select kernel based on d_head
+    if (params.d_head == 64) {
+        constexpr int D_HEAD = 64;
+        constexpr int SMEM_PAD = 8;
+        size_t smem_bytes = BLOCK_M * (D_HEAD + SMEM_PAD) * sizeof(half)
+                          + 2 * BLOCK_N * (D_HEAD + SMEM_PAD) * sizeof(half)
+                          + BLOCK_M * (BLOCK_N + SMEM_PAD) * sizeof(half)
+                          + 4 * BLOCK_M * sizeof(float);
 
-    // Request extended shared memory if needed (>48KB requires opt-in)
-    if (smem_bytes > 48 * 1024) {
-        if (params.causal) {
+        if (smem_bytes > 48 * 1024) {
             CUDA_CHECK(cudaFuncSetAttribute(
-                flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, D_HEAD, NUM_WARPS, true>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                static_cast<int>(smem_bytes)));
-        } else {
-            CUDA_CHECK(cudaFuncSetAttribute(
-                flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, D_HEAD, NUM_WARPS, false>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                static_cast<int>(smem_bytes)));
+                params.causal
+                    ? flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, 64, NUM_WARPS, true>
+                    : flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, 64, NUM_WARPS, false>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes));
         }
+
+        if (params.causal) {
+            flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, 64, NUM_WARPS, true>
+                <<<grid, block, smem_bytes, params.stream>>>(
+                    params.Q, params.K, params.V, params.O, params.L,
+                    q_len, kv_len, n_kv_heads, n_q_heads, params.scale);
+        } else {
+            flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, 64, NUM_WARPS, false>
+                <<<grid, block, smem_bytes, params.stream>>>(
+                    params.Q, params.K, params.V, params.O, params.L,
+                    q_len, kv_len, n_kv_heads, n_q_heads, params.scale);
+        }
+    } else if (params.d_head == 128) {
+        constexpr int D_HEAD = 128;
+        constexpr int SMEM_PAD = 8;
+        size_t smem_bytes = BLOCK_M * (D_HEAD + SMEM_PAD) * sizeof(half)
+                          + 2 * BLOCK_N * (D_HEAD + SMEM_PAD) * sizeof(half)
+                          + BLOCK_M * (BLOCK_N + SMEM_PAD) * sizeof(half)
+                          + 4 * BLOCK_M * sizeof(float);
+
+        // D_HEAD=128 needs ~67 KB smem — always opt-in
+        CUDA_CHECK(cudaFuncSetAttribute(
+            params.causal
+                ? flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, 128, NUM_WARPS, true>
+                : flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, 128, NUM_WARPS, false>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes));
+
+        if (params.causal) {
+            flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, 128, NUM_WARPS, true>
+                <<<grid, block, smem_bytes, params.stream>>>(
+                    params.Q, params.K, params.V, params.O, params.L,
+                    q_len, kv_len, n_kv_heads, n_q_heads, params.scale);
+        } else {
+            flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, 128, NUM_WARPS, false>
+                <<<grid, block, smem_bytes, params.stream>>>(
+                    params.Q, params.K, params.V, params.O, params.L,
+                    q_len, kv_len, n_kv_heads, n_q_heads, params.scale);
+        }
+    } else {
+        fprintf(stderr, "ERROR: Unsupported d_head=%d (only 64 and 128)\n", params.d_head);
+        exit(1);
     }
 
-    if (params.causal) {
-        flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, D_HEAD, NUM_WARPS, true>
-            <<<grid, block, smem_bytes, params.stream>>>(
-                params.Q, params.K, params.V, params.O, params.L,
-                params.seq_len, n_kv_heads, n_q_heads, params.scale);
-    } else {
-        flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, D_HEAD, NUM_WARPS, false>
-            <<<grid, block, smem_bytes, params.stream>>>(
-                params.Q, params.K, params.V, params.O, params.L,
-                params.seq_len, n_kv_heads, n_q_heads, params.scale);
-    }
     CUDA_CHECK(cudaGetLastError());
 }
 
