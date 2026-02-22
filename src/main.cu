@@ -779,6 +779,44 @@ void benchmark_flash_attention(int batch_size, int n_heads, int seq_len, int d_h
     cudaFree(Q); cudaFree(K); cudaFree(V); cudaFree(O); cudaFree(L);
 }
 
+void benchmark_flash_attention_gqa(int batch_size, int n_q_heads, int n_kv_heads,
+                                    int seq_len, int d_head,
+                                    int warmup = 10, int iters = 100) {
+    int ratio = n_q_heads / n_kv_heads;
+    printf("\n--- FA GQA [B=%d,Hq=%d,Hkv=%d,%d:1,S=%d,D=%d] ",
+           batch_size, n_q_heads, n_kv_heads, ratio, seq_len, d_head);
+
+    size_t q_bh  = (size_t)batch_size * n_q_heads;
+    size_t kv_bh = (size_t)batch_size * n_kv_heads;
+    size_t q_elems  = q_bh * seq_len * d_head;
+    size_t kv_elems = kv_bh * seq_len * d_head;
+
+    half *Q, *K, *V, *O; float *L;
+    cudaMalloc(&Q, q_elems*2);  cudaMalloc(&K, kv_elems*2);
+    cudaMalloc(&V, kv_elems*2); cudaMalloc(&O, q_elems*2);
+    cudaMalloc(&L, q_bh * seq_len * 4);
+    cudaMemset(Q, 0x3C, q_elems*2);
+    cudaMemset(K, 0x3C, kv_elems*2);
+    cudaMemset(V, 0x3C, kv_elems*2);
+
+    FlashAttentionParams p = {};
+    p.Q=Q; p.K=K; p.V=V; p.O=O; p.L=L;
+    p.batch_size=batch_size; p.num_heads=n_q_heads; p.num_kv_heads=n_kv_heads;
+    p.seq_len=seq_len; p.d_head=d_head;
+    p.scale=1.0f/sqrtf((float)d_head); p.causal=true; p.stream=nullptr;
+
+    for(int i=0;i<warmup;i++) launch_flash_attention(p);
+    cudaDeviceSynchronize();
+    CudaTimer t; t.begin();
+    for(int i=0;i<iters;i++) launch_flash_attention(p);
+    float ms = t.end()/iters;
+
+    // FLOPs: Q×K^T + P×V, each is 2*B*Hq*S*S*D (Q heads drive compute, KV is shared)
+    double flops = 2.0*q_bh*(double)seq_len*seq_len*d_head*2;
+    printf("%.3f ms  %.2f TFLOPS\n", ms, flops/(ms*1e-3)/1e12);
+    cudaFree(Q); cudaFree(K); cudaFree(V); cudaFree(O); cudaFree(L);
+}
+
 void benchmark_gemm(int M, int N, int K_dim, int warmup = 10, int iters = 100) {
     printf("--- GEMM Bench [%dx%dx%d] ", M, N, K_dim);
     half *A,*B,*C;
@@ -1565,6 +1603,25 @@ int main(int argc, char** argv) {
     benchmark_flash_attention(4, 12, 2048, 64);
     benchmark_flash_attention(8, 12, 2048, 64);
     benchmark_flash_attention(1, 12, 4096, 64);
+
+    // ── MHA vs GQA Comparison ────────────────────────────────────────────
+    printf("\n╔══════════════════════════════════════════╗\n");
+    printf("║       MHA vs GQA ATTENTION BENCHMARK     ║\n");
+    printf("╚══════════════════════════════════════════╝\n");
+
+    // Same Q heads (32), S=2048 — Llama 3.2 config
+    benchmark_flash_attention(1, 32, 2048, 64);           // MHA: 32Q, 32KV
+    benchmark_flash_attention_gqa(1, 32, 8, 2048, 64);    // GQA: 32Q, 8KV (4:1)
+    benchmark_flash_attention_gqa(1, 32, 4, 2048, 64);    // GQA: 32Q, 4KV (8:1)
+    benchmark_flash_attention_gqa(1, 32, 1, 2048, 64);    // MQA: 32Q, 1KV (32:1)
+
+    // Batched — B=4, 32 heads
+    benchmark_flash_attention(4, 32, 2048, 64);           // MHA
+    benchmark_flash_attention_gqa(4, 32, 8, 2048, 64);    // GQA 4:1
+
+    // Shorter seq — S=512
+    benchmark_flash_attention(1, 32, 512, 64);            // MHA
+    benchmark_flash_attention_gqa(1, 32, 8, 512, 64);     // GQA 4:1
 
     // ── Forward Pass: Eager vs CUDA Graph ────────────────────────────────
     printf("\n╔══════════════════════════════════════════╗\n");
