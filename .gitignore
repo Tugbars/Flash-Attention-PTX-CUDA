@@ -1,2 +1,4 @@
 /build
 /.cache
+scripts/deepseek-r1-1.5b.forge
+scripts/deepseek-r1-1.5b.forge.vocab

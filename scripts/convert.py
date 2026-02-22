@@ -130,11 +130,32 @@ def load_safetensors_dir(model_path: str) -> tuple[dict, dict]:
         raise FileNotFoundError(f"No .safetensors files in {model_path}")
 
     # Load all tensors
+    # Try torch first (handles bf16 natively), fall back to numpy
     tensors = {}
+    use_torch = False
+    try:
+        import torch
+        use_torch = True
+    except ImportError:
+        pass
+
     for path in st_files:
-        with safe_open(path, framework="numpy") as f:
-            for name in f.keys():
-                tensors[name] = f.get_tensor(name)
+        if use_torch:
+            with safe_open(path, framework="pt") as f:
+                for name in f.keys():
+                    t = f.get_tensor(name)
+                    # Convert to float16 numpy array (handles bf16 → fp16)
+                    tensors[name] = t.to(torch.float16).numpy()
+        else:
+            # Pure numpy — try loading, handle bf16 error
+            try:
+                with safe_open(path, framework="numpy") as f:
+                    for name in f.keys():
+                        tensors[name] = f.get_tensor(name)
+            except TypeError:
+                print(f"  BF16 detected — install PyTorch for automatic conversion:")
+                print(f"    pip install torch")
+                sys.exit(1)
         print(f"  Loaded {path} ({len(tensors)} tensors total)")
 
     return hf_config, tensors
@@ -509,7 +530,7 @@ def export_vocab(model_path: str, output_path: str):
         return
 
     print(f"\n  Exporting tokenizer from {tok_path}")
-    with open(tok_path) as f:
+    with open(tok_path, encoding="utf-8") as f:
         tok_data = json.load(f)
 
     model_data = tok_data.get("model", {})
