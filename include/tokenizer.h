@@ -121,7 +121,10 @@ public:
         printf("  Loading tokenizer: %u tokens, %u merges\n", vocab_size, n_merges);
 
         // Lines: id<TAB>base64(token_bytes)
-        id_to_token_.resize(vocab_size);
+        // First pass: read all entries, track max ID
+        std::vector<std::pair<uint32_t, std::string>> entries;
+        entries.reserve(vocab_size);
+        uint32_t max_id = 0;
         for (uint32_t i = 0; i < vocab_size; i++) {
             std::string line;
             std::getline(f, line);
@@ -133,7 +136,13 @@ public:
             uint32_t id = std::stoul(line.substr(0, tab));
             std::string b64 = line.substr(tab + 1);
             std::string token_bytes = base64_decode(b64);
+            entries.push_back({id, token_bytes});
+            if (id > max_id) max_id = id;
+        }
 
+        // Allocate to fit the largest ID
+        id_to_token_.resize(max_id + 1);
+        for (auto& [id, token_bytes] : entries) {
             id_to_token_[id] = token_bytes;
             token_to_id_[token_bytes] = id;
         }
@@ -141,7 +150,8 @@ public:
         // Build byte-to-token-ID mapping
         // For each single-byte token in the vocab, record its ID
         byte_to_id_.resize(256, UINT32_MAX);
-        for (uint32_t i = 0; i < vocab_size; i++) {
+        uint32_t actual_size = static_cast<uint32_t>(id_to_token_.size());
+        for (uint32_t i = 0; i < actual_size; i++) {
             const auto& tok = id_to_token_[i];
             if (tok.size() == 1) {
                 uint8_t byte = static_cast<uint8_t>(tok[0]);
@@ -156,7 +166,14 @@ public:
         for (int i = 0; i < 256; i++) {
             if (byte_to_id_[i] != UINT32_MAX) byte_count++;
         }
-        printf("  Byte tokens mapped: %d/256\n", byte_count);
+        printf("  Byte tokens mapped: %d/256", byte_count);
+        if (byte_count > 0) {
+            // Print a few examples
+            printf(" (e.g. 'H'=%u", byte_to_id_['H']);
+            printf(", 'e'=%u", byte_to_id_['e']);
+            printf(", ' '=%u)", byte_to_id_[' ']);
+        }
+        printf("\n");
 
         // Merge rules: id1<SPACE>id2 (priority = line order)
         merges_.reserve(n_merges);
