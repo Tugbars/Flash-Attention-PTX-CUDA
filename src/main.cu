@@ -716,6 +716,368 @@ void benchmark_layernorm(int N, int D, int warmup = 10, int iters = 1000) {
 }
 
 // ============================================================================
+// Full Forward Pass Benchmark — Eager vs CUDA Graph
+//
+// Self-contained: defines its own weight struct, KV update kernel, and
+// forward pass logic (same sequence as transformer_block.cu) so the test
+// compiles independently without cross-file .cu includes.
+// ============================================================================
+
+// KV cache update kernel (replaces host memcpy loop for graph compatibility)
+__global__ void bench_kv_update_kernel(
+    half* __restrict__ k_cache, half* __restrict__ v_cache,
+    const half* __restrict__ K_proj, const half* __restrict__ V_proj,
+    int d_model, int seq_len, int start_pos, int batch_size)
+{
+    const int kv = blockIdx.y;  // 0=K, 1=V
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = batch_size * seq_len * d_model;
+    if (idx >= total) return;
+    const int dim = idx % d_model;
+    const int s   = (idx / d_model) % seq_len;
+    const int src = (s) * d_model + dim;  // batch=0 for single-batch
+    const int dst = (start_pos + s) * d_model + dim;
+    if (kv == 0) k_cache[dst] = K_proj[src];
+    else         v_cache[dst] = V_proj[src];
+}
+
+// Residual add kernel
+__global__ void bench_residual_add(const half* a, const half* b, half* out, int n) {
+    int i2 = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
+    if (i2 + 1 < n) {
+        half2 va = *reinterpret_cast<const half2*>(&a[i2]);
+        half2 vb = *reinterpret_cast<const half2*>(&b[i2]);
+        float2 fa = __half22float2(va), fb = __half22float2(vb);
+        *reinterpret_cast<half2*>(&out[i2]) = __float22half2_rn({fa.x+fb.x, fa.y+fb.y});
+    } else if (i2 < n) {
+        out[i2] = __float2half(__half2float(a[i2]) + __half2float(b[i2]));
+    }
+}
+
+struct BenchLayerWeights {
+    half *W_q, *W_k, *W_v, *W_o;
+    half *W_gate, *W_up, *W_down;
+    half *ln1_gamma, *ln1_beta;
+    half *ln2_gamma, *ln2_beta;
+    half *b_o;  // optional bias
+};
+
+struct BenchScratch {
+    half *ln_out, *Q, *K_proj, *V_proj, *attn_out;
+    half *ffn_gate, *ffn_up, *ffn_inter, *ffn_out, *residual;
+    float *attn_lse;
+};
+
+static void bench_alloc_weights(BenchLayerWeights& w, int d, int d_ffn, cudaStream_t s) {
+    auto af = [s](half*& p, size_t n) {
+        cudaMallocAsync(&p, n * sizeof(half), s);
+        cudaMemsetAsync(p, 0x3C, n * sizeof(half), s);
+    };
+    af(w.W_q, (size_t)d*d); af(w.W_k, (size_t)d*d);
+    af(w.W_v, (size_t)d*d); af(w.W_o, (size_t)d*d);
+    af(w.W_gate, (size_t)d*d_ffn); af(w.W_up, (size_t)d*d_ffn);
+    af(w.W_down, (size_t)d_ffn*d);
+    af(w.ln1_gamma, d); af(w.ln1_beta, d);
+    af(w.ln2_gamma, d); af(w.ln2_beta, d);
+    w.b_o = nullptr;
+}
+
+static void bench_free_weights(BenchLayerWeights& w, cudaStream_t s) {
+    auto sf = [s](half*& p) { if(p){cudaFreeAsync(p,s);p=nullptr;} };
+    sf(w.W_q); sf(w.W_k); sf(w.W_v); sf(w.W_o);
+    sf(w.W_gate); sf(w.W_up); sf(w.W_down);
+    sf(w.ln1_gamma); sf(w.ln1_beta); sf(w.ln2_gamma); sf(w.ln2_beta);
+}
+
+// One full forward pass through all layers — same kernel sequence as transformer_block.cu
+static void bench_forward_pass(
+    half* input, half* output,
+    const std::vector<BenchLayerWeights>& weights,
+    BenchScratch& sc, KVCache<half>& kv,
+    GemmManager& gemm, const RoPEConfig& rope,
+    const ModelConfig& cfg,
+    int batch_size, int seq_len, int start_pos,
+    cudaStream_t stream)
+{
+    const int N = batch_size * seq_len;
+    const int d = cfg.d_model;
+    const int nh = cfg.n_heads;
+    const int dh = cfg.d_head;
+    const int d_ffn = cfg.d_ffn_gate();
+    gemm.set_stream(stream);
+
+    half* cur_in  = input;
+    half* cur_out = output;
+
+    for (int l = 0; l < cfg.n_layers; l++) {
+        const auto& w = weights[l];
+
+        // 1. Pre-LayerNorm
+        { LayerNormParams p={};
+          p.input=cur_in; p.gamma=w.ln1_gamma; p.beta=w.ln1_beta;
+          p.output=sc.ln_out; p.num_tokens=N; p.d_model=d;
+          p.eps=1e-5f; p.use_rmsnorm=false; p.stream=stream;
+          launch_fused_layernorm(p); }
+
+        // 2. QKV projections
+        gemm.gemm_nt(sc.ln_out, w.W_q, sc.Q,      N, d, d);
+        gemm.gemm_nt(sc.ln_out, w.W_k, sc.K_proj,  N, d, d);
+        gemm.gemm_nt(sc.ln_out, w.W_v, sc.V_proj,  N, d, d);
+
+        // 3. RoPE
+        if (cfg.use_rotary)
+            launch_rope(sc.Q, sc.K_proj, rope, batch_size*nh, seq_len, start_pos, stream);
+
+        // 4. KV cache update (kernel, graph-safe)
+        { half* kc = kv.get(l,0); half* vc = kv.get(l,1);
+          int total = batch_size * seq_len * d;
+          dim3 grid((total+255)/256, 2);
+          bench_kv_update_kernel<<<grid,256,0,stream>>>(
+              kc, vc, sc.K_proj, sc.V_proj, d, seq_len, start_pos, batch_size); }
+
+        // 5. Flash Attention
+        { int tlen = start_pos + seq_len;
+          FlashAttentionParams fa={};
+          fa.Q=sc.Q; fa.K=kv.get(l,0); fa.V=kv.get(l,1);
+          fa.O=sc.attn_out; fa.L=sc.attn_lse;
+          fa.batch_size=batch_size; fa.num_heads=nh;
+          fa.seq_len=tlen; fa.d_head=dh;
+          fa.scale=1.0f/sqrtf((float)dh);
+          fa.causal=true; fa.stream=stream;
+          launch_flash_attention(fa); }
+
+        // 6. Attn output projection
+        gemm.gemm_nt(sc.attn_out, w.W_o, sc.ffn_out, N, d, d);
+
+        // 7. Pre-LayerNorm (FFN) + residual
+        { LayerNormParams p={};
+          p.input=sc.ffn_out; p.residual=cur_in; p.bias=w.b_o;
+          p.gamma=w.ln2_gamma; p.beta=w.ln2_beta;
+          p.output=sc.ln_out; p.residual_out=sc.residual;
+          p.num_tokens=N; p.d_model=d;
+          p.eps=1e-5f; p.use_rmsnorm=false; p.stream=stream;
+          launch_fused_layernorm(p); }
+
+        // 8. FFN (SwiGLU)
+        if (cfg.use_swiglu) {
+            gemm.gemm_nt(sc.ln_out, w.W_gate, sc.ffn_gate, N, d_ffn, d);
+            gemm.gemm_nt(sc.ln_out, w.W_up,   sc.ffn_up,   N, d_ffn, d);
+            launch_fused_swiglu(sc.ffn_gate, sc.ffn_up, sc.ffn_inter, N, d_ffn, stream);
+        } else {
+            gemm.gemm_nt(sc.ln_out, w.W_up, sc.ffn_up, N, d_ffn, d);
+            launch_fused_gelu(sc.ffn_up, sc.ffn_inter, N, d_ffn, stream);
+        }
+        gemm.gemm_nt(sc.ffn_inter, w.W_down, sc.ffn_out, N, d, d_ffn);
+
+        // 9. Residual add
+        { int n = N * d; int grid = (n/2+255)/256;
+          bench_residual_add<<<grid,256,0,stream>>>(sc.residual, sc.ffn_out, cur_out, n); }
+
+        std::swap(cur_in, cur_out);
+    }
+
+    // Fix output pointer for odd layer count
+    if (cfg.n_layers % 2 == 1 && cur_in != output) {
+        size_t bytes = (size_t)batch_size * seq_len * d * sizeof(half);
+        cudaMemcpyAsync(output, cur_in, bytes, cudaMemcpyDeviceToDevice, stream);
+    }
+}
+
+void benchmark_forward_pass(const ModelConfig& cfg, int prefill_len, int decode_steps,
+                             int warmup_iters = 3) {
+    printf("\n=== Full Forward Pass: Eager vs CUDA Graph ===\n");
+    printf("  d=%d, heads=%d, layers=%d, d_ffn=%d (SwiGLU:%d)\n",
+           cfg.d_model, cfg.n_heads, cfg.n_layers, cfg.d_ffn_gate(), cfg.use_swiglu);
+    printf("  Prefill: %d tokens, Decode: %d steps\n\n", prefill_len, decode_steps);
+
+    const int d = cfg.d_model;
+    const int d_ffn = cfg.d_ffn_gate();
+    const int max_seq = cfg.max_seq_len;
+
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+
+    // Allocate weights
+    std::vector<BenchLayerWeights> weights(cfg.n_layers);
+    for (int l = 0; l < cfg.n_layers; l++)
+        bench_alloc_weights(weights[l], d, d_ffn, stream);
+
+    // Allocate scratch (sized for prefill — decode fits trivially)
+    size_t max_N = prefill_len;  // max tokens in a single forward call
+    BenchScratch sc;
+    cudaMallocAsync(&sc.ln_out,    max_N*d*sizeof(half), stream);
+    cudaMallocAsync(&sc.Q,         max_N*d*sizeof(half), stream);
+    cudaMallocAsync(&sc.K_proj,    max_N*d*sizeof(half), stream);
+    cudaMallocAsync(&sc.V_proj,    max_N*d*sizeof(half), stream);
+    cudaMallocAsync(&sc.attn_out,  max_N*d*sizeof(half), stream);
+    cudaMallocAsync(&sc.ffn_gate,  max_N*d_ffn*sizeof(half), stream);
+    cudaMallocAsync(&sc.ffn_up,    max_N*d_ffn*sizeof(half), stream);
+    cudaMallocAsync(&sc.ffn_inter, max_N*d_ffn*sizeof(half), stream);
+    cudaMallocAsync(&sc.ffn_out,   max_N*d*sizeof(half), stream);
+    cudaMallocAsync(&sc.residual,  max_N*d*sizeof(half), stream);
+    cudaMallocAsync(&sc.attn_lse,  max_N*cfg.n_heads*sizeof(float), stream);
+
+    // KV cache
+    KVCache<half> kv;
+    kv.allocate(cfg.n_layers, cfg.n_heads, cfg.d_head, max_seq, stream);
+
+    // RoPE
+    RoPEConfig rope;
+    if (cfg.use_rotary) rope.init(max_seq, cfg.d_head, 10000.0f, stream);
+
+    // GemmManager
+    GemmManager gemm;
+    gemm.set_stream(stream);
+
+    // Input/output
+    half *input, *output;
+    cudaMallocAsync(&input,  max_N*d*sizeof(half), stream);
+    cudaMallocAsync(&output, max_N*d*sizeof(half), stream);
+    cudaMemsetAsync(input, 0x3C, max_N*d*sizeof(half), stream);
+    cudaStreamSynchronize(stream);
+
+    // =====================================================================
+    // EAGER (no graphs)
+    // =====================================================================
+    {
+        printf("  --- EAGER (no graphs) ---\n");
+
+        // Warmup
+        for (int w = 0; w < warmup_iters; w++) {
+            bench_forward_pass(input, output, weights, sc, kv, gemm, rope,
+                              cfg, 1, prefill_len, 0, stream);
+            cudaStreamSynchronize(stream);
+        }
+
+        // Time prefill
+        CudaTimer t;
+        t.begin(stream);
+        bench_forward_pass(input, output, weights, sc, kv, gemm, rope,
+                          cfg, 1, prefill_len, 0, stream);
+        float prefill_ms = t.end(stream);
+
+        // Time decode
+        t.begin(stream);
+        for (int s = 0; s < decode_steps; s++) {
+            bench_forward_pass(input, output, weights, sc, kv, gemm, rope,
+                              cfg, 1, 1, prefill_len + s, stream);
+            cudaStreamSynchronize(stream);
+        }
+        float decode_ms = t.end(stream);
+        float decode_per = decode_ms / decode_steps;
+
+        printf("    Prefill (%d tok):    %.3f ms\n", prefill_len, prefill_ms);
+        printf("    Decode  (per step):  %.3f ms  (%.0f tok/s)\n",
+               decode_per, 1000.0 / decode_per);
+        printf("    Decode  (%d steps):  %.3f ms\n\n", decode_steps, decode_ms);
+    }
+
+    // Reset KV cache for fair comparison
+    cudaMemsetAsync(kv.data, 0,
+        (size_t)cfg.n_layers * 2 * max_seq * cfg.n_heads * cfg.d_head * sizeof(half), stream);
+    cudaStreamSynchronize(stream);
+
+    // =====================================================================
+    // CUDA GRAPH
+    // =====================================================================
+    {
+        printf("  --- CUDA GRAPH ---\n");
+
+        // We need two graph executables: one for prefill, one for decode.
+        // Decode graph is captured once and updated each step (only start_pos changes).
+
+        cudaGraph_t     graph      = nullptr;
+        cudaGraphExec_t decode_exec = nullptr;
+
+        // Warmup — also warms up cuBLAS plans etc.
+        for (int w = 0; w < warmup_iters; w++) {
+            bench_forward_pass(input, output, weights, sc, kv, gemm, rope,
+                              cfg, 1, prefill_len, 0, stream);
+            cudaStreamSynchronize(stream);
+        }
+
+        // Reset KV again
+        cudaMemsetAsync(kv.data, 0,
+            (size_t)cfg.n_layers * 2 * max_seq * cfg.n_heads * cfg.d_head * sizeof(half), stream);
+        cudaStreamSynchronize(stream);
+
+        // --- Time prefill with graph ---
+        // Capture
+        cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+        bench_forward_pass(input, output, weights, sc, kv, gemm, rope,
+                          cfg, 1, prefill_len, 0, stream);
+        cudaStreamEndCapture(stream, &graph);
+        cudaGraphExec_t prefill_exec;
+        cudaGraphInstantiate(&prefill_exec, graph, nullptr, nullptr, 0);
+        cudaGraphDestroy(graph); graph = nullptr;
+
+        CudaTimer t;
+        t.begin(stream);
+        cudaGraphLaunch(prefill_exec, stream);
+        float prefill_ms = t.end(stream);
+        cudaGraphExecDestroy(prefill_exec);
+
+        // --- Time decode with graph (capture + update cycle) ---
+        // Capture first decode step → instantiate
+        cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+        bench_forward_pass(input, output, weights, sc, kv, gemm, rope,
+                          cfg, 1, 1, prefill_len, stream);
+        cudaStreamEndCapture(stream, &graph);
+        cudaGraphInstantiate(&decode_exec, graph, nullptr, nullptr, 0);
+        cudaGraphDestroy(graph); graph = nullptr;
+
+        // Launch first decode step
+        cudaGraphLaunch(decode_exec, stream);
+        cudaStreamSynchronize(stream);
+
+        // Time remaining decode steps with update + launch
+        t.begin(stream);
+        for (int s = 1; s < decode_steps; s++) {
+            // Capture new graph with updated start_pos
+            cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+            bench_forward_pass(input, output, weights, sc, kv, gemm, rope,
+                              cfg, 1, 1, prefill_len + s, stream);
+            cudaStreamEndCapture(stream, &graph);
+
+            // Fast parameter update (no re-instantiation)
+            cudaGraphExecUpdateResult result;
+            cudaGraphNode_t err_node;
+            cudaError_t err = cudaGraphExecUpdate(decode_exec, graph, &err_node, &result);
+            if (err != cudaSuccess || result != cudaGraphExecUpdateSuccess) {
+                // Fallback — shouldn't happen for same topology
+                cudaGraphExecDestroy(decode_exec);
+                cudaGraphInstantiate(&decode_exec, graph, nullptr, nullptr, 0);
+            }
+            cudaGraphDestroy(graph); graph = nullptr;
+
+            cudaGraphLaunch(decode_exec, stream);
+            cudaStreamSynchronize(stream);
+        }
+        float decode_ms = t.end(stream);
+        float decode_per = decode_ms / (decode_steps - 1);  // first step excluded
+
+        printf("    Prefill (%d tok):    %.3f ms\n", prefill_len, prefill_ms);
+        printf("    Decode  (per step):  %.3f ms  (%.0f tok/s)\n",
+               decode_per, 1000.0 / decode_per);
+        printf("    Decode  (%d steps):  %.3f ms\n\n", decode_steps - 1, decode_ms);
+
+        cudaGraphExecDestroy(decode_exec);
+    }
+
+    // Cleanup
+    auto sf = [stream](half*& p) { if(p){cudaFreeAsync(p,stream);p=nullptr;} };
+    sf(sc.ln_out); sf(sc.Q); sf(sc.K_proj); sf(sc.V_proj); sf(sc.attn_out);
+    sf(sc.ffn_gate); sf(sc.ffn_up); sf(sc.ffn_inter); sf(sc.ffn_out); sf(sc.residual);
+    if(sc.attn_lse){cudaFreeAsync(sc.attn_lse,stream);sc.attn_lse=nullptr;}
+    sf(input); sf(output);
+    kv.free(stream);
+    if (cfg.use_rotary) rope.free(stream);
+    for (int l = 0; l < cfg.n_layers; l++) bench_free_weights(weights[l], stream);
+    cudaStreamSynchronize(stream);
+    cudaStreamDestroy(stream);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 int main(int argc, char** argv) {
@@ -806,6 +1168,39 @@ int main(int argc, char** argv) {
     benchmark_flash_attention(4, 12, 2048, 64);
     benchmark_flash_attention(8, 12, 2048, 64);
     benchmark_flash_attention(1, 12, 4096, 64);
+
+    // ── Forward Pass: Eager vs CUDA Graph ────────────────────────────────
+    printf("\n╔══════════════════════════════════════════╗\n");
+    printf("║    FORWARD PASS: EAGER vs CUDA GRAPH     ║\n");
+    printf("╚══════════════════════════════════════════╝\n");
+
+    // Small model (GPT-2 small scale) — 12 layers
+    {
+        ModelConfig fwd_cfg;
+        fwd_cfg.d_model     = 768;
+        fwd_cfg.n_heads     = 12;
+        fwd_cfg.d_head      = 64;
+        fwd_cfg.d_ffn       = 3072;
+        fwd_cfg.n_layers    = 12;
+        fwd_cfg.max_seq_len = 2048;
+        fwd_cfg.use_rotary  = true;
+        fwd_cfg.use_swiglu  = true;
+        benchmark_forward_pass(fwd_cfg, /*prefill=*/512, /*decode_steps=*/100);
+    }
+
+    // Smaller model — 6 layers (faster iteration)
+    {
+        ModelConfig fwd_cfg;
+        fwd_cfg.d_model     = 512;
+        fwd_cfg.n_heads     = 8;
+        fwd_cfg.d_head      = 64;
+        fwd_cfg.d_ffn       = 2048;
+        fwd_cfg.n_layers    = 6;
+        fwd_cfg.max_seq_len = 2048;
+        fwd_cfg.use_rotary  = true;
+        fwd_cfg.use_swiglu  = true;
+        benchmark_forward_pass(fwd_cfg, /*prefill=*/256, /*decode_steps=*/200);
+    }
 
     printf("\n============================================\n");
     printf("  Complete. %d/%d accuracy tests passed.\n", pass, pass + fail);
