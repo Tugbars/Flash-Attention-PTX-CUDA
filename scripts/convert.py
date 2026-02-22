@@ -322,16 +322,15 @@ def hf_config_to_forge(hf_config: dict) -> dict:
 
 
 def transpose_for_nt(tensor: np.ndarray) -> np.ndarray:
-    """Transpose a 2D weight matrix for cuBLAS NT layout.
+    """Prepare a 2D weight matrix for cuBLAS NT layout.
     
+    gemm_nt computes C = A * B^T, where B is [N, K] row-major.
     HF stores weights as [out_features, in_features] row-major.
-    cuBLAS NT expects B as [out_features, in_features] col-major
-    = [in_features, out_features] row-major.
+    For gemm_nt: N=out_features, K=in_features, so B=[out, in] row-major.
     
-    So we just transpose: [out, in] → [in, out].
+    This matches HF layout directly — NO transpose needed.
     """
-    if tensor.ndim == 2:
-        return np.ascontiguousarray(tensor.T)
+    # No-op: HF layout is already correct for gemm_nt
     return tensor
 
 
