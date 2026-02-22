@@ -1078,6 +1078,297 @@ void benchmark_forward_pass(const ModelConfig& cfg, int prefill_len, int decode_
 }
 
 // ============================================================================
+// Multi-Stream Forward Pass — Concurrent QKV & Gate/Up GEMMs
+//
+// Within each layer, two groups of GEMMs are independent:
+//   - Q, K, V projections: all read ln_out, write separate buffers
+//   - FFN gate, up projections: all read ln_out, write separate buffers
+//
+// By dispatching these on separate streams with separate cuBLAS handles,
+// the GPU can overlap memory loads across different weight matrices.
+//
+// This helps most during DECODE (seq_len=1) where individual GEMMs are
+// tiny matrix-vector multiplies that don't saturate the GPU. During
+// PREFILL, a single GEMM already saturates all SMs, so concurrency
+// adds no benefit.
+//
+// Cross-layer overlap (FFN_N || LN_N+1) is NOT possible — the residual
+// add at the end of each layer creates a true data dependency:
+//   output_N = residual + FFN_down(...)  →  LN1_N+1(output_N)
+// ============================================================================
+
+static void bench_forward_multistream(
+    half* input, half* output,
+    const std::vector<BenchLayerWeights>& weights,
+    BenchScratch& sc, KVCache<half>& kv,
+    GemmManager& gemm0, GemmManager& gemm1, GemmManager& gemm2,
+    const RoPEConfig& rope, const ModelConfig& cfg,
+    int batch_size, int seq_len, int start_pos,
+    cudaStream_t s0, cudaStream_t s1, cudaStream_t s2,
+    cudaEvent_t ev1, cudaEvent_t ev2)
+{
+    const int N = batch_size * seq_len;
+    const int d = cfg.d_model;
+    const int nh = cfg.n_heads;
+    const int dh = cfg.d_head;
+    const int d_ffn = cfg.d_ffn_gate();
+
+    gemm0.set_stream(s0);
+    gemm1.set_stream(s1);
+    gemm2.set_stream(s2);
+
+    half* cur_in  = input;
+    half* cur_out = output;
+
+    for (int l = 0; l < cfg.n_layers; l++) {
+        const auto& w = weights[l];
+
+        // 1. Pre-LayerNorm (on s0)
+        { LayerNormParams p={};
+          p.input=cur_in; p.gamma=w.ln1_gamma; p.beta=w.ln1_beta;
+          p.output=sc.ln_out; p.num_tokens=N; p.d_model=d;
+          p.eps=1e-5f; p.use_rmsnorm=false; p.stream=s0;
+          launch_fused_layernorm(p); }
+
+        // 2. CONCURRENT QKV projections
+        //    s1 and s2 wait for LN on s0 to finish
+        cudaEventRecord(ev1, s0);
+        cudaStreamWaitEvent(s1, ev1, 0);
+        cudaStreamWaitEvent(s2, ev1, 0);
+
+        gemm0.gemm_nt(sc.ln_out, w.W_q, sc.Q,      N, d, d);  // Q on s0
+        gemm1.gemm_nt(sc.ln_out, w.W_k, sc.K_proj,  N, d, d);  // K on s1
+        gemm2.gemm_nt(sc.ln_out, w.W_v, sc.V_proj,  N, d, d);  // V on s2
+
+        // Sync: s0 waits for K and V to complete
+        cudaEventRecord(ev1, s1);
+        cudaEventRecord(ev2, s2);
+        cudaStreamWaitEvent(s0, ev1, 0);
+        cudaStreamWaitEvent(s0, ev2, 0);
+
+        // 3. RoPE (on s0, needs Q and K)
+        if (cfg.use_rotary)
+            launch_rope(sc.Q, sc.K_proj, rope, batch_size*nh, seq_len, start_pos, s0);
+
+        // 4. KV cache update (on s0)
+        { half* kc = kv.get(l,0); half* vc = kv.get(l,1);
+          int total = batch_size * seq_len * d;
+          dim3 grid((total+255)/256, 2);
+          bench_kv_update_kernel<<<grid,256,0,s0>>>(
+              kc, vc, sc.K_proj, sc.V_proj, d, seq_len, start_pos, batch_size); }
+
+        // 5. Flash Attention (on s0)
+        { int tlen = start_pos + seq_len;
+          FlashAttentionParams fa={};
+          fa.Q=sc.Q; fa.K=kv.get(l,0); fa.V=kv.get(l,1);
+          fa.O=sc.attn_out; fa.L=sc.attn_lse;
+          fa.batch_size=batch_size; fa.num_heads=nh;
+          fa.seq_len=tlen; fa.d_head=dh;
+          fa.scale=1.0f/sqrtf((float)dh);
+          fa.causal=true; fa.stream=s0;
+          launch_flash_attention(fa); }
+
+        // 6. Attn output projection (on s0)
+        gemm0.gemm_nt(sc.attn_out, w.W_o, sc.ffn_out, N, d, d);
+
+        // 7. Pre-LayerNorm (FFN) + residual (on s0)
+        { LayerNormParams p={};
+          p.input=sc.ffn_out; p.residual=cur_in; p.bias=w.b_o;
+          p.gamma=w.ln2_gamma; p.beta=w.ln2_beta;
+          p.output=sc.ln_out; p.residual_out=sc.residual;
+          p.num_tokens=N; p.d_model=d;
+          p.eps=1e-5f; p.use_rmsnorm=false; p.stream=s0;
+          launch_fused_layernorm(p); }
+
+        // 8. CONCURRENT gate + up projections
+        if (cfg.use_swiglu) {
+            cudaEventRecord(ev1, s0);
+            cudaStreamWaitEvent(s1, ev1, 0);
+
+            gemm0.gemm_nt(sc.ln_out, w.W_gate, sc.ffn_gate, N, d_ffn, d);  // gate on s0
+            gemm1.gemm_nt(sc.ln_out, w.W_up,   sc.ffn_up,   N, d_ffn, d);  // up on s1
+
+            // Sync: s0 waits for up
+            cudaEventRecord(ev1, s1);
+            cudaStreamWaitEvent(s0, ev1, 0);
+
+            launch_fused_swiglu(sc.ffn_gate, sc.ffn_up, sc.ffn_inter, N, d_ffn, s0);
+        } else {
+            gemm0.gemm_nt(sc.ln_out, w.W_up, sc.ffn_up, N, d_ffn, d);
+            launch_fused_gelu(sc.ffn_up, sc.ffn_inter, N, d_ffn, s0);
+        }
+
+        // 9. FFN down (on s0)
+        gemm0.gemm_nt(sc.ffn_inter, w.W_down, sc.ffn_out, N, d, d_ffn);
+
+        // 10. Residual add (on s0)
+        { int n = N * d; int grid = (n/2+255)/256;
+          bench_residual_add<<<grid,256,0,s0>>>(sc.residual, sc.ffn_out, cur_out, n); }
+
+        std::swap(cur_in, cur_out);
+    }
+
+    if (cfg.n_layers % 2 == 1 && cur_in != output) {
+        size_t bytes = (size_t)batch_size * seq_len * d * sizeof(half);
+        cudaMemcpyAsync(output, cur_in, bytes, cudaMemcpyDeviceToDevice, s0);
+    }
+}
+
+void benchmark_multistream(const ModelConfig& cfg, int prefill_len, int decode_steps,
+                            int warmup_iters = 3) {
+    printf("\n=== Multi-Stream Pipeline: 1 Stream vs 3 Streams ===\n");
+    printf("  d=%d, heads=%d, layers=%d, d_ffn=%d\n",
+           cfg.d_model, cfg.n_heads, cfg.n_layers, cfg.d_ffn_gate());
+    printf("  Prefill: %d tokens, Decode: %d steps\n", prefill_len, decode_steps);
+    printf("  Concurrent: QKV on 3 streams, gate+up on 2 streams\n\n");
+
+    const int d = cfg.d_model;
+    const int d_ffn = cfg.d_ffn_gate();
+    const int max_seq = cfg.max_seq_len;
+
+    // Create 3 streams + 2 events
+    cudaStream_t s0, s1, s2;
+    cudaStreamCreate(&s0); cudaStreamCreate(&s1); cudaStreamCreate(&s2);
+    cudaEvent_t ev1, ev2;
+    cudaEventCreate(&ev1); cudaEventCreate(&ev2);
+
+    // 3 GemmManagers (each creates its own cuBLAS handle — workspace isolation)
+    GemmManager gemm0, gemm1, gemm2;
+    gemm0.set_stream(s0); gemm1.set_stream(s1); gemm2.set_stream(s2);
+
+    // Single-stream gemm for baseline
+    GemmManager gemm_single;
+    gemm_single.set_stream(s0);
+
+    // Weights
+    std::vector<BenchLayerWeights> weights(cfg.n_layers);
+    for (int l = 0; l < cfg.n_layers; l++)
+        bench_alloc_weights(weights[l], d, d_ffn, s0);
+
+    // Scratch
+    size_t max_N = prefill_len;
+    BenchScratch sc;
+    cudaMallocAsync(&sc.ln_out,    max_N*d*sizeof(half), s0);
+    cudaMallocAsync(&sc.Q,         max_N*d*sizeof(half), s0);
+    cudaMallocAsync(&sc.K_proj,    max_N*d*sizeof(half), s0);
+    cudaMallocAsync(&sc.V_proj,    max_N*d*sizeof(half), s0);
+    cudaMallocAsync(&sc.attn_out,  max_N*d*sizeof(half), s0);
+    cudaMallocAsync(&sc.ffn_gate,  max_N*d_ffn*sizeof(half), s0);
+    cudaMallocAsync(&sc.ffn_up,    max_N*d_ffn*sizeof(half), s0);
+    cudaMallocAsync(&sc.ffn_inter, max_N*d_ffn*sizeof(half), s0);
+    cudaMallocAsync(&sc.ffn_out,   max_N*d*sizeof(half), s0);
+    cudaMallocAsync(&sc.residual,  max_N*d*sizeof(half), s0);
+    cudaMallocAsync(&sc.attn_lse,  max_N*cfg.n_heads*sizeof(float), s0);
+
+    KVCache<half> kv;
+    kv.allocate(cfg.n_layers, cfg.n_heads, cfg.d_head, max_seq, s0);
+
+    RoPEConfig rope;
+    if (cfg.use_rotary) rope.init(max_seq, cfg.d_head, 10000.0f, s0);
+
+    half *input, *output;
+    cudaMallocAsync(&input,  max_N*d*sizeof(half), s0);
+    cudaMallocAsync(&output, max_N*d*sizeof(half), s0);
+    cudaMemsetAsync(input, 0x3C, max_N*d*sizeof(half), s0);
+    cudaStreamSynchronize(s0);
+
+    // =====================================================================
+    // Single-stream baseline (eager)
+    // =====================================================================
+    {
+        printf("  --- SINGLE STREAM ---\n");
+        for (int w = 0; w < warmup_iters; w++) {
+            bench_forward_pass(input, output, weights, sc, kv, gemm_single, rope,
+                              cfg, 1, 1, prefill_len + w, s0);
+            cudaStreamSynchronize(s0);
+        }
+
+        // Reset KV
+        cudaMemsetAsync(kv.data, 0,
+            (size_t)cfg.n_layers * 2 * max_seq * cfg.n_heads * cfg.d_head * sizeof(half), s0);
+        cudaStreamSynchronize(s0);
+
+        // Prefill
+        CudaTimer t;
+        t.begin(s0);
+        bench_forward_pass(input, output, weights, sc, kv, gemm_single, rope,
+                          cfg, 1, prefill_len, 0, s0);
+        float prefill_ms = t.end(s0);
+
+        // Decode
+        t.begin(s0);
+        for (int s = 0; s < decode_steps; s++) {
+            bench_forward_pass(input, output, weights, sc, kv, gemm_single, rope,
+                              cfg, 1, 1, prefill_len + s, s0);
+            cudaStreamSynchronize(s0);
+        }
+        float decode_ms = t.end(s0);
+
+        printf("    Prefill (%d tok):    %.3f ms\n", prefill_len, prefill_ms);
+        printf("    Decode  (per step):  %.3f ms  (%.0f tok/s)\n",
+               decode_ms / decode_steps, 1000.0 * decode_steps / decode_ms);
+    }
+
+    // Reset KV
+    cudaMemsetAsync(kv.data, 0,
+        (size_t)cfg.n_layers * 2 * max_seq * cfg.n_heads * cfg.d_head * sizeof(half), s0);
+    cudaStreamSynchronize(s0);
+
+    // =====================================================================
+    // Multi-stream (3 streams for QKV, 2 for gate/up)
+    // =====================================================================
+    {
+        printf("  --- MULTI-STREAM (3 streams) ---\n");
+        for (int w = 0; w < warmup_iters; w++) {
+            bench_forward_multistream(input, output, weights, sc, kv,
+                gemm0, gemm1, gemm2, rope, cfg, 1, 1, prefill_len + w,
+                s0, s1, s2, ev1, ev2);
+            cudaStreamSynchronize(s0);
+        }
+
+        // Reset KV
+        cudaMemsetAsync(kv.data, 0,
+            (size_t)cfg.n_layers * 2 * max_seq * cfg.n_heads * cfg.d_head * sizeof(half), s0);
+        cudaStreamSynchronize(s0);
+
+        // Prefill
+        CudaTimer t;
+        t.begin(s0);
+        bench_forward_multistream(input, output, weights, sc, kv,
+            gemm0, gemm1, gemm2, rope, cfg, 1, prefill_len, 0,
+            s0, s1, s2, ev1, ev2);
+        float prefill_ms = t.end(s0);
+
+        // Decode
+        t.begin(s0);
+        for (int s = 0; s < decode_steps; s++) {
+            bench_forward_multistream(input, output, weights, sc, kv,
+                gemm0, gemm1, gemm2, rope, cfg, 1, 1, prefill_len + s,
+                s0, s1, s2, ev1, ev2);
+            cudaStreamSynchronize(s0);
+        }
+        float decode_ms = t.end(s0);
+
+        printf("    Prefill (%d tok):    %.3f ms\n", prefill_len, prefill_ms);
+        printf("    Decode  (per step):  %.3f ms  (%.0f tok/s)\n\n",
+               decode_ms / decode_steps, 1000.0 * decode_steps / decode_ms);
+    }
+
+    // Cleanup
+    auto sf = [s0](half*& p) { if(p){cudaFreeAsync(p,s0);p=nullptr;} };
+    sf(sc.ln_out); sf(sc.Q); sf(sc.K_proj); sf(sc.V_proj); sf(sc.attn_out);
+    sf(sc.ffn_gate); sf(sc.ffn_up); sf(sc.ffn_inter); sf(sc.ffn_out); sf(sc.residual);
+    if(sc.attn_lse){cudaFreeAsync(sc.attn_lse,s0);sc.attn_lse=nullptr;}
+    sf(input); sf(output);
+    kv.free(s0);
+    if (cfg.use_rotary) rope.free(s0);
+    for (int l = 0; l < cfg.n_layers; l++) bench_free_weights(weights[l], s0);
+    cudaStreamSynchronize(s0);
+    cudaEventDestroy(ev1); cudaEventDestroy(ev2);
+    cudaStreamDestroy(s0); cudaStreamDestroy(s1); cudaStreamDestroy(s2);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 int main(int argc, char** argv) {
@@ -1200,6 +1491,39 @@ int main(int argc, char** argv) {
         fwd_cfg.use_rotary  = true;
         fwd_cfg.use_swiglu  = true;
         benchmark_forward_pass(fwd_cfg, /*prefill=*/256, /*decode_steps=*/200);
+    }
+
+    // ── Multi-Stream Pipeline ────────────────────────────────────────────
+    printf("\n╔══════════════════════════════════════════╗\n");
+    printf("║   MULTI-STREAM: 1 vs 3 CONCURRENT GEMM  ║\n");
+    printf("╚══════════════════════════════════════════╝\n");
+
+    // 12-layer — decode is where concurrent GEMMs should help
+    {
+        ModelConfig ms_cfg;
+        ms_cfg.d_model     = 768;
+        ms_cfg.n_heads     = 12;
+        ms_cfg.d_head      = 64;
+        ms_cfg.d_ffn       = 3072;
+        ms_cfg.n_layers    = 12;
+        ms_cfg.max_seq_len = 2048;
+        ms_cfg.use_rotary  = true;
+        ms_cfg.use_swiglu  = true;
+        benchmark_multistream(ms_cfg, /*prefill=*/512, /*decode_steps=*/100);
+    }
+
+    // 6-layer — smaller GEMMs, more room for overlap
+    {
+        ModelConfig ms_cfg;
+        ms_cfg.d_model     = 512;
+        ms_cfg.n_heads     = 8;
+        ms_cfg.d_head      = 64;
+        ms_cfg.d_ffn       = 2048;
+        ms_cfg.n_layers    = 6;
+        ms_cfg.max_seq_len = 2048;
+        ms_cfg.use_rotary  = true;
+        ms_cfg.use_swiglu  = true;
+        benchmark_multistream(ms_cfg, /*prefill=*/256, /*decode_steps=*/200);
     }
 
     printf("\n============================================\n");
