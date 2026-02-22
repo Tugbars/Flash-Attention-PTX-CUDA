@@ -49,13 +49,14 @@ namespace transformer {
 // Launch Parameters
 // ============================================================================
 struct FlashAttentionParams {
-    const half* Q;           // [B*H, S, D] query matrix (FP16)
-    const half* K;           // [B*H, S, D] key matrix (FP16)
-    const half* V;           // [B*H, S, D] value matrix (FP16)
-    half*       O;           // [B*H, S, D] output matrix (FP16)
-    float*      L;           // [B*H, S]    log-sum-exp (FP32, optional — can be nullptr)
+    const half* Q;           // [B*H_q, S, D] query matrix (FP16)
+    const half* K;           // [B*H_kv, S, D] key matrix (FP16)
+    const half* V;           // [B*H_kv, S, D] value matrix (FP16)
+    half*       O;           // [B*H_q, S, D] output matrix (FP16)
+    float*      L;           // [B*H_q, S]    log-sum-exp (FP32, optional — can be nullptr)
     int         batch_size;
-    int         num_heads;
+    int         num_heads;   // Q heads (H_q)
+    int         num_kv_heads;// KV heads (H_kv). If 0 or == num_heads, MHA mode.
     int         seq_len;
     int         d_head;      // Must be 64
     float       scale;       // Typically 1.0f / sqrtf(d_head)

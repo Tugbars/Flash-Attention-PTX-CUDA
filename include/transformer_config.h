@@ -12,7 +12,8 @@ namespace transformer {
 // -- Model hyperparameters (compile-time for kernel specialization) ----------
 struct ModelConfig {
     int32_t d_model       = 768;       // Hidden dimension
-    int32_t n_heads       = 12;        // Number of attention heads
+    int32_t n_heads       = 12;        // Number of Q attention heads
+    int32_t n_kv_heads    = 12;        // Number of KV heads (< n_heads for GQA)
     int32_t d_head        = 64;        // d_model / n_heads
     int32_t d_ffn         = 3072;      // FFN intermediate (4 * d_model typical)
     int32_t n_layers      = 12;        // Number of transformer blocks

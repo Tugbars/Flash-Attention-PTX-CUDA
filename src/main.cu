@@ -634,6 +634,7 @@ bool verify_flash_attention(int batch_size, int n_heads, int seq_len, int d_head
     FlashAttentionParams params = {};
     params.Q = dQ; params.K = dK; params.V = dV; params.O = dO; params.L = dL;
     params.batch_size = batch_size; params.num_heads = n_heads;
+    params.num_kv_heads = 0;  // 0 = MHA (n_kv_heads == n_heads)
     params.seq_len = seq_len; params.d_head = d_head;
     params.scale = scale; params.causal = true; params.stream = 0;
 
@@ -646,6 +647,104 @@ bool verify_flash_attention(int batch_size, int n_heads, int seq_len, int d_head
     auto r = compare_arrays(h_O_ref.data(), h_O_gpu.data(), total_elements,
                             0.05f, 0.1f, 0.03f);
     print_result("Flash Attention", r);
+
+    cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO); cudaFree(dL);
+    return r.pass;
+}
+
+// ============================================================================
+// Flash Attention GQA Accuracy Test
+//   CPU ref: Q has n_q_heads, K/V have n_kv_heads. Each group of
+//   (n_q_heads / n_kv_heads) Q heads shares the same KV head.
+//   Verifies the kernel correctly maps Q head → KV head.
+// ============================================================================
+bool verify_flash_attention_gqa(int batch_size, int n_q_heads, int n_kv_heads,
+                                 int seq_len, int d_head) {
+    const int gqa_ratio = n_q_heads / n_kv_heads;
+    printf("=== Flash Attention GQA [B=%d, Hq=%d, Hkv=%d, ratio=%d:1, S=%d, D=%d] ===\n",
+           batch_size, n_q_heads, n_kv_heads, gqa_ratio, seq_len, d_head);
+
+    const int q_elements  = batch_size * n_q_heads * seq_len * d_head;
+    const int kv_elements = batch_size * n_kv_heads * seq_len * d_head;
+    const float scale = 1.0f / sqrtf(static_cast<float>(d_head));
+
+    std::vector<float> h_Q(q_elements), h_K(kv_elements), h_V(kv_elements);
+    std::vector<float> h_O_ref(q_elements, 0.0f), h_O_gpu(q_elements);
+
+    srand(12345);
+    for (int i = 0; i < q_elements; i++)
+        h_Q[i] = (rand() / (float)RAND_MAX - 0.5f) * 0.5f;
+    for (int i = 0; i < kv_elements; i++) {
+        h_K[i] = (rand() / (float)RAND_MAX - 0.5f) * 0.5f;
+        h_V[i] = (rand() / (float)RAND_MAX - 0.5f) * 0.5f;
+    }
+
+    // CPU reference with GQA head mapping
+    for (int b = 0; b < batch_size; b++) {
+        for (int qh = 0; qh < n_q_heads; qh++) {
+            const int kvh = qh / gqa_ratio;  // shared KV head
+
+            const int q_bh  = b * n_q_heads + qh;
+            const int kv_bh = b * n_kv_heads + kvh;
+
+            const float* Q_ptr = h_Q.data() + q_bh * seq_len * d_head;
+            const float* K_ptr = h_K.data() + kv_bh * seq_len * d_head;
+            const float* V_ptr = h_V.data() + kv_bh * seq_len * d_head;
+            float*       O_ptr = h_O_ref.data() + q_bh * seq_len * d_head;
+
+            std::vector<float> S(seq_len * seq_len);
+            for (int i = 0; i < seq_len; i++)
+                for (int j = 0; j < seq_len; j++) {
+                    float dot = 0.0f;
+                    for (int k = 0; k < d_head; k++)
+                        dot += Q_ptr[i * d_head + k] * K_ptr[j * d_head + k];
+                    S[i * seq_len + j] = (j > i) ? -1e9f : dot * scale;
+                }
+
+            std::vector<float> P(seq_len * seq_len);
+            for (int i = 0; i < seq_len; i++) {
+                float mx = *std::max_element(&S[i * seq_len], &S[(i+1) * seq_len]);
+                float sum = 0.0f;
+                for (int j = 0; j < seq_len; j++) {
+                    P[i * seq_len + j] = expf(S[i * seq_len + j] - mx);
+                    sum += P[i * seq_len + j];
+                }
+                for (int j = 0; j < seq_len; j++) P[i * seq_len + j] /= sum;
+            }
+
+            for (int i = 0; i < seq_len; i++)
+                for (int k = 0; k < d_head; k++) {
+                    float val = 0.0f;
+                    for (int j = 0; j < seq_len; j++)
+                        val += P[i * seq_len + j] * V_ptr[j * d_head + k];
+                    O_ptr[i * d_head + k] = val;
+                }
+        }
+    }
+
+    // GPU — Q is [B*Hq, S, D], K/V are [B*Hkv, S, D]
+    half* dQ = upload_fp16(h_Q, q_elements);
+    half* dK = upload_fp16(h_K, kv_elements);
+    half* dV = upload_fp16(h_V, kv_elements);
+    half* dO; cudaMalloc(&dO, q_elements * sizeof(half));
+    float* dL; cudaMalloc(&dL, batch_size * n_q_heads * seq_len * sizeof(float));
+
+    FlashAttentionParams params = {};
+    params.Q = dQ; params.K = dK; params.V = dV; params.O = dO; params.L = dL;
+    params.batch_size = batch_size;
+    params.num_heads = n_q_heads;
+    params.num_kv_heads = n_kv_heads;
+    params.seq_len = seq_len; params.d_head = d_head;
+    params.scale = scale; params.causal = true; params.stream = 0;
+
+    launch_flash_attention(params);
+    cudaDeviceSynchronize();
+
+    download_fp16(dO, h_O_gpu, q_elements);
+
+    auto r = compare_arrays(h_O_ref.data(), h_O_gpu.data(), q_elements,
+                            0.05f, 0.1f, 0.03f);
+    print_result("Flash Attention GQA", r);
 
     cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO); cudaFree(dL);
     return r.pass;
@@ -667,7 +766,8 @@ void benchmark_flash_attention(int batch_size, int n_heads, int seq_len, int d_h
 
     FlashAttentionParams p = {};
     p.Q=Q; p.K=K; p.V=V; p.O=O; p.L=L;
-    p.batch_size=batch_size; p.num_heads=n_heads; p.seq_len=seq_len; p.d_head=d_head;
+    p.batch_size=batch_size; p.num_heads=n_heads; p.num_kv_heads=0;
+    p.seq_len=seq_len; p.d_head=d_head;
     p.scale=1.0f/sqrtf((float)d_head); p.causal=true; p.stream=nullptr;
     for(int i=0;i<warmup;i++) launch_flash_attention(p);
     cudaDeviceSynchronize();
@@ -840,7 +940,7 @@ static void bench_forward_pass(
           FlashAttentionParams fa={};
           fa.Q=sc.Q; fa.K=kv.get(l,0); fa.V=kv.get(l,1);
           fa.O=sc.attn_out; fa.L=sc.attn_lse;
-          fa.batch_size=batch_size; fa.num_heads=nh;
+          fa.batch_size=batch_size; fa.num_heads=nh; fa.num_kv_heads=0;
           fa.seq_len=tlen; fa.d_head=dh;
           fa.scale=1.0f/sqrtf((float)dh);
           fa.causal=true; fa.stream=stream;
@@ -1162,7 +1262,7 @@ static void bench_forward_multistream(
           FlashAttentionParams fa={};
           fa.Q=sc.Q; fa.K=kv.get(l,0); fa.V=kv.get(l,1);
           fa.O=sc.attn_out; fa.L=sc.attn_lse;
-          fa.batch_size=batch_size; fa.num_heads=nh;
+          fa.batch_size=batch_size; fa.num_heads=nh; fa.num_kv_heads=0;
           fa.seq_len=tlen; fa.d_head=dh;
           fa.scale=1.0f/sqrtf((float)dh);
           fa.causal=true; fa.stream=s0;
@@ -1400,10 +1500,16 @@ int main(int argc, char** argv) {
     // PTX MMA
     check(test_ptx_mma());
 
-    // Flash Attention — multiple configs
+    // Flash Attention — MHA (regression: must still pass with GQA kernel)
     check(verify_flash_attention(1, 1, 64, 64));
     check(verify_flash_attention(1, 1, 128, 64));
     check(verify_flash_attention(1, 2, 256, 64));
+
+    // Flash Attention — GQA (new: shared KV heads)
+    check(verify_flash_attention_gqa(1, 4, 2, 64, 64));    // 4Q:2KV = 2:1
+    check(verify_flash_attention_gqa(1, 8, 2, 128, 64));   // 8Q:2KV = 4:1
+    check(verify_flash_attention_gqa(1, 32, 8, 64, 64));   // 32Q:8KV = 4:1 (Llama config)
+    check(verify_flash_attention_gqa(2, 32, 8, 64, 64));   // Batched GQA
 
     // GEMM NT — small, medium, transformer-sized
     check(verify_gemm_nt(16, 16, 16));

@@ -95,9 +95,11 @@ __global__ void flash_attention_ptx_kernel(
     half*       __restrict__ O,
     float*      __restrict__ LSE,
     const int   seq_len,
+    const int   n_kv_heads,
+    const int   n_q_heads,
     const float scale)
 {
-    const int bh_idx  = blockIdx.y;       // batch * head index
+    const int bh_idx  = blockIdx.y;       // batch * Q-head index
     const int q_start = blockIdx.x * BLOCK_M;  // first query row for this block
     const int tid     = threadIdx.x + threadIdx.y * WARP_SIZE_FA;
     const int warp_id = threadIdx.y;
@@ -129,11 +131,23 @@ __global__ void flash_attention_ptx_kernel(
     float* smem_partial_max = reinterpret_cast<float*>(smem_p + BLOCK_M * P_STRIDE);
     float* smem_partial_sum = smem_partial_max + 2 * BLOCK_M;
 
-    const size_t head_offset = static_cast<size_t>(bh_idx) * seq_len * D_HEAD;
-    const half* Q_head = Q + head_offset;
-    const half* K_head = K + head_offset;
-    const half* V_head = V + head_offset;
-    half*       O_head = O + head_offset;
+    // GQA: Q uses bh_idx directly, K/V map to shared KV head
+    //   batch_idx = bh_idx / n_q_heads
+    //   q_head    = bh_idx % n_q_heads
+    //   kv_head   = q_head * n_kv_heads / n_q_heads   (integer division)
+    //   kv_bh_idx = batch_idx * n_kv_heads + kv_head
+    // When n_kv_heads == n_q_heads (MHA), kv_bh_idx == bh_idx.
+    const int batch_idx = bh_idx / n_q_heads;
+    const int q_head    = bh_idx % n_q_heads;
+    const int kv_head   = q_head * n_kv_heads / n_q_heads;
+    const int kv_bh_idx = batch_idx * n_kv_heads + kv_head;
+
+    const size_t q_head_offset  = static_cast<size_t>(bh_idx)    * seq_len * D_HEAD;
+    const size_t kv_head_offset = static_cast<size_t>(kv_bh_idx) * seq_len * D_HEAD;
+    const half* Q_head = Q + q_head_offset;
+    const half* K_head = K + kv_head_offset;
+    const half* V_head = V + kv_head_offset;
+    half*       O_head = O + q_head_offset;
 
     // -- Load Q tile (stays in smem for all KV iterations) -------------------
     // 128-bit vectorized loads: each uint4 moves 8 half values.
@@ -490,6 +504,11 @@ void launch_flash_attention(const FlashAttentionParams& params) {
     dim3 grid(grid_x, grid_y);
     dim3 block(WARP_SIZE_FA, NUM_WARPS);  // 32 × 8 = 256 threads
 
+    // GQA: resolve n_kv_heads (0 or equal to num_heads means MHA)
+    const int n_kv_heads = (params.num_kv_heads > 0 && params.num_kv_heads < params.num_heads)
+                           ? params.num_kv_heads : params.num_heads;
+    const int n_q_heads  = params.num_heads;
+
     // Compute dynamic shared memory requirement
     size_t smem_bytes = 0;
     smem_bytes += BLOCK_M * Q_STRIDE * sizeof(half);   // smem_q
@@ -517,12 +536,12 @@ void launch_flash_attention(const FlashAttentionParams& params) {
         flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, D_HEAD, NUM_WARPS, true>
             <<<grid, block, smem_bytes, params.stream>>>(
                 params.Q, params.K, params.V, params.O, params.L,
-                params.seq_len, params.scale);
+                params.seq_len, n_kv_heads, n_q_heads, params.scale);
     } else {
         flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, D_HEAD, NUM_WARPS, false>
             <<<grid, block, smem_bytes, params.stream>>>(
                 params.Q, params.K, params.V, params.O, params.L,
-                params.seq_len, params.scale);
+                params.seq_len, n_kv_heads, n_q_heads, params.scale);
     }
     CUDA_CHECK(cudaGetLastError());
 }
