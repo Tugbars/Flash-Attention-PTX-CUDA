@@ -38,16 +38,33 @@ else()
     set(CUTLASS_INCLUDE_DIR "")
 endif()
 
+# FP8 support — requires sm_89+ (Ada/Blackwell) and CUTLASS
+option(ENABLE_FP8 "Enable FP8 E4M3 quantized GEMM kernels" ON)
+if(ENABLE_FP8)
+    if(NOT USE_CUTLASS)
+        message(WARNING "FP8 requires CUTLASS — disabling FP8")
+        set(ENABLE_FP8 OFF)
+    else()
+        message(STATUS "FP8 E4M3 quantization enabled")
+        add_compile_definitions(ENABLE_FP8)
+    endif()
+endif()
+
 # ============================================================================
 # Library Target
 # ============================================================================
-add_library(cuda_transformer STATIC
+set(TRANSFORMER_SOURCES
     src/transformer.cu
     kernels/flash_attention.cu
     kernels/fused_layernorm.cu
     kernels/rotary_embedding.cu
     kernels/activation_kernels.cu
 )
+if(ENABLE_FP8)
+    list(APPEND TRANSFORMER_SOURCES kernels/fp8_quantize.cu)
+endif()
+
+add_library(cuda_transformer STATIC ${TRANSFORMER_SOURCES})
 
 target_include_directories(cuda_transformer PUBLIC
     ${CMAKE_SOURCE_DIR}/include
@@ -86,6 +103,21 @@ target_include_directories(bench_critical_path PRIVATE
     ${CUTLASS_INCLUDE_DIR}
 )
 
+if(ENABLE_FP8)
+    add_executable(bench_fp8 src/bench_fp8.cu)
+    target_link_libraries(bench_fp8 PRIVATE cuda_transformer)
+    target_include_directories(bench_fp8 PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CUTLASS_INCLUDE_DIR}
+    )
+    target_compile_options(bench_fp8 PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:
+            --expt-relaxed-constexpr
+            --expt-extended-lambda
+        >
+    )
+endif()
+
 # ============================================================================
 # Install
 # ============================================================================
@@ -97,4 +129,5 @@ install(DIRECTORY include/ DESTINATION include)
 # ============================================================================
 message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 message(STATUS "CUTLASS enabled: ${USE_CUTLASS}")
+message(STATUS "FP8 E4M3 enabled: ${ENABLE_FP8}")
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")

@@ -12,7 +12,6 @@
 #include "transformer_config.h"
 #include "tensor.h"
 #include "activation_kernels.h"
-#include "activation_kernels.h"
 
 // CUTLASS headers (3.x)
 #ifdef USE_CUTLASS
@@ -25,6 +24,12 @@
 #include <cutlass/layout/matrix.h>
 #include <cutlass/numeric_types.h>
 #include <cute/tensor.hpp>
+#endif
+
+// FP8 support
+#ifdef ENABLE_FP8
+#include <cuda_fp8.h>
+#include "fp8_quantize.h"
 #endif
 
 namespace transformer {
@@ -117,6 +122,36 @@ using GemmFP16_SiLU = cutlass::gemm::device::GemmUniversal<
     4
 >;
 
+#ifdef ENABLE_FP8
+// -- FP8 E4M3 Tensor Core GEMM (Ada sm_89 / Blackwell sm_120) ----------------
+// A,B: FP8 E4M3, C/D: FP16, Accumulator: FP32
+// Dequantization via alpha = scale_a * scale_b in epilogue
+using GemmFP8_NT = cutlass::gemm::device::GemmUniversal<
+    cutlass::float_e4m3_t,                              // ElementA
+    cutlass::layout::RowMajor,                          // LayoutA
+    cutlass::float_e4m3_t,                              // ElementB
+    cutlass::layout::ColumnMajor,                       // LayoutB (transposed weights)
+    cutlass::half_t,                                    // ElementC (output FP16)
+    cutlass::layout::RowMajor,                          // LayoutC
+    float,                                              // Accumulator FP32
+    cutlass::arch::OpClassTensorOp,                     // Tensor Cores
+    cutlass::arch::Sm89,                                // Ada+ (works on sm_120)
+    cutlass::gemm::GemmShape<
+        tuning::FP8_GEMM_TILE_M,
+        tuning::FP8_GEMM_TILE_N,
+        tuning::FP8_GEMM_TILE_K>,                       // ThreadBlock (128,64,128)
+    cutlass::gemm::GemmShape<
+        tuning::FP8_GEMM_WARP_M,
+        tuning::FP8_GEMM_WARP_N,
+        tuning::FP8_GEMM_WARP_K>,                       // Warp (64,32,128)
+    cutlass::gemm::GemmShape<16, 8, 32>,                // MMA shape for FP8
+    cutlass::epilogue::thread::LinearCombination<
+        cutlass::half_t, 8, float, float>,              // alpha*acc → FP16
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>,
+    tuning::FP8_GEMM_STAGES
+>;
+#endif // ENABLE_FP8
+
 #endif // USE_CUTLASS
 
 // ============================================================================
@@ -189,6 +224,65 @@ public:
         silu_fallback(C, static_cast<size_t>(M) * N);
 #endif
     }
+
+#ifdef ENABLE_FP8
+    // -----------------------------------------------------------------------
+    // FP8 GEMM: D_fp16 = (scale_a * scale_b) * (A_fp8 * B_fp8^T)
+    //
+    // A: [M, K] FP8, B: [N, K] FP8 (stored transposed)
+    // scale_a, scale_b: per-tensor scale factors (absmax / 448)
+    // D: [M, N] FP16 output
+    // -----------------------------------------------------------------------
+    void gemm_nt_fp8(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* B,
+                     half* D,
+                     int M, int N, int K,
+                     float scale_a, float scale_b)
+    {
+#ifdef USE_CUTLASS
+        launch_cutlass_gemm_nt_fp8(A, B, D, M, N, K, scale_a, scale_b);
+#else
+        // No cuBLAS FP8 fallback — require CUTLASS
+        assert(false && "FP8 GEMM requires CUTLASS");
+#endif
+    }
+
+    // -----------------------------------------------------------------------
+    // FP8 GEMM convenience: quantize FP16 activations on the fly, then GEMM
+    //
+    // Takes FP16 A and pre-quantized FP8 weights B.
+    // Quantizes A dynamically, runs FP8 GEMM, outputs FP16.
+    //
+    // NOTE: This path contains a cudaStreamSynchronize to read the activation
+    // scale back to host (CUTLASS requires host-side alpha at launch time).
+    // This causes a ~5μs pipeline bubble per GEMM.
+    //
+    // Production alternatives to eliminate the sync:
+    //   1. Static calibration: pre-compute activation scales offline
+    //   2. CUTLASS EVT (Epilogue Visitor Tree): device-side alpha pointer
+    //   3. Post-GEMM scale: GEMM with alpha=1, then fused scale+dequant kernel
+    //   4. Scale from previous layer: reuse previous layer's activation stats
+    // -----------------------------------------------------------------------
+    void gemm_nt_fp8_dynamic(const half* A_fp16,
+                              const __nv_fp8_e4m3* B_fp8,
+                              half* D,
+                              int M, int N, int K,
+                              float scale_b,
+                              __nv_fp8_e4m3* a_fp8_buf,
+                              float* a_scale_buf)  // 2 device floats
+    {
+        // Step 1: Quantize A to FP8 (3 kernels: absmax → scale → quantize)
+        launch_quantize_fp16_to_fp8(A_fp16, a_fp8_buf, a_scale_buf, M * K, stream_);
+
+        // Step 2: Read scale_a from device — requires sync
+        // TODO(perf): replace with EVT epilogue or post-GEMM scale kernel
+        cudaStreamSynchronize(stream_);
+        float scale_a;
+        cudaMemcpy(&scale_a, a_scale_buf, sizeof(float), cudaMemcpyDeviceToHost);
+
+        // Step 3: FP8 GEMM with dequant in epilogue
+        gemm_nt_fp8(a_fp8_buf, B_fp8, D, M, N, K, scale_a, scale_b);
+    }
+#endif // ENABLE_FP8
 
 private:
     cublasHandle_t cublas_handle_ = nullptr;
@@ -310,7 +404,41 @@ private:
         cutlass::Status status = gemm_op(args, nullptr, stream_);
         assert(status == cutlass::Status::kSuccess);
     }
-#endif
+
+#ifdef ENABLE_FP8
+    // -- FP8 CUTLASS GEMM launcher -------------------------------------------
+    // D_fp16 = (scale_a * scale_b) * (A_fp8 * B_fp8^T)
+    // Alpha encodes the dequantization: alpha = scale_a * scale_b
+    // This converts INT32-range accumulator back to proper FP16 magnitude.
+    void launch_cutlass_gemm_nt_fp8(const __nv_fp8_e4m3* A,
+                                     const __nv_fp8_e4m3* B,
+                                     half* D,
+                                     int M, int N, int K,
+                                     float scale_a, float scale_b)
+    {
+        using Gemm = GemmFP8_NT;
+        float alpha = scale_a * scale_b;
+        float beta  = 0.0f;
+
+        typename Gemm::Arguments args(
+            cutlass::gemm::GemmUniversalMode::kGemm,
+            {M, N, K},
+            1,                          // batch count
+            {alpha, beta},              // Epilogue: D = alpha * acc + beta * C
+            reinterpret_cast<const cutlass::float_e4m3_t*>(A),
+            reinterpret_cast<const cutlass::float_e4m3_t*>(B),
+            reinterpret_cast<cutlass::half_t*>(D),       // C (source, unused with beta=0)
+            reinterpret_cast<cutlass::half_t*>(D),       // D (destination)
+            M * K, N * K, M * N, M * N, // Batch strides
+            K, K, N, N                   // Leading dims
+        );
+
+        Gemm gemm_op;
+        cutlass::Status status = gemm_op(args, nullptr, stream_);
+        assert(status == cutlass::Status::kSuccess);
+    }
+#endif // ENABLE_FP8
+#endif // USE_CUTLASS
 
     // SiLU fallback — delegates to launch_silu_inplace from activation_kernels
     void silu_fallback(half* data, size_t n) {

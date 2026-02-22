@@ -38,6 +38,13 @@ enum class Precision : uint8_t {
     INT8,    // W8A8 quantized
 };
 
+// -- Compute mode (runtime switchable, compile-time gated) ------------------
+enum class ComputeMode : uint8_t {
+    FP16,    // Default: FP16 weights, FP16 activations, FP16 GEMM
+    FP8,     // FP8 E4M3 weights + activations, FP32 accumulation, FP16 output
+    // INT8, // Future: W8A8
+};
+
 // -- Kernel tuning constants ------------------------------------------------
 // Tuned for Blackwell (sm_120) / RTX 5080. Also works on Ampere/Ada/Hopper.
 namespace tuning {
@@ -57,6 +64,15 @@ constexpr int GEMM_WARP_M   = 64;
 constexpr int GEMM_WARP_N   = 64;
 constexpr int GEMM_WARP_K   = 32;
 constexpr int GEMM_STAGES   = 4;      // Async pipeline depth
+
+// FP8 GEMM tile sizes (CUTLASS, K is larger due to smaller element size)
+constexpr int FP8_GEMM_TILE_M   = 128;
+constexpr int FP8_GEMM_TILE_N   = 64;
+constexpr int FP8_GEMM_TILE_K   = 128;
+constexpr int FP8_GEMM_WARP_M   = 64;
+constexpr int FP8_GEMM_WARP_N   = 32;
+constexpr int FP8_GEMM_WARP_K   = 128;
+constexpr int FP8_GEMM_STAGES   = 4;
 
 // LayerNorm
 constexpr int LN_BLOCK_SIZE = 256;    // Threads per block
