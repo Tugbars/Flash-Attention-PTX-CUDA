@@ -1694,6 +1694,125 @@ int main(int argc, char** argv) {
     check(verify_flash_attention_gqa_cache(1, 12, 2, 64, 128, 8192));   // longer seq in cache
     check(verify_flash_attention_gqa_cache(1, 4, 2, 5, 64, 1024));      // D=64 with cache stride
 
+    // Large-magnitude data test (reproduces model's ~8500 QK^T scores / one-hot softmax)
+    {
+        printf("\n=== Flash Attention Large-Magnitude Data Test ===\n");
+        const int S = 5, D = 128, Hq = 12, Hkv = 2, max_seq = 8192;
+        const int gqa_ratio = Hq / Hkv;
+        const float scale = 1.0f / sqrtf((float)D);
+        const int q_elems = Hq * S * D;
+        const int kv_elems = Hkv * S * D;
+        const int kv_cache = Hkv * max_seq * D;
+
+        std::vector<float> hQ(q_elems), hK(kv_elems), hV(kv_elems);
+        std::vector<float> hO_ref(q_elems, 0.0f), hO_gpu(q_elems);
+
+        // Generate correlated Q/K to produce large dot products (like the real model)
+        srand(42);
+        // Base pattern that all Q heads and K heads share (creates high correlation)
+        std::vector<float> base(D);
+        for (int i = 0; i < D; i++) base[i] = (rand() / (float)RAND_MAX - 0.5f) * 4.0f;
+
+        for (int h = 0; h < Hkv; h++) {
+            for (int s = 0; s < S; s++) {
+                for (int d = 0; d < D; d++) {
+                    float noise = (rand() / (float)RAND_MAX - 0.5f) * 0.5f;
+                    hK[h*S*D + s*D + d] = base[d] + noise;
+                    hV[h*S*D + s*D + d] = (rand() / (float)RAND_MAX - 0.5f) * 0.1f;
+                }
+            }
+        }
+        for (int h = 0; h < Hq; h++) {
+            int kvh = h / gqa_ratio;
+            for (int s = 0; s < S; s++) {
+                for (int d = 0; d < D; d++) {
+                    float noise = (rand() / (float)RAND_MAX - 0.5f) * 0.2f;
+                    hQ[h*S*D + s*D + d] = hK[kvh*S*D + s*D + d] + noise;
+                }
+            }
+        }
+
+        // Print QK^T scores for head 0 last query to verify magnitude
+        {
+            float* Q0 = hQ.data() + (S-1)*D;  // head 0, last pos
+            printf("  QK^T scores (head 0, last Q):");
+            for (int j = 0; j < S; j++) {
+                float dot = 0;
+                for (int d = 0; d < D; d++) dot += Q0[d] * hK[j*D + d];
+                printf(" %.1f", dot * scale);
+            }
+            printf("\n");
+        }
+
+        // CPU reference
+        for (int qh = 0; qh < Hq; qh++) {
+            int kvh = qh / gqa_ratio;
+            float* Q_ptr = hQ.data() + qh*S*D;
+            float* K_ptr = hK.data() + kvh*S*D;
+            float* V_ptr = hV.data() + kvh*S*D;
+            float* O_ptr = hO_ref.data() + qh*S*D;
+
+            for (int i = 0; i < S; i++) {
+                std::vector<float> scores(S);
+                float mx = -1e30f;
+                for (int j = 0; j < S; j++) {
+                    if (j > i) { scores[j] = -1e9f; continue; }
+                    float dot = 0;
+                    for (int d = 0; d < D; d++) dot += Q_ptr[i*D+d] * K_ptr[j*D+d];
+                    scores[j] = dot * scale;
+                    mx = fmaxf(mx, scores[j]);
+                }
+                float sum = 0;
+                for (int j = 0; j < S; j++) { scores[j] = expf(scores[j]-mx); sum += scores[j]; }
+                for (int j = 0; j < S; j++) scores[j] /= sum;
+                for (int d = 0; d < D; d++) {
+                    float val = 0;
+                    for (int j = 0; j < S; j++) val += scores[j] * V_ptr[j*D+d];
+                    O_ptr[i*D+d] = val;
+                }
+            }
+        }
+
+        // GPU with cache layout
+        half* dQ = upload_fp16(hQ, q_elems);
+        half* dO; cudaMalloc(&dO, q_elems * sizeof(half));
+        float* dL; cudaMalloc(&dL, Hq * S * sizeof(float));
+        half* dK_c; cudaMalloc(&dK_c, kv_cache * sizeof(half));
+        half* dV_c; cudaMalloc(&dV_c, kv_cache * sizeof(half));
+        cudaMemset(dK_c, 0, kv_cache * sizeof(half));
+        cudaMemset(dV_c, 0, kv_cache * sizeof(half));
+
+        std::vector<half> hK16(kv_elems), hV16(kv_elems);
+        for (int i = 0; i < kv_elems; i++) { hK16[i] = __float2half(hK[i]); hV16[i] = __float2half(hV[i]); }
+        for (int h = 0; h < Hkv; h++) {
+            cudaMemcpy(dK_c + (size_t)h*max_seq*D, hK16.data()+h*S*D, S*D*sizeof(half), cudaMemcpyHostToDevice);
+            cudaMemcpy(dV_c + (size_t)h*max_seq*D, hV16.data()+h*S*D, S*D*sizeof(half), cudaMemcpyHostToDevice);
+        }
+
+        FlashAttentionParams fa = {};
+        fa.Q = dQ; fa.K = dK_c; fa.V = dV_c; fa.O = dO; fa.L = dL;
+        fa.batch_size = 1; fa.num_heads = Hq; fa.num_kv_heads = Hkv;
+        fa.q_len = S; fa.kv_len = S; fa.kv_seq_stride = max_seq;
+        fa.d_head = D; fa.scale = scale; fa.causal = true; fa.stream = 0;
+        launch_flash_attention(fa);
+        cudaDeviceSynchronize();
+        download_fp16(dO, hO_gpu, q_elems);
+
+        // Print head 0 last token comparison
+        int off = (S-1)*D;
+        printf("  CPU ref  (h0, last, 0-7): ");
+        for (int i = 0; i < 8; i++) printf("%.4f ", hO_ref[off+i]);
+        printf("\n  GPU FA   (h0, last, 0-7): ");
+        for (int i = 0; i < 8; i++) printf("%.4f ", hO_gpu[off+i]);
+        printf("\n");
+
+        auto r = compare_arrays(hO_ref.data(), hO_gpu.data(), q_elems, 0.05f, 0.1f, 0.03f);
+        print_result("FA Large-Magnitude", r);
+        check(r.pass);
+
+        cudaFree(dQ); cudaFree(dK_c); cudaFree(dV_c); cudaFree(dO); cudaFree(dL);
+    }
+
     // GEMM NT — small, medium, transformer-sized
     check(verify_gemm_nt(16, 16, 16));
     check(verify_gemm_nt(128, 128, 128));
