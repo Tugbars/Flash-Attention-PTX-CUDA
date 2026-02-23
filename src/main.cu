@@ -751,6 +751,135 @@ bool verify_flash_attention_gqa(int batch_size, int n_q_heads, int n_kv_heads,
 }
 
 // ============================================================================
+// Flash Attention GQA with KV cache stride (replicates inference scenario)
+//
+// K/V are allocated as [n_kv_heads, max_seq, d_head] with only the first
+// seq_len positions filled. This tests FA with kv_seq_stride != kv_len.
+// ============================================================================
+bool verify_flash_attention_gqa_cache(int batch_size, int n_q_heads, int n_kv_heads,
+                                       int seq_len, int d_head, int max_seq_len) {
+    const int gqa_ratio = n_q_heads / n_kv_heads;
+    printf("=== Flash Attention GQA+Cache [B=%d, Hq=%d, Hkv=%d, ratio=%d:1, S=%d, D=%d, max_seq=%d] ===\n",
+           batch_size, n_q_heads, n_kv_heads, gqa_ratio, seq_len, d_head, max_seq_len);
+
+    const int q_elements  = batch_size * n_q_heads * seq_len * d_head;
+    const int kv_tight    = batch_size * n_kv_heads * seq_len * d_head;
+    const int kv_cache_sz = batch_size * n_kv_heads * max_seq_len * d_head;
+    const float scale = 1.0f / sqrtf(static_cast<float>(d_head));
+
+    std::vector<float> h_Q(q_elements), h_K(kv_tight), h_V(kv_tight);
+    std::vector<float> h_O_ref(q_elements, 0.0f), h_O_gpu(q_elements);
+
+    srand(12345);
+    for (int i = 0; i < q_elements; i++)
+        h_Q[i] = (rand() / (float)RAND_MAX - 0.5f) * 0.5f;
+    for (int i = 0; i < kv_tight; i++) {
+        h_K[i] = (rand() / (float)RAND_MAX - 0.5f) * 0.5f;
+        h_V[i] = (rand() / (float)RAND_MAX - 0.5f) * 0.5f;
+    }
+
+    // CPU reference (same as normal GQA test — uses tight arrays)
+    for (int b = 0; b < batch_size; b++) {
+        for (int qh = 0; qh < n_q_heads; qh++) {
+            const int kvh = qh / gqa_ratio;
+            const int q_bh  = b * n_q_heads + qh;
+            const int kv_bh = b * n_kv_heads + kvh;
+
+            const float* Q_ptr = h_Q.data() + q_bh * seq_len * d_head;
+            const float* K_ptr = h_K.data() + kv_bh * seq_len * d_head;
+            const float* V_ptr = h_V.data() + kv_bh * seq_len * d_head;
+            float*       O_ptr = h_O_ref.data() + q_bh * seq_len * d_head;
+
+            std::vector<float> S(seq_len * seq_len);
+            for (int i = 0; i < seq_len; i++)
+                for (int j = 0; j < seq_len; j++) {
+                    float dot = 0.0f;
+                    for (int k = 0; k < d_head; k++)
+                        dot += Q_ptr[i * d_head + k] * K_ptr[j * d_head + k];
+                    S[i * seq_len + j] = (j > i) ? -1e9f : dot * scale;
+                }
+
+            std::vector<float> P(seq_len * seq_len);
+            for (int i = 0; i < seq_len; i++) {
+                float mx = *std::max_element(&S[i * seq_len], &S[(i+1) * seq_len]);
+                float sum = 0.0f;
+                for (int j = 0; j < seq_len; j++) {
+                    P[i * seq_len + j] = expf(S[i * seq_len + j] - mx);
+                    sum += P[i * seq_len + j];
+                }
+                for (int j = 0; j < seq_len; j++) P[i * seq_len + j] /= sum;
+            }
+
+            for (int i = 0; i < seq_len; i++)
+                for (int k = 0; k < d_head; k++) {
+                    float val = 0.0f;
+                    for (int j = 0; j < seq_len; j++)
+                        val += P[i * seq_len + j] * V_ptr[j * d_head + k];
+                    O_ptr[i * d_head + k] = val;
+                }
+        }
+    }
+
+    // GPU — Q is tight [B*Hq, S, D], but K/V use cache layout [B*Hkv, max_seq, D]
+    half* dQ = upload_fp16(h_Q, q_elements);
+    half* dO; cudaMalloc(&dO, q_elements * sizeof(half));
+    float* dL; cudaMalloc(&dL, batch_size * n_q_heads * seq_len * sizeof(float));
+
+    // Allocate KV cache and zero it (uninitialized positions should be zero)
+    half* dK_cache; cudaMalloc(&dK_cache, kv_cache_sz * sizeof(half));
+    half* dV_cache; cudaMalloc(&dV_cache, kv_cache_sz * sizeof(half));
+    cudaMemset(dK_cache, 0, kv_cache_sz * sizeof(half));
+    cudaMemset(dV_cache, 0, kv_cache_sz * sizeof(half));
+
+    // Copy tight K/V into cache layout: [n_kv_heads, max_seq, d_head]
+    // Only first seq_len positions of each head are filled
+    {
+        std::vector<half> h_K_fp16(kv_tight), h_V_fp16(kv_tight);
+        for (int i = 0; i < kv_tight; i++) {
+            h_K_fp16[i] = __float2half(h_K[i]);
+            h_V_fp16[i] = __float2half(h_V[i]);
+        }
+
+        for (int b = 0; b < batch_size; b++) {
+            for (int h = 0; h < n_kv_heads; h++) {
+                int bh = b * n_kv_heads + h;
+                // Tight source: offset = bh * seq_len * d_head
+                // Cache dest:   offset = bh * max_seq_len * d_head
+                half* src_k = h_K_fp16.data() + bh * seq_len * d_head;
+                half* src_v = h_V_fp16.data() + bh * seq_len * d_head;
+                half* dst_k = dK_cache + (size_t)bh * max_seq_len * d_head;
+                half* dst_v = dV_cache + (size_t)bh * max_seq_len * d_head;
+                cudaMemcpy(dst_k, src_k, seq_len * d_head * sizeof(half), cudaMemcpyHostToDevice);
+                cudaMemcpy(dst_v, src_v, seq_len * d_head * sizeof(half), cudaMemcpyHostToDevice);
+            }
+        }
+    }
+
+    FlashAttentionParams params = {};
+    params.Q = dQ; params.K = dK_cache; params.V = dV_cache; params.O = dO; params.L = dL;
+    params.batch_size = batch_size;
+    params.num_heads = n_q_heads;
+    params.num_kv_heads = n_kv_heads;
+    params.q_len = seq_len;
+    params.kv_len = seq_len;
+    params.kv_seq_stride = max_seq_len;
+    params.d_head = d_head;
+    params.scale = scale; params.causal = true; params.stream = 0;
+
+    launch_flash_attention(params);
+    cudaDeviceSynchronize();
+
+    download_fp16(dO, h_O_gpu, q_elements);
+
+    auto r = compare_arrays(h_O_ref.data(), h_O_gpu.data(), q_elements,
+                            0.05f, 0.1f, 0.03f);
+    print_result("Flash Attention GQA+Cache", r);
+
+    cudaFree(dQ); cudaFree(dK_cache); cudaFree(dV_cache); cudaFree(dO); cudaFree(dL);
+    return r.pass;
+}
+
+// ============================================================================
 // Benchmarks (unchanged)
 // ============================================================================
 void benchmark_flash_attention(int batch_size, int n_heads, int seq_len, int d_head,
@@ -1558,6 +1687,12 @@ int main(int argc, char** argv) {
     check(verify_flash_attention_gqa(1, 12, 2, 5, 128));   // exact DeepSeek config, S=5
     check(verify_flash_attention_gqa(1, 12, 2, 64, 128));  // longer sequence
     check(verify_flash_attention_gqa(1, 12, 2, 128, 128)); // even longer
+
+    // GQA with KV cache stride (replicates exact inference scenario)
+    check(verify_flash_attention_gqa_cache(1, 12, 2, 5, 128, 8192));    // exact inference: S=5, max=8192
+    check(verify_flash_attention_gqa_cache(1, 12, 2, 5, 128, 256));     // smaller cache
+    check(verify_flash_attention_gqa_cache(1, 12, 2, 64, 128, 8192));   // longer seq in cache
+    check(verify_flash_attention_gqa_cache(1, 4, 2, 5, 64, 1024));      // D=64 with cache stride
 
     // GEMM NT — small, medium, transformer-sized
     check(verify_gemm_nt(16, 16, 16));
