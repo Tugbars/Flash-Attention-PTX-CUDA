@@ -31,8 +31,9 @@ __global__ void apply_rotary_embedding_kernel(
 
     size_t base_offset = static_cast<size_t>(bh_idx) * seq_len * d_head
                        + seq_pos * d_head;
-    int dim0 = pair_idx * 2;
-    int dim1 = pair_idx * 2 + 1;
+    // Non-interleaved (neox-style) RoPE: pair dim k with dim k + half_d
+    int dim0 = pair_idx;
+    int dim1 = pair_idx + half_d;
 
     float x0 = __half2float(QorK[base_offset + dim0]);
     float x1 = __half2float(QorK[base_offset + dim1]);

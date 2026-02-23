@@ -26,10 +26,9 @@
 #include <cute/tensor.hpp>
 #endif
 
-// FP8 support
+// FP8 support (requires CUTLASS + Linux)
 #ifdef ENABLE_FP8
 #include <cuda_fp8.h>
-#include "fp8_quantize.h"
 #endif
 
 namespace transformer {

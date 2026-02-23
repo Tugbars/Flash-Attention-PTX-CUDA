@@ -282,6 +282,21 @@ void forward_pass(
             launch_fused_layernorm(p);
         }
 
+        // Layer 0 multi-stage diagnostic (prefill only)
+        if (l == 0 && seq_len > 1) {
+            std::vector<half> h_debug(8);
+            auto print_debug = [&](const char* label, const half* ptr, int offset_tokens, int dim) {
+                cudaMemcpyAsync(h_debug.data(),
+                    ptr + (size_t)offset_tokens * dim,
+                    8 * sizeof(half), cudaMemcpyDeviceToHost, stream);
+                cudaStreamSynchronize(stream);
+                printf("  [DIAG L0] %s (last tok, first 8): ", label);
+                for (int i = 0; i < 8; i++) printf("%.4f ", __half2float(h_debug[i]));
+                printf("\n");
+            };
+            print_debug("RMSNorm out", sc.ln_out, N-1, d);
+        }
+
         // 2. QKV projections (GQA: K and V are [N, d_kv])
         half* Q      = sc.qkv;
         half* K_proj = sc.qkv + (size_t)N * d;
@@ -295,6 +310,18 @@ void forward_pass(
         launch_bias_add(Q,      w.bq, N, d,    stream);
         launch_bias_add(K_proj, w.bk, N, d_kv, stream);
         launch_bias_add(V_proj, w.bv, N, d_kv, stream);
+
+        // Layer 0 Q diagnostic (prefill only)
+        if (l == 0 && seq_len > 1) {
+            std::vector<half> h_debug(8);
+            cudaMemcpyAsync(h_debug.data(),
+                Q + (size_t)(N-1) * d,  // last token Q
+                8 * sizeof(half), cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+            printf("  [DIAG L0] Q+bias (last tok, first 8): ");
+            for (int i = 0; i < 8; i++) printf("%.4f ", __half2float(h_debug[i]));
+            printf("\n");
+        }
 
         // 3. Layout: GEMM outputs [S, H*D] row-major.
         //    RoPE and FA expect [H, S, D].
@@ -321,6 +348,41 @@ void forward_pass(
             launch_rope(rope_Q, rope_K, rope,
                        batch_size * nh, batch_size * nkv,
                        seq_len, start_pos, stream);
+        }
+
+        // Layer 0 post-RoPE diagnostic (prefill only)
+        if (l == 0 && seq_len > 1) {
+            std::vector<half> h_debug(8);
+            // rope_Q is [nh, S, dh] — head 0, last position = offset (S-1)*dh
+            size_t q_h0_last = (size_t)(seq_len - 1) * dh;
+            
+            // Dims 0-7
+            cudaMemcpyAsync(h_debug.data(),
+                rope_Q + q_h0_last,
+                8 * sizeof(half), cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+            printf("  [DIAG L0] Q post-RoPE head0 (last tok, dims 0-7): ");
+            for (int i = 0; i < 8; i++) printf("%.4f ", __half2float(h_debug[i]));
+            printf("\n");
+            
+            // Dims 64-71 (second half — the paired dims in non-interleaved RoPE)
+            cudaMemcpyAsync(h_debug.data(),
+                rope_Q + q_h0_last + 64,  // offset by half_d
+                8 * sizeof(half), cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+            printf("  [DIAG L0] Q post-RoPE head0 (last tok, dims 64-71): ");
+            for (int i = 0; i < 8; i++) printf("%.4f ", __half2float(h_debug[i]));
+            printf("\n");
+
+            // K head 0, last position dims 0-7
+            size_t k_h0_last = (size_t)(seq_len - 1) * dh;
+            cudaMemcpyAsync(h_debug.data(),
+                rope_K + k_h0_last,
+                8 * sizeof(half), cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+            printf("  [DIAG L0] K post-RoPE head0 (last tok, dims 0-7): ");
+            for (int i = 0; i < 8; i++) printf("%.4f ", __half2float(h_debug[i]));
+            printf("\n");
         }
 
         // 5. KV cache update
@@ -386,6 +448,79 @@ void forward_pass(
             fa.causal = true; fa.stream = stream;
             launch_flash_attention(fa);
 
+            // ---- Layer 0: Naive CPU attention reference for head 0 ----
+            if (l == 0 && seq_len > 1) {
+                cudaStreamSynchronize(stream);
+
+                // Dump Q head 0 [S, dh], K cache head 0 [S, dh], V cache head 0 [S, dh]
+                int S = seq_len;
+                std::vector<half> h_q(S * dh), h_k(S * dh), h_v(S * dh);
+
+                // Q is in [nh, S, dh] layout — head 0 starts at offset 0
+                cudaMemcpy(h_q.data(), rope_Q, S * dh * sizeof(half), cudaMemcpyDeviceToHost);
+
+                // KV cache: [nkv, max_seq, dh] — head 0 starts at offset 0
+                // Positions 0..S-1 are at offset pos*dh within head 0
+                half* k_cache = kv.get(l, 0);
+                half* v_cache = kv.get(l, 1);
+                cudaMemcpy(h_k.data(), k_cache, S * dh * sizeof(half), cudaMemcpyDeviceToHost);
+                cudaMemcpy(h_v.data(), v_cache, S * dh * sizeof(half), cudaMemcpyDeviceToHost);
+
+                // Compute QK^T for last query (row S-1) against all S keys
+                float scale = 1.0f / sqrtf((float)dh);
+                printf("  [NAIVE] QK^T scores (last Q, head 0):");
+                float scores[64] = {};  // max seq_len for this test
+                float max_s = -1e30f;
+                for (int j = 0; j < S; j++) {
+                    float dot = 0.0f;
+                    for (int d_i = 0; d_i < dh; d_i++) {
+                        dot += __half2float(h_q[(S-1)*dh + d_i]) * __half2float(h_k[j*dh + d_i]);
+                    }
+                    scores[j] = dot * scale;
+                    max_s = fmaxf(max_s, scores[j]);
+                    printf(" %.4f", scores[j]);
+                }
+                printf("\n");
+
+                // Softmax
+                float sum_exp = 0.0f;
+                float probs[64] = {};
+                for (int j = 0; j < S; j++) {
+                    // Causal: last query (pos S-1) can attend to all S positions
+                    probs[j] = expf(scores[j] - max_s);
+                    sum_exp += probs[j];
+                }
+                for (int j = 0; j < S; j++) probs[j] /= sum_exp;
+                printf("  [NAIVE] Softmax probs: ");
+                for (int j = 0; j < S; j++) printf("%.4f ", probs[j]);
+                printf("\n");
+
+                // O = P @ V — first 8 dims
+                printf("  [NAIVE] Attn out head0 (last tok, first 8): ");
+                for (int d_i = 0; d_i < 8; d_i++) {
+                    float val = 0.0f;
+                    for (int j = 0; j < S; j++) {
+                        val += probs[j] * __half2float(h_v[j*dh + d_i]);
+                    }
+                    printf("%.4f ", val);
+                }
+                printf("\n");
+
+                // Also print FA output for comparison
+                half* fa_out = need_transpose ? sc.o_transposed : sc.attn_out;
+                // FA output is [nh, S, dh] — head 0, last token
+                std::vector<half> h_fa(8);
+                cudaMemcpy(h_fa.data(), fa_out + (size_t)(S-1)*dh, 8*sizeof(half), cudaMemcpyDeviceToHost);
+                printf("  [FA]    Attn out head0 (last tok, first 8): ");
+                for (int i = 0; i < 8; i++) printf("%.4f ", __half2float(h_fa[i]));
+                printf("\n");
+
+                // Print V cache head 0 first row for sanity
+                printf("  [NAIVE] V cache head0 pos0 first 8: ");
+                for (int i = 0; i < 8; i++) printf("%.4f ", __half2float(h_v[i]));
+                printf("\n");
+            }
+
             if (need_transpose) {
                 // Transpose output back: [nh, seq_len, dh] → [seq_len, nh*dh]
                 launch_transpose(sc.o_transposed, sc.attn_out, seq_len, nh, dh, false, stream);
@@ -394,6 +529,28 @@ void forward_pass(
 
         // 6. Attention output projection
         gemm.gemm_nt(sc.attn_out, w.wo, sc.ffn_out, N, d, d);
+
+        // Layer 0 attn output diagnostic (prefill only)
+        if (l == 0 && seq_len > 1) {
+            std::vector<half> h_debug(8);
+            // attn_out = FA output (before Wo)
+            cudaMemcpyAsync(h_debug.data(),
+                sc.attn_out + (size_t)(N-1) * d,
+                8 * sizeof(half), cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+            printf("  [DIAG L0] Attn out (last tok, first 8): ");
+            for (int i = 0; i < 8; i++) printf("%.4f ", __half2float(h_debug[i]));
+            printf("\n");
+
+            // ffn_out = Wo projection of attn
+            cudaMemcpyAsync(h_debug.data(),
+                sc.ffn_out + (size_t)(N-1) * d,
+                8 * sizeof(half), cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+            printf("  [DIAG L0] Wo proj (last tok, first 8): ");
+            for (int i = 0; i < 8; i++) printf("%.4f ", __half2float(h_debug[i]));
+            printf("\n");
+        }
 
         // 7. RMSNorm (pre-FFN) + residual add
         {
@@ -429,6 +586,18 @@ void forward_pass(
         }
 
         std::swap(cur_in, cur_out);
+
+        // Layer 0 final output diagnostic (prefill only)
+        if (l == 0 && seq_len > 1) {
+            std::vector<half> h_debug(8);
+            cudaMemcpyAsync(h_debug.data(),
+                cur_in + (size_t)(N-1) * d,
+                8 * sizeof(half), cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+            printf("  [DIAG L0] Layer output (last tok, first 8): ");
+            for (int i = 0; i < 8; i++) printf("%.4f ", __half2float(h_debug[i]));
+            printf("\n");
+        }
     }
 
     // If odd number of layers, result is in cur_in (which may be hidden or hidden2)
@@ -653,6 +822,12 @@ int main(int argc, char** argv) {
     }
     const auto& cfg = model.config;
 
+    // Config verification
+    printf("  rms_norm_eps=%e  rope_theta=%.1f\n", cfg.rms_norm_eps, cfg.rope_theta);
+    printf("  use_rotary=%d  use_swiglu=%d  use_rmsnorm=%d  tie=%d\n",
+           (int)cfg.use_rotary, (int)cfg.use_swiglu,
+           (int)cfg.use_rmsnorm, (int)cfg.tie_word_embeddings);
+
     // ── 2. Load tokenizer ────────────────────────────────────────────────
     Tokenizer tokenizer;
     std::string vocab_path = args.model_path + ".vocab";
@@ -667,7 +842,7 @@ int main(int argc, char** argv) {
     if (cfg.eos_token_id >= 0) tokenizer.eos_id = cfg.eos_token_id;
 
     // ── 3. Tokenize prompt ───────────────────────────────────────────────
-    std::vector<int32_t> prompt_tokens = tokenizer.encode(args.prompt, true);
+    std::vector<int32_t> prompt_tokens = tokenizer.encode(args.prompt, false);
     int prompt_len = static_cast<int>(prompt_tokens.size());
     printf("\nPrompt: \"%s\" → %d tokens\n", args.prompt.c_str(), prompt_len);
 
@@ -803,6 +978,18 @@ int main(int argc, char** argv) {
             std::string tok = tokenizer.decode_token(scored[i].second);
             printf("    %2d. id=%6d logit=%8.3f  \"%s\"\n",
                    i+1, scored[i].second, scored[i].first, tok.c_str());
+        }
+        // HF reference comparison for "The capital of France is"
+        int ref_ids[] = {12095, 220, 15251, 27991, 330, 264, 279};
+        const char* ref_names[] = {" Paris", " (space)", " represented", " invested", " \"", " a", " the"};
+        float ref_logits[] = {11.359f, 11.008f, 10.594f, 10.539f, 9.750f, 9.742f, 9.227f};
+        printf("  [DIAG] HF reference comparison:\n");
+        for (int r = 0; r < 7; r++) {
+            if (ref_ids[r] < (int)h_logits.size()) {
+                printf("    %-14s id=%6d  ours=%8.3f  HF=%8.3f  diff=%+.3f\n",
+                       ref_names[r], ref_ids[r], h_logits[ref_ids[r]], ref_logits[r],
+                       h_logits[ref_ids[r]] - ref_logits[r]);
+            }
         }
         printf("\n");
     }

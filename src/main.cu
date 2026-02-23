@@ -1543,11 +1543,21 @@ int main(int argc, char** argv) {
     check(verify_flash_attention(1, 1, 128, 64));
     check(verify_flash_attention(1, 2, 256, 64));
 
+    // Flash Attention — D_HEAD=128 (DeepSeek/Qwen2 config)
+    check(verify_flash_attention(1, 1, 5, 128));      // minimal: matches our test prompt
+    check(verify_flash_attention(1, 1, 64, 128));
+    check(verify_flash_attention(1, 2, 128, 128));
+
     // Flash Attention — GQA (new: shared KV heads)
     check(verify_flash_attention_gqa(1, 4, 2, 64, 64));    // 4Q:2KV = 2:1
     check(verify_flash_attention_gqa(1, 8, 2, 128, 64));   // 8Q:2KV = 4:1
     check(verify_flash_attention_gqa(1, 32, 8, 64, 64));   // 32Q:8KV = 4:1 (Llama config)
     check(verify_flash_attention_gqa(2, 32, 8, 64, 64));   // Batched GQA
+
+    // GQA with D_HEAD=128 (DeepSeek-R1 config: 12Q:2KV)
+    check(verify_flash_attention_gqa(1, 12, 2, 5, 128));   // exact DeepSeek config, S=5
+    check(verify_flash_attention_gqa(1, 12, 2, 64, 128));  // longer sequence
+    check(verify_flash_attention_gqa(1, 12, 2, 128, 128)); // even longer
 
     // GEMM NT — small, medium, transformer-sized
     check(verify_gemm_nt(16, 16, 16));
