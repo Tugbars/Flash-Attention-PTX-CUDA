@@ -50,8 +50,8 @@ namespace transformer {
 // ============================================================================
 struct FlashAttentionParams {
     const half* Q;           // [B*H_q, q_len, D] query matrix (FP16)
-    const half* K;           // [B*H_kv, kv_len, D] key matrix (FP16)
-    const half* V;           // [B*H_kv, kv_len, D] value matrix (FP16)
+    const half* K;           // [B*H_kv, kv_seq_stride, D] key matrix (FP16)
+    const half* V;           // [B*H_kv, kv_seq_stride, D] value matrix (FP16)
     half*       O;           // [B*H_q, q_len, D] output matrix (FP16)
     float*      L;           // [B*H_q, q_len]    log-sum-exp (FP32, optional)
     int         batch_size;
@@ -59,8 +59,9 @@ struct FlashAttentionParams {
     int         num_kv_heads;// KV heads (H_kv). If 0 or == num_heads, MHA mode.
     int         seq_len;     // For prefill: q_len == kv_len == seq_len
     int         q_len;       // Number of query positions (0 = use seq_len)
-    int         kv_len;      // Number of key/value positions (0 = use seq_len)
-    int         d_head;      // Must be 64
+    int         kv_len;      // Number of key/value positions to attend to
+    int         kv_seq_stride; // Memory stride between KV heads (= max_seq_len for cache, = kv_len for tight arrays)
+    int         d_head;      // Must be 64 or 128
     float       scale;       // Typically 1.0f / sqrtf(d_head)
     bool        causal;
     cudaStream_t stream;

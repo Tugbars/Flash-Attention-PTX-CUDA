@@ -96,6 +96,7 @@ __global__ void flash_attention_ptx_kernel(
     float*      __restrict__ LSE,
     const int   q_len,       // number of query positions
     const int   kv_len,      // number of key/value positions (>= q_len for decode)
+    const int   kv_seq_stride, // memory stride between KV heads (max_seq_len for cache)
     const int   n_kv_heads,
     const int   n_q_heads,
     const float scale)
@@ -144,7 +145,7 @@ __global__ void flash_attention_ptx_kernel(
     const int kv_bh_idx = batch_idx * n_kv_heads + kv_head;
 
     const size_t q_head_offset  = static_cast<size_t>(bh_idx)    * q_len  * D_HEAD;
-    const size_t kv_head_offset = static_cast<size_t>(kv_bh_idx) * kv_len * D_HEAD;
+    const size_t kv_head_offset = static_cast<size_t>(kv_bh_idx) * kv_seq_stride * D_HEAD;
     const half* Q_head = Q + q_head_offset;
     const half* K_head = K + kv_head_offset;
     const half* V_head = V + kv_head_offset;
@@ -502,6 +503,7 @@ void launch_flash_attention(const FlashAttentionParams& params) {
     // Resolve q_len / kv_len (0 means use seq_len for backward compat)
     const int q_len  = (params.q_len  > 0) ? params.q_len  : params.seq_len;
     const int kv_len = (params.kv_len > 0) ? params.kv_len : params.seq_len;
+    const int kv_seq_stride = (params.kv_seq_stride > 0) ? params.kv_seq_stride : kv_len;
 
     const int grid_x = (q_len + BLOCK_M - 1) / BLOCK_M;
     const int grid_y = params.batch_size * params.num_heads;
@@ -533,12 +535,12 @@ void launch_flash_attention(const FlashAttentionParams& params) {
             flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, 64, NUM_WARPS, true>
                 <<<grid, block, smem_bytes, params.stream>>>(
                     params.Q, params.K, params.V, params.O, params.L,
-                    q_len, kv_len, n_kv_heads, n_q_heads, params.scale);
+                    q_len, kv_len, kv_seq_stride, n_kv_heads, n_q_heads, params.scale);
         } else {
             flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, 64, NUM_WARPS, false>
                 <<<grid, block, smem_bytes, params.stream>>>(
                     params.Q, params.K, params.V, params.O, params.L,
-                    q_len, kv_len, n_kv_heads, n_q_heads, params.scale);
+                    q_len, kv_len, kv_seq_stride, n_kv_heads, n_q_heads, params.scale);
         }
     } else if (params.d_head == 128) {
         constexpr int D_HEAD = 128;
@@ -559,12 +561,12 @@ void launch_flash_attention(const FlashAttentionParams& params) {
             flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, 128, NUM_WARPS, true>
                 <<<grid, block, smem_bytes, params.stream>>>(
                     params.Q, params.K, params.V, params.O, params.L,
-                    q_len, kv_len, n_kv_heads, n_q_heads, params.scale);
+                    q_len, kv_len, kv_seq_stride, n_kv_heads, n_q_heads, params.scale);
         } else {
             flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, 128, NUM_WARPS, false>
                 <<<grid, block, smem_bytes, params.stream>>>(
                     params.Q, params.K, params.V, params.O, params.L,
-                    q_len, kv_len, n_kv_heads, n_q_heads, params.scale);
+                    q_len, kv_len, kv_seq_stride, n_kv_heads, n_q_heads, params.scale);
         }
     } else {
         fprintf(stderr, "ERROR: Unsupported d_head=%d (only 64 and 128)\n", params.d_head);

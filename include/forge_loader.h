@@ -110,6 +110,9 @@ struct ForgeLayerWeights {
     half* wq;            // [d_model, d_model] transposed (col-major for NT)
     half* wk;            // [d_model, d_kv]    transposed
     half* wv;            // [d_model, d_kv]    transposed
+    half* bq;            // [d_model]          Q bias (nullptr if no bias)
+    half* bk;            // [d_kv]             K bias (nullptr if no bias)
+    half* bv;            // [d_kv]             V bias (nullptr if no bias)
     half* wo;            // [d_model, d_model] transposed
     half* ln2_weight;    // [d_model]         RMSNorm weight
     half* w_gate;        // [d_model, d_ffn]  transposed
@@ -275,7 +278,7 @@ static bool forge_load(const char* path, ForgeModel* model, cudaStream_t stream 
            n_tensors, file_size / (1024.0 * 1024.0));
 
     // 4. Allocate tracking arrays
-    int max_ptrs = 3 + cfg.n_layers * 9;  // embed + layers*9 + norm + lm_head
+    int max_ptrs = 3 + cfg.n_layers * 12;  // embed + layers*(9 weights + 3 bias) + norm + lm_head
     model->all_device_ptrs = new half*[max_ptrs];
     model->n_device_ptrs = 0;
     model->layers = new ForgeLayerWeights[cfg.n_layers];
@@ -287,6 +290,15 @@ static bool forge_load(const char* path, ForgeModel* model, cudaStream_t stream 
             fprintf(stderr, "  WARNING: tensor '%s' not found\n", name);
             return nullptr;
         }
+        half* ptr = forge_upload_tensor(base, e, stream);
+        model->all_device_ptrs[model->n_device_ptrs++] = ptr;
+        return ptr;
+    };
+
+    // Optional upload — returns nullptr silently if not found
+    auto upload_optional = [&](const char* name) -> half* {
+        const ForgeTensorEntry* e = forge_find_tensor(table, n_tensors, name);
+        if (!e) return nullptr;
         half* ptr = forge_upload_tensor(base, e, stream);
         model->all_device_ptrs[model->n_device_ptrs++] = ptr;
         return ptr;
@@ -305,12 +317,19 @@ static bool forge_load(const char* path, ForgeModel* model, cudaStream_t stream 
         snprintf(name, 64, "layers.%d.wq", l);           lw.wq = upload(name);
         snprintf(name, 64, "layers.%d.wk", l);           lw.wk = upload(name);
         snprintf(name, 64, "layers.%d.wv", l);           lw.wv = upload(name);
+        snprintf(name, 64, "layers.%d.bq", l);           lw.bq = upload_optional(name);
+        snprintf(name, 64, "layers.%d.bk", l);           lw.bk = upload_optional(name);
+        snprintf(name, 64, "layers.%d.bv", l);           lw.bv = upload_optional(name);
         snprintf(name, 64, "layers.%d.wo", l);           lw.wo = upload(name);
         snprintf(name, 64, "layers.%d.ln2_weight", l);   lw.ln2_weight = upload(name);
         snprintf(name, 64, "layers.%d.w_gate", l);       lw.w_gate = upload(name);
         snprintf(name, 64, "layers.%d.w_up", l);         lw.w_up = upload(name);
         snprintf(name, 64, "layers.%d.w_down", l);       lw.w_down = upload(name);
     }
+
+    // Report bias status
+    if (model->layers[0].bq) printf("  Attention QKV bias: enabled\n");
+    else printf("  Attention QKV bias: none\n");
 
     model->final_norm_weight = upload("final_norm_weight");
     model->lm_head = upload("lm_head");

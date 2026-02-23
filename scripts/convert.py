@@ -322,15 +322,7 @@ def hf_config_to_forge(hf_config: dict) -> dict:
 
 
 def transpose_for_nt(tensor: np.ndarray) -> np.ndarray:
-    """Prepare a 2D weight matrix for cuBLAS NT layout.
-    
-    gemm_nt computes C = A * B^T, where B is [N, K] row-major.
-    HF stores weights as [out_features, in_features] row-major.
-    For gemm_nt: N=out_features, K=in_features, so B=[out, in] row-major.
-    
-    This matches HF layout directly — NO transpose needed.
-    """
-    # No-op: HF layout is already correct for gemm_nt
+    """No transpose needed — HF [out, in] matches gemm_nt B=[N, K] directly."""
     return tensor
 
 
@@ -384,6 +376,18 @@ def write_forge(output_path: str, forge_config: dict, hf_tensors: dict):
             f"{pfx}.self_attn.k_proj.weight", transpose=True)
         add(f"layers.{l}.wv",
             f"{pfx}.self_attn.v_proj.weight", transpose=True)
+        # QKV bias (optional — Qwen2 has them, Llama does not)
+        for bias_name, forge_name in [
+            (f"{pfx}.self_attn.q_proj.bias", f"layers.{l}.bq"),
+            (f"{pfx}.self_attn.k_proj.bias", f"layers.{l}.bk"),
+            (f"{pfx}.self_attn.v_proj.bias", f"layers.{l}.bv"),
+        ]:
+            if bias_name in hf_tensors:
+                t = hf_tensors[bias_name]
+                if hasattr(t, 'numpy'):
+                    t = t.float().numpy()
+                t = to_fp16(t)
+                ordered.append((forge_name, t))
         add(f"layers.{l}.wo",
             f"{pfx}.self_attn.o_proj.weight", transpose=True)
         add(f"layers.{l}.ln2_weight",

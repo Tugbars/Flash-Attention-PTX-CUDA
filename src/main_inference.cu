@@ -138,6 +138,29 @@ __global__ void half_to_float_kernel(const half* in, float* out, int n) {
 }
 
 // ============================================================================
+// Bias add: out[row, col] += bias[col]  for matrix [num_rows, dim]
+// ============================================================================
+__global__ void bias_add_kernel(half* data, const half* __restrict__ bias,
+                                 int num_rows, int dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_rows * dim;
+    if (idx < total) {
+        int col = idx % dim;
+        float val = __half2float(data[idx]) + __half2float(bias[col]);
+        data[idx] = __float2half(val);
+    }
+}
+
+static void launch_bias_add(half* data, const half* bias, int num_rows, int dim,
+                             cudaStream_t stream) {
+    if (!bias) return;  // no-op if no bias
+    int total = num_rows * dim;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+    bias_add_kernel<<<grid, block, 0, stream>>>(data, bias, num_rows, dim);
+}
+
+// ============================================================================
 // Layout transpose: [S, H*D] → [H, S, D] (row-major GEMM output → FA input)
 // Also used as: [H, S, D] → [S, H*D] (FA output → row-major for GEMM)
 // ============================================================================
@@ -268,6 +291,11 @@ void forward_pass(
         gemm.gemm_nt(sc.ln_out, w.wk, K_proj,  N, d_kv, d);
         gemm.gemm_nt(sc.ln_out, w.wv, V_proj,  N, d_kv, d);
 
+        // QKV bias (Qwen2 has attention bias, Llama does not)
+        launch_bias_add(Q,      w.bq, N, d,    stream);
+        launch_bias_add(K_proj, w.bk, N, d_kv, stream);
+        launch_bias_add(V_proj, w.bv, N, d_kv, stream);
+
         // 3. Layout: GEMM outputs [S, H*D] row-major.
         //    RoPE and FA expect [H, S, D].
         //    For seq_len=1 (decode), these are identical.
@@ -351,6 +379,7 @@ void forward_pass(
             fa.batch_size = batch_size; fa.num_heads = nh;
             fa.num_kv_heads = nkv;
             fa.q_len = seq_len; fa.kv_len = total_len;
+            fa.kv_seq_stride = cfg.max_seq_len;  // KV cache layout: [nkv, max_seq, dh]
             fa.seq_len = 0;  // unused — using q_len/kv_len
             fa.d_head = dh;
             fa.scale = 1.0f / sqrtf((float)dh);
