@@ -113,23 +113,28 @@ __global__ void flash_attention_ptx_kernel(
     // -- Shared memory layout ------------------------------------------------
     // Padding by 8 halfs avoids bank conflicts on 16-byte aligned ldmatrix.
     //
-    //   smem_q:            [BLOCK_M × (D_HEAD+8)] half     Q tile (9 KB)
-    //   smem_k:            [BLOCK_N × (D_HEAD+8)] half     K tile (9 KB)
-    //   smem_v:            [BLOCK_N × (D_HEAD+8)] half     V tile (9 KB)
-    //   smem_p:            [BLOCK_M × (BLOCK_N+8)] half    P = softmax(S) (9 KB)
-    //   smem_partial_max:  [2 × BLOCK_M] float             cross-warp max (0.5 KB)
-    //   smem_partial_sum:  [2 × BLOCK_M] float             cross-warp sum (0.5 KB)
-    //                                                      Total: ~37 KB
+    //   smem_q:            [BLOCK_M × (D_HEAD+8)] half     Q tile
+    //   smem_k:            [BLOCK_N × (D_HEAD+8)] half     K tile
+    //   smem_v:            [D_HEAD × (BLOCK_N+8)] half     V tile (TRANSPOSED!)
+    //   smem_p:            [BLOCK_M × (BLOCK_N+8)] half    P = softmax(S)
+    //   smem_partial_max:  [2 × BLOCK_M] float             cross-warp max
+    //   smem_partial_sum:  [2 × BLOCK_M] float             cross-warp sum
+    //
+    // V is stored transposed in smem so that ldmatrix_x2_trans produces
+    // the correct B[k=kv_pos, n=head_dim] operand for P*V MMA.
+    // Without transposing, ldmatrix_x2_trans would yield V^T, computing
+    // P*V^T instead of P*V — catastrophically wrong for non-uniform softmax.
     constexpr int SMEM_PAD  = 8;
     constexpr int Q_STRIDE  = D_HEAD + SMEM_PAD;
     constexpr int KV_STRIDE = D_HEAD + SMEM_PAD;
+    constexpr int VT_STRIDE = BLOCK_N + SMEM_PAD;  // V transposed stride
     constexpr int P_STRIDE  = BLOCK_N + SMEM_PAD;
 
     extern __shared__ char smem_raw[];
     half*  smem_q = reinterpret_cast<half*>(smem_raw);
     half*  smem_k = smem_q + BLOCK_M * Q_STRIDE;
-    half*  smem_v = smem_k + BLOCK_N * KV_STRIDE;
-    half*  smem_p = smem_v + BLOCK_N * KV_STRIDE;
+    half*  smem_v = smem_k + BLOCK_N * KV_STRIDE;           // [D_HEAD × VT_STRIDE]
+    half*  smem_p = smem_v + D_HEAD * VT_STRIDE;
     float* smem_partial_max = reinterpret_cast<float*>(smem_p + BLOCK_M * P_STRIDE);
     float* smem_partial_sum = smem_partial_max + 2 * BLOCK_M;
 
@@ -228,7 +233,15 @@ __global__ void flash_attention_ptx_kernel(
                 uint4 val = (g < kv_len && row < kv_count)
                     ? reinterpret_cast<const uint4*>(V_head + g * D_HEAD)[col]
                     : make_uint4(0, 0, 0, 0);
-                reinterpret_cast<uint4*>(smem_v + row * KV_STRIDE)[col] = val;
+                // Store V TRANSPOSED: smem_v[d_col][kv_row] with VT_STRIDE
+                // Each uint4 = 8 consecutive halfs from V[kv_row][d_base..d_base+7]
+                // → scatter to smem_v[d_base+0][row], smem_v[d_base+1][row], ...
+                const half* vals = reinterpret_cast<const half*>(&val);
+                int d_base = col * 8;
+                #pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    smem_v[(d_base + i) * VT_STRIDE + row] = vals[i];
+                }
             }
         }
         __syncthreads();
@@ -435,13 +448,16 @@ __global__ void flash_attention_ptx_kernel(
                             smem_p + (mi * 16 + row) * P_STRIDE + ki * 16 + col);
                     }
 
-                    // Load V tile (B operand, transposed)
-                    // Same addressing fix as K: threads 8-15 offset by +8 rows
+                    // Load V tile (B operand, transposed layout in smem)
+                    // smem_v is [D_HEAD × VT_STRIDE] = [d_row × kv_col]
+                    // ldmatrix_x2_trans reads [d_row, kv_col] and transposes
+                    // to produce B[k=kv, n=d] — correct for O = P * V.
                     uint32_t b0, b1;
                     {
-                        int v_row = lane_id % 8 + ((lane_id / 8) % 2) * 8;
+                        int d_row = lane_id % 8;
+                        int mat   = (lane_id / 8) % 2;
                         ldmatrix_x2_trans(b0, b1,
-                            smem_v + (ki * 16 + v_row) * KV_STRIDE + di * 8);
+                            smem_v + (di * 8 + d_row) * VT_STRIDE + ki * 16 + mat * 8);
                     }
 
                     ptx_mma_m16n8k16(
@@ -518,10 +534,11 @@ void launch_flash_attention(const FlashAttentionParams& params) {
     if (params.d_head == 64) {
         constexpr int D_HEAD = 64;
         constexpr int SMEM_PAD = 8;
-        size_t smem_bytes = BLOCK_M * (D_HEAD + SMEM_PAD) * sizeof(half)
-                          + 2 * BLOCK_N * (D_HEAD + SMEM_PAD) * sizeof(half)
-                          + BLOCK_M * (BLOCK_N + SMEM_PAD) * sizeof(half)
-                          + 4 * BLOCK_M * sizeof(float);
+        size_t smem_bytes = BLOCK_M * (D_HEAD + SMEM_PAD) * sizeof(half)     // Q
+                          + BLOCK_N * (D_HEAD + SMEM_PAD) * sizeof(half)     // K
+                          + D_HEAD * (BLOCK_N + SMEM_PAD) * sizeof(half)     // V (transposed)
+                          + BLOCK_M * (BLOCK_N + SMEM_PAD) * sizeof(half)    // P
+                          + 4 * BLOCK_M * sizeof(float);                     // partial max/sum
 
         if (smem_bytes > 48 * 1024) {
             CUDA_CHECK(cudaFuncSetAttribute(
@@ -545,10 +562,11 @@ void launch_flash_attention(const FlashAttentionParams& params) {
     } else if (params.d_head == 128) {
         constexpr int D_HEAD = 128;
         constexpr int SMEM_PAD = 8;
-        size_t smem_bytes = BLOCK_M * (D_HEAD + SMEM_PAD) * sizeof(half)
-                          + 2 * BLOCK_N * (D_HEAD + SMEM_PAD) * sizeof(half)
-                          + BLOCK_M * (BLOCK_N + SMEM_PAD) * sizeof(half)
-                          + 4 * BLOCK_M * sizeof(float);
+        size_t smem_bytes = BLOCK_M * (D_HEAD + SMEM_PAD) * sizeof(half)     // Q
+                          + BLOCK_N * (D_HEAD + SMEM_PAD) * sizeof(half)     // K
+                          + D_HEAD * (BLOCK_N + SMEM_PAD) * sizeof(half)     // V (transposed)
+                          + BLOCK_M * (BLOCK_N + SMEM_PAD) * sizeof(half)    // P
+                          + 4 * BLOCK_M * sizeof(float);                     // partial max/sum
 
         // D_HEAD=128 needs ~67 KB smem — always opt-in
         CUDA_CHECK(cudaFuncSetAttribute(
