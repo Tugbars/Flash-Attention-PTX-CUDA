@@ -6,8 +6,8 @@
 <h1 align="center">Flash Attention PTX/CUDA</h1>
 
 <p align="center">
-  <strong>Hand-written PTX flash attention kernel achieving 136 TFLOPS on RTX 5080</strong><br>
-  58% of theoretical peak · 50× faster than scalar baseline · no WGMMA, no TMA, no shortcuts
+  <strong>Hand-written PTX flash attention kernel achieving 156 TFLOPS on RTX 5080</strong><br>
+  67% of theoretical peak · 58× faster than scalar baseline · no WGMMA, no TMA, no shortcuts
 </p>
 
 <p align="center">
@@ -22,7 +22,7 @@
 
 ## What is this?
 
-A from-scratch flash attention implementation in raw CUDA/PTX targeting consumer NVIDIA GPUs (RTX 5080, Blackwell sm_120). No libraries, no CUTLASS attention wrappers, no cuDNN — just hand-written kernels optimized step by step from 2.7 TFLOPS to 135.9 TFLOPS.
+A from-scratch flash attention implementation in raw CUDA/PTX targeting consumer NVIDIA GPUs (RTX 5080, Blackwell sm_120). No libraries, no CUTLASS attention wrappers, no cuDNN — just hand-written kernels optimized step by step from 2.7 TFLOPS to 156.4 TFLOPS.
 
 The kernel uses PTX inline assembly for `mma.sync.aligned.m16n8k16` tensor core operations with `ldmatrix` for optimal shared memory → register transfers, and performs the full softmax **in registers** using warp shuffle intrinsics, eliminating the largest shared memory bottleneck in standard flash attention implementations.
 
@@ -34,19 +34,21 @@ Consumer Blackwell (sm_120) lacks the datacenter features that make H100/B200 at
 <img width="1783" height="734" alt="performance" src="https://github.com/user-attachments/assets/547dfcc4-e5e4-4f27-b38f-8c3cf14751ca" />
 </p>
 
-**Peak: 135.9 TFLOPS** at B=4, H=12, S=2048, D=64 (causal attention).
+**Peak: 156.4 TFLOPS** at B=8, H=12, S=2048, D=64 (causal attention).
 
 | Config | TFLOPS | % Peak | Notes |
 |--------|-------:|-------:|-------|
-| B=1, S=512 | 34.7 | 14.8% | Low occupancy |
-| B=1, S=2048 | 101.4 | 43.2% | |
-| **B=4, S=2048** | **135.9** | **57.9%** | **Sweet spot** |
-| B=8, S=2048 | 118.6 | 50.5% | L2 pressure |
-| B=1, S=4096 | 128.3 | 54.6% | |
+| B=1, S=512 | 48.4 | 20.6% | Small-tile variant (auto-dispatched) |
+| B=1, S=2048 | 109.6 | 46.7% | |
+| B=4, S=2048 | 151.5 | 64.5% | |
+| **B=8, S=2048** | **156.4** | **66.6%** | **Sweet spot** |
+| B=1, S=4096 | 142.6 | 60.7% | |
 
 Measured on RTX 5080 (84 SMs, 234.8 TFLOPS FP16 theoretical peak).
 
-For context, Flash Attention 2 on the A100 (datacenter Ampere with dedicated TMA hardware) achieves approximately 60% tensor core utilization. This consumer Blackwell kernel reaches 58% without WGMMA, TMA, or warp specialization, using only tools available on consumer silicon.
+Under-saturated workloads (small batch × short sequence, e.g. B=1, S<1024) are auto-dispatched to a 32×64 / 4-warp tile variant that doubles the grid count and fills the SMs — same kernel template, smaller M-tile. See [Architecture](#architecture).
+
+For context, Flash Attention 2 on the A100 (datacenter Ampere) achieves approximately 60% tensor core utilization. This consumer Blackwell kernel reaches 67% without WGMMA, TMA, or warp specialization, using only tools available on consumer silicon.
 
 ### Optimization progression
 
@@ -59,7 +61,8 @@ Each version identified and eliminated a specific bottleneck. Every change was v
 | v6 — Vectorized loads | 38.3 | uint4 coalesced global memory access |
 | v7 — PTX MMA + ldmatrix | 49.2 | Known register layout, eliminated fragment opacity |
 | v8 — In-register softmax | 125.2 | Eliminated 16KB smem_s round-trip |
-| **v9 — Direct rescale** | **135.9** | **exp(S−new_max) directly, fewer critical-path ops** |
+| v9 — Direct rescale | 135.9 | exp(S−new_max) directly, fewer critical-path ops |
+| **v10 — cp.async loads** | **156.4** | **gmem→smem direct (no register staging), LSU freed for compute** |
 
 ### Profiler metrics (B=4, S=2048)
 
@@ -211,7 +214,7 @@ flash-attention-cuda/
 ├── include/
 │   └── flash_attention.h           # FlashAttentionParams struct + launch declaration
 ├── kernels/
-│   └── flash_attention.cu          # v9 kernel — the main event
+│   └── flash_attention.cu          # v10 kernel + tile-size dispatcher — the main event
 ├── src/
 │   └── demo.cu                     # standalone demo + correctness check
 ├── scripts/
@@ -227,15 +230,29 @@ flash-attention-cuda/
 
 ### Kernel parameters
 
-| Parameter | Value |
-|-----------|-------|
-| BLOCK_M | 64 |
-| BLOCK_N | 64 |
-| D_HEAD | 64 |
-| NUM_WARPS | 8 (4 warp pairs) |
-| Shared memory | ~38 KB |
-| MMA instruction | `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` |
-| Precision | FP16 compute, FP32 accumulation |
+| Parameter | Big tile | Small tile |
+|-----------|---------:|-----------:|
+| BLOCK_M | 64 | 32 |
+| BLOCK_N | 64 | 64 |
+| D_HEAD | 64 | 64 |
+| NUM_WARPS | 8 (4 warp pairs) | 4 (2 warp pairs) |
+| Shared memory | ~37 KB | ~28 KB |
+| MMA instruction | `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` | (same) |
+| Precision | FP16 compute, FP32 accumulation | (same) |
+
+### Tile-size dispatcher
+
+Both variants are the same kernel template — only `BLOCK_M` and `NUM_WARPS` differ. The kernel's warp partitioning (`warp_pair = warp_id/2 = mi`, `warp_half = warp_id%2`) generalizes to either NUM_WARPS=4 (2 warp pairs, 2 m-tiles) or NUM_WARPS=8 (4 warp pairs, 4 m-tiles).
+
+The host launch picks at runtime based on whether the workload saturates the GPU:
+
+```cpp
+num_blocks_big = B * H * ceil(S / 64);
+if (num_blocks_big < 2 * sm_count)  → small tile (32×64, 4 warps)
+else                                 → big tile (64×64, 8 warps)
+```
+
+The small variant wins on under-saturated workloads (B=1, S<1024 on the RTX 5080) by halving BLOCK_M and doubling the grid count, which fills the SMs that the big-tile grid would leave idle. On B=1, S=512 this is +32% over the big tile (36.7 → 48.4 TFLOPS). On saturated workloads the big tile wins by amortizing per-block overhead, so it stays the production path for everything except the smallest configs.
 
 ### Shared memory layout
 
