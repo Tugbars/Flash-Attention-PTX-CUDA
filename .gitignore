@@ -1,2 +1,6 @@
 /build
 /.cache
+scripts/deepseek-r1-1.5b.forge
+scripts/deepseek-r1-1.5b.forge.vocab
+docs/offline_language_learning_plan.md
+.claude/settings.json

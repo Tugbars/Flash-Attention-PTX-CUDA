@@ -84,6 +84,32 @@ __device__ __forceinline__ void ldmatrix_x2_trans(
         : "=r"(r0), "=r"(r1) : "r"(addr));
 }
 
+// 16-byte async copy gmem->smem. Bypasses registers entirely and does not
+// block the warp; completion is signalled later via cp.async.wait_group.
+// When `pred` is false, src_size=0 zero-fills the 16-byte destination, which
+// matches the previous OOB behaviour (uint4{0,0,0,0}).
+__device__ __forceinline__ void cp_async_16(
+    void* smem_dst, const void* gmem_src, bool pred)
+{
+    uint32_t smem_int = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
+    int src_size = pred ? 16 : 0;
+    asm volatile(
+        "cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+        :: "r"(smem_int), "l"(gmem_src), "r"(src_size));
+}
+
+__device__ __forceinline__ void cp_async_commit_group()
+{
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+// Wait until at most N committed cp.async groups are still in flight.
+template <int N>
+__device__ __forceinline__ void cp_async_wait_group()
+{
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+}
+
 // ============================================================================
 // Kernel
 // ============================================================================
@@ -189,27 +215,35 @@ __global__ void flash_attention_ptx_kernel(
         const int kv_count = min(BLOCK_N, seq_len - kv_start);
 
         // ================================================================
-        // Load K and V tiles from global memory → shared memory
-        // All 256 threads participate via 128-bit coalesced loads.
+        // Load K and V tiles from global memory → shared memory via cp.async.
+        //
+        // cp.async streams bytes directly gmem→smem without staging through
+        // registers, frees the LSU for compute, and lets us batch the K+V
+        // loads behind a single wait_group. OOB rows use src_size=0 which
+        // zero-fills the destination (matches the prior uint4{0,0,0,0} path).
         // ================================================================
         {
             constexpr int VEC_COLS = D_HEAD / 8;
             for (int idx = tid; idx < BLOCK_N * VEC_COLS; idx += THREADS) {
                 int row = idx / VEC_COLS, col = idx % VEC_COLS;
                 int g = kv_start + row;
-                uint4 val = (g < seq_len && row < kv_count)
-                    ? reinterpret_cast<const uint4*>(K_head + g * D_HEAD)[col]
-                    : make_uint4(0, 0, 0, 0);
-                reinterpret_cast<uint4*>(smem_k + row * KV_STRIDE)[col] = val;
+                bool valid = (g < seq_len) && (row < kv_count);
+                cp_async_16(
+                    reinterpret_cast<uint4*>(smem_k + row * KV_STRIDE) + col,
+                    reinterpret_cast<const uint4*>(K_head + g * D_HEAD) + col,
+                    valid);
             }
             for (int idx = tid; idx < BLOCK_N * VEC_COLS; idx += THREADS) {
                 int row = idx / VEC_COLS, col = idx % VEC_COLS;
                 int g = kv_start + row;
-                uint4 val = (g < seq_len && row < kv_count)
-                    ? reinterpret_cast<const uint4*>(V_head + g * D_HEAD)[col]
-                    : make_uint4(0, 0, 0, 0);
-                reinterpret_cast<uint4*>(smem_v + row * KV_STRIDE)[col] = val;
+                bool valid = (g < seq_len) && (row < kv_count);
+                cp_async_16(
+                    reinterpret_cast<uint4*>(smem_v + row * KV_STRIDE) + col,
+                    reinterpret_cast<const uint4*>(V_head + g * D_HEAD) + col,
+                    valid);
             }
+            cp_async_commit_group();
+            cp_async_wait_group<0>();
         }
         __syncthreads();
 
