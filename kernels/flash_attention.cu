@@ -36,7 +36,6 @@
 #include <cuda_runtime.h>
 #include <type_traits>
 
-
 namespace transformer {
 
 static constexpr int WARP_SIZE_FA = 32;
@@ -67,7 +66,8 @@ __device__ __forceinline__ __nv_bfloat16 to_elem<__nv_bfloat16>(float x) {
   return __float2bfloat16(x);
 }
 
-// m16n8k16 MMA, templated on the input element type. Only the PTX opcode differs
+// m16n8k16 MMA, templated on the input element type. Only the PTX opcode
+// differs
 // (.f16.f16 vs .bf16.bf16) — operands are the same uint32 register pairs loaded
 // by ldmatrix, accumulation is always FP32.
 template <class T>
@@ -187,8 +187,7 @@ __global__ void flash_attention_ptx_kernel(
   T *smem_q = reinterpret_cast<T *>(smem_raw);
   T *smem_k = smem_q + BLOCK_M * Q_STRIDE;
   T *smem_v = smem_k + BLOCK_N * KV_STRIDE;
-  T *smem_p =
-      smem_k; // alias onto K (see note above): saves 9 KB, +1 block/SM
+  T *smem_p = smem_k; // alias onto K (see note above): saves 9 KB, +1 block/SM
   float *smem_partial_max =
       reinterpret_cast<float *>(smem_v + BLOCK_N * KV_STRIDE);
   float *smem_partial_sum = smem_partial_max + 2 * BLOCK_M;
@@ -342,10 +341,10 @@ __global__ void flash_attention_ptx_kernel(
                                   mat * 8);
           }
 
-          ptx_mma_m16n8k16<T>(s_acc[ni_local][0], s_acc[ni_local][1],
-                           s_acc[ni_local][2], s_acc[ni_local][3], a0, a1, a2,
-                           a3, b0, b1, s_acc[ni_local][0], s_acc[ni_local][1],
-                           s_acc[ni_local][2], s_acc[ni_local][3]);
+          ptx_mma_m16n8k16<T>(
+              s_acc[ni_local][0], s_acc[ni_local][1], s_acc[ni_local][2],
+              s_acc[ni_local][3], a0, a1, a2, a3, b0, b1, s_acc[ni_local][0],
+              s_acc[ni_local][1], s_acc[ni_local][2], s_acc[ni_local][3]);
         }
 
         // Apply scale and causal mask directly in registers
@@ -539,10 +538,10 @@ __global__ void flash_attention_ptx_kernel(
                               smem_v + (ki * 16 + v_row) * KV_STRIDE + di * 8);
           }
 
-          ptx_mma_m16n8k16<T>(o_acc[di_local][0], o_acc[di_local][1],
-                           o_acc[di_local][2], o_acc[di_local][3], a0, a1, a2,
-                           a3, b0, b1, o_acc[di_local][0], o_acc[di_local][1],
-                           o_acc[di_local][2], o_acc[di_local][3]);
+          ptx_mma_m16n8k16<T>(
+              o_acc[di_local][0], o_acc[di_local][1], o_acc[di_local][2],
+              o_acc[di_local][3], a0, a1, a2, a3, b0, b1, o_acc[di_local][0],
+              o_acc[di_local][1], o_acc[di_local][2], o_acc[di_local][3]);
         }
       }
     }
@@ -734,12 +733,16 @@ void launch_flash_attention(const FlashAttentionParams &params) {
   const bool bf16 = (params.dtype == DType::BF16);
   switch (params.d_head) {
   case 64:
-    if (bf16) dispatch_by_saturation<__nv_bfloat16, 64>(params);
-    else      dispatch_by_saturation<half, 64>(params);
+    if (bf16)
+      dispatch_by_saturation<__nv_bfloat16, 64>(params);
+    else
+      dispatch_by_saturation<half, 64>(params);
     break;
   case 128:
-    if (bf16) dispatch_by_saturation<__nv_bfloat16, 128>(params);
-    else      dispatch_by_saturation<half, 128>(params);
+    if (bf16)
+      dispatch_by_saturation<__nv_bfloat16, 128>(params);
+    else
+      dispatch_by_saturation<half, 128>(params);
     break;
   default:
     fprintf(stderr, "flash_attention: unsupported d_head=%d (tuned: 64, 128)\n",

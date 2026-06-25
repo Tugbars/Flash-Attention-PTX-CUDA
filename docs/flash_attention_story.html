@@ -1,1258 +1,732 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Flash Attention on RTX 5080 — From 3 to 136 TFLOPS</title>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Instrument+Serif&family=DM+Sans:wght@300;400;500;700&display=swap" rel="stylesheet">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flash Attention on the RTX 5080 — hand-written PTX</title>
 <style>
-:root {
-  --bg: #0a0a0f;
-  --bg2: #12121a;
-  --fg: #e8e6e1;
-  --dim: #6b6878;
-  --accent: #00ff88;
-  --accent2: #ff6b35;
-  --accent3: #4ecdc4;
-  --hot: #ff2d55;
-  --gold: #ffd700;
-  --mono: 'JetBrains Mono', monospace;
-  --serif: 'Instrument Serif', serif;
-  --sans: 'DM Sans', sans-serif;
-}
-
-* { margin: 0; padding: 0; box-sizing: border-box; }
-
-html { scroll-behavior: smooth; }
-
-body {
-  background: var(--bg);
-  color: var(--fg);
-  font-family: var(--sans);
-  line-height: 1.7;
-  overflow-x: hidden;
-}
-
-::selection {
-  background: var(--accent);
-  color: var(--bg);
-}
-
-/* =================== HERO =================== */
-.hero {
-  min-height: 100vh;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  align-items: center;
-  position: relative;
-  overflow: hidden;
-  padding: 2rem;
-}
-
-.hero::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background:
-    radial-gradient(ellipse 80% 50% at 50% 0%, rgba(0,255,136,0.08) 0%, transparent 60%),
-    radial-gradient(ellipse 60% 40% at 80% 80%, rgba(255,107,53,0.06) 0%, transparent 50%);
-  pointer-events: none;
-}
-
-.hero-grid {
-  position: absolute;
-  inset: 0;
-  background-image:
-    linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
-  background-size: 60px 60px;
-  mask-image: radial-gradient(ellipse at center, black 30%, transparent 70%);
-  animation: gridPulse 8s ease-in-out infinite;
-}
-
-@keyframes gridPulse {
-  0%, 100% { opacity: 0.4; }
-  50% { opacity: 0.8; }
-}
-
-.hero-chip {
-  font-family: var(--mono);
-  font-size: 0.75rem;
-  letter-spacing: 0.2em;
-  text-transform: uppercase;
-  color: var(--accent);
-  border: 1px solid rgba(0,255,136,0.3);
-  padding: 0.4rem 1.2rem;
-  border-radius: 100px;
-  margin-bottom: 2rem;
-  animation: fadeSlideUp 1s ease-out 0.2s both;
-}
-
-.hero h1 {
-  font-family: var(--serif);
-  font-size: clamp(3rem, 8vw, 7rem);
-  line-height: 1.05;
-  text-align: center;
-  max-width: 900px;
-  animation: fadeSlideUp 1s ease-out 0.4s both;
-}
-
-.hero h1 .num {
-  font-family: var(--mono);
-  font-weight: 700;
-  background: linear-gradient(135deg, var(--accent), var(--accent3));
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-}
-
-.hero-sub {
-  font-size: 1.2rem;
-  color: var(--dim);
-  margin-top: 1.5rem;
-  text-align: center;
-  max-width: 600px;
-  animation: fadeSlideUp 1s ease-out 0.6s both;
-}
-
-.hero-stats {
-  display: flex;
-  gap: 3rem;
-  margin-top: 3rem;
-  animation: fadeSlideUp 1s ease-out 0.8s both;
-}
-
-.hero-stat {
-  text-align: center;
-}
-
-.hero-stat .val {
-  font-family: var(--mono);
-  font-size: 2.5rem;
-  font-weight: 700;
-  color: var(--accent);
-}
-
-.hero-stat .label {
-  font-size: 0.8rem;
-  color: var(--dim);
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  margin-top: 0.25rem;
-}
-
-.scroll-hint {
-  position: absolute;
-  bottom: 2rem;
-  animation: bounce 2s ease-in-out infinite;
-  color: var(--dim);
-  font-size: 0.8rem;
-  letter-spacing: 0.15em;
-  text-transform: uppercase;
-}
-
-@keyframes bounce {
-  0%, 100% { transform: translateY(0); }
-  50% { transform: translateY(8px); }
-}
-
-@keyframes fadeSlideUp {
-  from { opacity: 0; transform: translateY(30px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-
-/* =================== SECTIONS =================== */
-section {
-  max-width: 1100px;
-  margin: 0 auto;
-  padding: 6rem 2rem;
-}
-
-.section-label {
-  font-family: var(--mono);
-  font-size: 0.7rem;
-  letter-spacing: 0.25em;
-  text-transform: uppercase;
-  color: var(--accent);
-  margin-bottom: 1rem;
-}
-
-h2 {
-  font-family: var(--serif);
-  font-size: clamp(2rem, 4vw, 3.5rem);
-  line-height: 1.15;
-  margin-bottom: 1.5rem;
-}
-
-p.body-text {
-  color: var(--dim);
-  font-size: 1.05rem;
-  max-width: 680px;
-  margin-bottom: 1.5rem;
-}
-
-/* =================== TIMELINE =================== */
-.timeline {
-  position: relative;
-  margin-top: 3rem;
-}
-
-.timeline::before {
-  content: '';
-  position: absolute;
-  left: 24px;
-  top: 0;
-  bottom: 0;
-  width: 2px;
-  background: linear-gradient(to bottom, var(--accent), var(--accent2), var(--hot));
-}
-
-.timeline-item {
-  position: relative;
-  padding-left: 64px;
-  padding-bottom: 4rem;
-  opacity: 0;
-  transform: translateX(-20px);
-  transition: all 0.6s cubic-bezier(0.16, 1, 0.3, 1);
-}
-
-.timeline-item.visible {
-  opacity: 1;
-  transform: translateX(0);
-}
-
-.timeline-dot {
-  position: absolute;
-  left: 14px;
-  top: 4px;
-  width: 22px;
-  height: 22px;
-  border-radius: 50%;
-  border: 2px solid var(--accent);
-  background: var(--bg);
-  z-index: 1;
-  transition: all 0.3s;
-}
-
-.timeline-item.visible .timeline-dot {
-  background: var(--accent);
-  box-shadow: 0 0 20px rgba(0,255,136,0.4);
-}
-
-.timeline-version {
-  font-family: var(--mono);
-  font-size: 0.75rem;
-  color: var(--accent);
-  letter-spacing: 0.1em;
-  margin-bottom: 0.3rem;
-}
-
-.timeline-title {
-  font-family: var(--serif);
-  font-size: 1.6rem;
-  margin-bottom: 0.5rem;
-}
-
-.timeline-desc {
-  color: var(--dim);
-  font-size: 0.95rem;
-  max-width: 550px;
-  margin-bottom: 1rem;
-}
-
-.timeline-perf {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.75rem;
-  background: rgba(0,255,136,0.08);
-  border: 1px solid rgba(0,255,136,0.2);
-  border-radius: 8px;
-  padding: 0.5rem 1rem;
-  font-family: var(--mono);
-  font-size: 0.9rem;
-}
-
-.timeline-perf .tflops {
-  color: var(--accent);
-  font-weight: 700;
-  font-size: 1.1rem;
-}
-
-/* =================== PERF BAR CHART =================== */
-.perf-chart {
-  margin-top: 3rem;
-  display: flex;
-  flex-direction: column;
-  gap: 1rem;
-}
-
-.perf-row {
-  display: grid;
-  grid-template-columns: 180px 1fr 80px;
-  align-items: center;
-  gap: 1rem;
-}
-
-.perf-label {
-  font-family: var(--mono);
-  font-size: 0.8rem;
-  color: var(--dim);
-  text-align: right;
-}
-
-.perf-bar-bg {
-  height: 32px;
-  background: rgba(255,255,255,0.03);
-  border-radius: 4px;
-  overflow: hidden;
-  position: relative;
-}
-
-.perf-bar {
-  height: 100%;
-  border-radius: 4px;
-  width: 0%;
-  transition: width 1.5s cubic-bezier(0.16, 1, 0.3, 1);
-  position: relative;
-}
-
-.perf-bar::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.15) 100%);
-}
-
-.perf-val {
-  font-family: var(--mono);
-  font-size: 0.9rem;
-  font-weight: 700;
-  color: var(--fg);
-}
-
-/* =================== CONCEPT CARDS =================== */
-.concept-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-  gap: 1.5rem;
-  margin-top: 2rem;
-}
-
-.concept-card {
-  background: var(--bg2);
-  border: 1px solid rgba(255,255,255,0.06);
-  border-radius: 12px;
-  padding: 2rem;
-  position: relative;
-  overflow: hidden;
-  transition: all 0.4s;
-}
-
-.concept-card:hover {
-  border-color: rgba(0,255,136,0.3);
-  transform: translateY(-4px);
-  box-shadow: 0 12px 40px rgba(0,0,0,0.4);
-}
-
-.concept-card .icon {
-  font-size: 2rem;
-  margin-bottom: 1rem;
-}
-
-.concept-card h3 {
-  font-family: var(--serif);
-  font-size: 1.3rem;
-  margin-bottom: 0.75rem;
-}
-
-.concept-card p {
-  color: var(--dim);
-  font-size: 0.9rem;
-  line-height: 1.6;
-}
-
-/* =================== ANIMATED DIAGRAM =================== */
-.diagram-wrapper {
-  margin: 3rem 0;
-  padding: 2rem;
-  background: var(--bg2);
-  border: 1px solid rgba(255,255,255,0.06);
-  border-radius: 16px;
-  overflow-x: auto;
-}
-
-.diagram-title {
-  font-family: var(--mono);
-  font-size: 0.75rem;
-  color: var(--accent);
-  letter-spacing: 0.15em;
-  text-transform: uppercase;
-  margin-bottom: 1.5rem;
-}
-
-.smem-layout {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-family: var(--mono);
-  font-size: 0.7rem;
-}
-
-.smem-block {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-}
-
-.smem-label {
-  width: 80px;
-  text-align: right;
-  color: var(--dim);
-  font-size: 0.7rem;
-}
-
-.smem-bar {
-  height: 28px;
-  border-radius: 4px;
-  display: flex;
-  align-items: center;
-  padding-left: 10px;
-  color: var(--bg);
-  font-weight: 600;
-  font-size: 0.7rem;
-  transition: width 1s cubic-bezier(0.16, 1, 0.3, 1);
-}
-
-/* =================== CODE BLOCK =================== */
-.code-block {
-  background: #0d0d14;
-  border: 1px solid rgba(255,255,255,0.06);
-  border-radius: 12px;
-  padding: 1.5rem;
-  margin: 1.5rem 0;
-  overflow-x: auto;
-  position: relative;
-}
-
-.code-block::before {
-  content: attr(data-lang);
-  position: absolute;
-  top: 0.75rem;
-  right: 1rem;
-  font-family: var(--mono);
-  font-size: 0.65rem;
-  color: var(--dim);
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-}
-
-.code-block code {
-  font-family: var(--mono);
-  font-size: 0.8rem;
-  line-height: 1.8;
-  color: #c8c5be;
-}
-
-.code-block .kw { color: #ff7eb6; }
-.code-block .fn { color: #78dce8; }
-.code-block .cm { color: #5a5870; }
-.code-block .st { color: #a9dc76; }
-.code-block .num { color: #ffd866; }
-.code-block .acc { color: #00ff88; }
-
-/* =================== WARP DIAGRAM =================== */
-.warp-visual {
-  display: grid;
-  grid-template-columns: repeat(8, 1fr);
-  gap: 3px;
-  margin: 1.5rem 0;
-  max-width: 500px;
-}
-
-.warp-cell {
-  aspect-ratio: 1;
-  border-radius: 3px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-family: var(--mono);
-  font-size: 0.55rem;
-  color: var(--bg);
-  font-weight: 600;
-  opacity: 0;
-  animation: cellFadeIn 0.3s ease-out forwards;
-}
-
-/* =================== PROFILE TABLE =================== */
-.profile-table {
-  width: 100%;
-  border-collapse: collapse;
-  margin: 2rem 0;
-  font-family: var(--mono);
-  font-size: 0.85rem;
-}
-
-.profile-table th {
-  text-align: left;
-  padding: 0.75rem 1rem;
-  border-bottom: 2px solid rgba(255,255,255,0.1);
-  color: var(--dim);
-  font-weight: 400;
-  font-size: 0.7rem;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-}
-
-.profile-table td {
-  padding: 0.75rem 1rem;
-  border-bottom: 1px solid rgba(255,255,255,0.04);
-}
-
-.profile-table .highlight {
-  color: var(--accent);
-  font-weight: 700;
-}
-
-.profile-table .hot { color: var(--hot); }
-.profile-table .warm { color: var(--accent2); }
-
-/* =================== REGISTER ANIMATION =================== */
-.reg-flow {
-  display: flex;
-  align-items: center;
-  gap: 1rem;
-  margin: 2rem 0;
-  flex-wrap: wrap;
-  justify-content: center;
-}
-
-.reg-box {
-  padding: 0.75rem 1.25rem;
-  border-radius: 8px;
-  font-family: var(--mono);
-  font-size: 0.8rem;
-  font-weight: 600;
-  text-align: center;
-  min-width: 100px;
-  position: relative;
-}
-
-.reg-arrow {
-  color: var(--dim);
-  font-size: 1.5rem;
-  animation: arrowPulse 1.5s ease-in-out infinite;
-}
-
-@keyframes arrowPulse {
-  0%, 100% { opacity: 0.4; }
-  50% { opacity: 1; color: var(--accent); }
-}
-
-@keyframes cellFadeIn {
-  from { opacity: 0; transform: scale(0.8); }
-  to { opacity: 1; transform: scale(1); }
-}
-
-/* =================== COMPARISON STRIP =================== */
-.comparison {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 2rem;
-  margin: 2rem 0;
-}
-
-.comp-side {
-  padding: 2rem;
-  border-radius: 12px;
-  border: 1px solid rgba(255,255,255,0.06);
-}
-
-.comp-side.before {
-  background: rgba(255,45,85,0.05);
-  border-color: rgba(255,45,85,0.2);
-}
-
-.comp-side.after {
-  background: rgba(0,255,136,0.05);
-  border-color: rgba(0,255,136,0.2);
-}
-
-.comp-side h4 {
-  font-family: var(--mono);
-  font-size: 0.7rem;
-  letter-spacing: 0.15em;
-  text-transform: uppercase;
-  margin-bottom: 1rem;
-}
-
-.comp-side.before h4 { color: var(--hot); }
-.comp-side.after h4 { color: var(--accent); }
-
-.comp-side ul {
-  list-style: none;
-  color: var(--dim);
-  font-size: 0.9rem;
-}
-
-.comp-side ul li {
-  padding: 0.3rem 0;
-  padding-left: 1.2rem;
-  position: relative;
-}
-
-.comp-side ul li::before {
-  content: '×';
-  position: absolute;
-  left: 0;
-  color: var(--hot);
-  font-weight: 700;
-}
-
-.comp-side.after ul li::before {
-  content: '✓';
-  color: var(--accent);
-}
-
-/* =================== FOOTER =================== */
-.footer {
-  text-align: center;
-  padding: 4rem 2rem;
-  color: var(--dim);
-  font-size: 0.85rem;
-  border-top: 1px solid rgba(255,255,255,0.04);
-}
-
-.footer .big-num {
-  font-family: var(--mono);
-  font-size: clamp(4rem, 10vw, 8rem);
-  font-weight: 700;
-  background: linear-gradient(135deg, var(--accent), var(--accent3), var(--accent2));
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  line-height: 1;
-  margin-bottom: 1rem;
-}
-
-/* =================== RESPONSIVE =================== */
-@media (max-width: 768px) {
-  .hero-stats { flex-direction: column; gap: 1.5rem; }
-  .perf-row { grid-template-columns: 100px 1fr 60px; }
-  .comparison { grid-template-columns: 1fr; }
-  .concept-grid { grid-template-columns: 1fr; }
-}
+  :root{
+    --ink:#1c1c1a; --muted:#6c6b64; --faint:#8a8980;
+    --bg:#fbfbf8; --panel:#f5f4ee; --rule:#e5e4dd; --rule2:#d2d1c8;
+    --accent:#1f5f9e; --win:#1c7d4d; --loss:#b23b39;
+    --serif: Charter,"Bitstream Charter","Palatino Linotype","Book Antiqua",Palatino,Georgia,serif;
+    --sans: system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:"SF Mono","JetBrains Mono","Cascadia Mono",ui-monospace,Consolas,"Liberation Mono",monospace;
+  }
+  *{box-sizing:border-box;}
+  html{-webkit-text-size-adjust:100%;}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--serif);
+       font-size:19px;line-height:1.66;text-rendering:optimizeLegibility;
+       -webkit-font-smoothing:antialiased;}
+  .wrap{max-width:744px;margin:0 auto;padding:60px 24px 120px;}
+
+  header.doc{border-bottom:1px solid var(--rule2);padding-bottom:26px;margin-bottom:36px;}
+  .eyebrow{font-family:var(--sans);font-size:.72rem;letter-spacing:.13em;text-transform:uppercase;
+           color:var(--accent);font-weight:600;margin-bottom:14px;}
+  h1{font-size:2.05rem;line-height:1.18;font-weight:700;letter-spacing:-.012em;margin:0 0 14px;}
+  .subtitle{font-size:1.12rem;color:var(--muted);font-style:italic;margin:0 0 20px;line-height:1.5;}
+  .meta{font-family:var(--sans);font-size:.78rem;letter-spacing:.02em;color:var(--faint);}
+  .meta span{color:var(--muted);}
+
+  .abstract{font-size:.98rem;color:#37362f;background:var(--panel);border:1px solid var(--rule);
+            border-radius:6px;padding:18px 22px;margin:0 0 8px;line-height:1.6;}
+
+  h2{font-size:1.42rem;font-weight:700;letter-spacing:-.01em;margin:58px 0 14px;line-height:1.25;}
+  h2 .no{font-family:var(--sans);font-size:.72em;font-weight:600;color:var(--accent);margin-right:.55em;
+         vertical-align:.06em;}
+  h3{font-size:1.06rem;font-weight:700;margin:30px 0 8px;}
+  p{margin:0 0 18px;}
+  a{color:var(--accent);text-decoration:none;border-bottom:1px solid rgba(31,95,158,.32);}
+  a:hover{border-bottom-color:var(--accent);}
+  em{font-style:italic;}
+  strong{font-weight:700;}
+
+  code{font-family:var(--mono);font-size:.84em;background:#eeede6;padding:1px 5px;border-radius:3px;
+       color:#33322b;}
+  pre{font-family:var(--mono);font-size:.8rem;line-height:1.55;background:#f7f6f0;border:1px solid var(--rule);
+      border-left:3px solid var(--accent);border-radius:5px;padding:15px 17px;overflow-x:auto;margin:0 0 22px;
+      color:#33322b;}
+  pre code{background:none;padding:0;font-size:1em;color:inherit;}
+  pre .c{color:#9a9a8c;}      /* comment */
+  pre .k{color:#9b4a16;}      /* keyword/op highlight */
+
+  table{width:100%;border-collapse:collapse;font-family:var(--sans);font-size:.82rem;margin:6px 0 26px;}
+  caption{caption-side:bottom;font-family:var(--sans);font-size:.74rem;color:var(--faint);
+          text-align:left;padding-top:8px;line-height:1.45;}
+  th,td{text-align:left;padding:7px 11px;border-bottom:1px solid var(--rule);vertical-align:baseline;}
+  thead th{font-weight:600;color:var(--muted);border-bottom:1.5px solid var(--rule2);}
+  .num{text-align:right;font-variant-numeric:tabular-nums;}
+  tr.hi td{background:#f3f7fb;font-weight:600;}
+  .win{color:var(--win);font-weight:600;} .loss{color:var(--loss);font-weight:600;}
+  .mono{font-family:var(--mono);}
+
+  .note{border-left:3px solid var(--rule2);padding:2px 0 2px 18px;margin:0 0 20px;color:var(--muted);
+        font-size:.96rem;}
+
+  /* diagrams */
+  figure.fig{margin:14px 0 26px;}
+  figure.fig svg{width:100%;height:auto;display:block;background:#fff;border:1px solid var(--rule);border-radius:6px;}
+  figure.fig figcaption{font-family:var(--sans);font-size:.74rem;color:var(--faint);padding-top:9px;line-height:1.5;}
+  svg .bx{fill:var(--panel);stroke:var(--rule2);stroke-width:1;}
+  svg .bx-a{fill:#e9f1fa;stroke:var(--accent);stroke-width:1.3;}
+  svg .bx-g{fill:#e7f4ed;stroke:#3a9a63;stroke-width:1.3;}
+  svg .bx-r{fill:#fcebe9;stroke:#cf6b66;stroke-width:1.3;}
+  svg .bx-w{fill:#fbf2db;stroke:#c2912f;stroke-width:1.3;}
+  svg .bx-d{fill:#f3f2ec;stroke:var(--rule2);stroke-width:1;stroke-dasharray:4 3;}
+  svg text{font-family:var(--sans);font-size:12.5px;fill:var(--ink);}
+  svg .mn{font-family:var(--mono);}
+  svg .sub{fill:var(--muted);font-size:10.5px;}
+  svg .cap{fill:var(--faint);font-size:10px;letter-spacing:.06em;text-transform:uppercase;}
+  svg .ln{stroke:#6c6b64;stroke-width:1.4;fill:none;}
+  svg .lnd{stroke:#c9c8be;stroke-width:1.1;stroke-dasharray:4 4;fill:none;}
+  svg .acc{fill:var(--accent);} svg .gd{fill:#c2912f;} svg .gr{fill:#3a9a63;} svg .rd{fill:#cf6b66;}
+
+  /* memory/register reference card */
+  .ref{margin:18px 0 30px;}
+  .ref h3.refh{font-family:var(--sans);font-size:1.04rem;font-weight:700;margin:0 0 2px;}
+  .ref .refsub{font-family:var(--sans);font-size:.82rem;color:var(--muted);margin:0 0 16px;}
+  .tier{border:1px solid var(--rule2);border-radius:8px;padding:15px 15px 15px;margin:0 0 13px;background:#fcfcf9;}
+  .tier .th{font-family:var(--sans);font-size:.92rem;font-weight:700;margin:0 0 1px;}
+  .tier .ts{font-family:var(--sans);font-size:.76rem;color:var(--muted);margin:0 0 13px;}
+  .cards{display:grid;grid-template-columns:repeat(4,1fr);gap:9px;}
+  .card{border:1px solid;border-radius:6px;padding:9px 11px;font-family:var(--sans);font-size:.735rem;
+        line-height:1.42;color:#3a392f;}
+  .card .nm{font-family:var(--mono);font-weight:700;font-size:.84rem;display:block;margin:0 0 5px;}
+  .card .sz{display:block;margin-top:6px;font-weight:600;}
+  .card.wide{grid-column:1 / -1;}
+  .c-teal{background:#e9f4ef;border-color:#54a888;}   .c-teal   .nm{color:#1f6f56;}  .c-teal .sz{color:#1f6f56;}
+  .c-coral{background:#fcecea;border-color:#d57a74;}  .c-coral  .nm{color:#a6433d;}  .c-coral .sz{color:#a6433d;}
+  .c-amber{background:#fbf2da;border-color:#cc9b3c;}  .c-amber  .nm{color:#8a6512;}  .c-amber .sz{color:#8a6512;}
+  .c-pink{background:#fbe8f0;border-color:#cf6594;}   .c-pink   .nm{color:#9c2f5e;}  .c-pink .sz{color:#9c2f5e;}
+  .c-purple{background:#edeafb;border-color:#8169c9;} .c-purple .nm{color:#523c9b;}  .c-purple .sz{color:#523c9b;}
+  .legend{display:grid;grid-template-columns:repeat(2,1fr);gap:5px 22px;font-family:var(--sans);
+          font-size:.78rem;color:var(--muted);margin-top:4px;}
+  .legend .sw{display:inline-block;width:11px;height:11px;border-radius:3px;border:1px solid;
+              margin-right:9px;vertical-align:-1px;}
+  @media(max-width:600px){.cards{grid-template-columns:repeat(2,1fr);} .legend{grid-template-columns:1fr;}}
+  hr{border:0;border-top:1px solid var(--rule);margin:0;}
+  ul{margin:0 0 18px;padding-left:22px;} li{margin:0 0 6px;}
+
+  footer{margin-top:70px;padding-top:22px;border-top:1px solid var(--rule2);
+         font-family:var(--sans);font-size:.8rem;color:var(--faint);line-height:1.6;}
+  footer a{color:var(--muted);}
+  @media(max-width:600px){ body{font-size:17px;} .wrap{padding:40px 18px 80px;} h1{font-size:1.7rem;} }
 </style>
 </head>
 <body>
+<div class="wrap">
 
-<!-- ===================== HERO ===================== -->
-<div class="hero">
-  <div class="hero-grid"></div>
-  <div class="hero-chip">RTX 5080 · sm_120 · Consumer Blackwell</div>
-  <h1>From <span class="num">3</span> to <span class="num">136</span> TFLOPS</h1>
-  <p class="hero-sub">
-    Hand-writing a Flash Attention kernel in raw PTX assembly, eliminating shared memory bottlenecks, and achieving 58% of theoretical peak on consumer hardware.
-  </p>
-  <div class="hero-stats">
-    <div class="hero-stat">
-      <div class="val">50×</div>
-      <div class="label">Total Speedup</div>
-    </div>
-    <div class="hero-stat">
-      <div class="val">58%</div>
-      <div class="label">Peak Utilization</div>
-    </div>
-    <div class="hero-stat">
-      <div class="val">135.9</div>
-      <div class="label">TFLOPS FP16</div>
-    </div>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="arr" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#6c6b64"/></marker>
+  <marker id="arrA" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#1f5f9e"/></marker>
+</defs></svg>
+
+<header class="doc">
+  <div class="eyebrow">RTX 5080 · sm_120 · consumer Blackwell</div>
+  <h1>Flash Attention on a GPU without datacenter features</h1>
+  <p class="subtitle">A hand-written PTX kernel taken from 2.7 to ~183 TFLOPS — and an honest log of what worked, what didn't, and why.</p>
+  <div class="meta"><span>FP16/BF16 · MHA &amp; GQA · D = 64 / 128 · prefill + decode</span></div>
+</header>
+
+<p class="abstract">
+A from-scratch flash-attention implementation in raw CUDA/PTX for the RTX 5080
+(sm_120). Consumer Blackwell lacks the features that make H100/B200 attention
+fast — <strong>no WGMMA, no TMA, no tcgen05/TMEM</strong> — so this kernel reaches
+competitive utilization with only <code>mma.sync</code>, <code>ldmatrix</code>, and
+<code>cp.async</code>. Optimized step by step from a 2.7-TFLOPS scalar baseline to
+<strong>~170 TFLOPS at the B=8, S=2048 sweet spot and ~183 TFLOPS peak</strong>
+(≈78% of the 234.8-TFLOPS FP16 roofline), it runs <strong>~1.7× faster than the
+CUTLASS attention that actually compiles for this GPU</strong>. The most useful
+result is the catalogue of optimizations that <em>didn't</em> help — and the one
+property that explains all of them.
+</p>
+
+<h2><span class="no">1</span>The shape of the problem</h2>
+<p>
+Attention has two matmuls with a softmax wedged between them:
+<code>S = Q·Kᵀ</code>, then <code>softmax(S)</code>, then <code>O = P·V</code>.
+The matmuls love tensor cores; the softmax does not. On every KV tile the tensor
+cores go idle while the softmax runs its exponentials, cross-warp reductions, and
+barriers. That bubble — not raw FLOPs — is what a good attention kernel fights.
+</p>
+<figure class="fig"><svg viewBox="0 0 700 150" role="img" aria-label="The softmax bubble">
+  <text x="22" y="26" class="cap">one KV tile — tensor-core activity over time</text>
+  <rect class="bx-a" x="30" y="44" width="165" height="46" rx="4"/>
+  <text x="112" y="66" text-anchor="middle">Q·Kᵀ</text>
+  <text x="112" y="82" text-anchor="middle" class="sub">MMA — busy</text>
+  <rect class="bx-r" x="205" y="44" width="290" height="46" rx="4"/>
+  <text x="350" y="66" text-anchor="middle" class="rd">softmax — tensor cores IDLE</text>
+  <text x="350" y="82" text-anchor="middle" class="sub">exp · cross-warp max/sum · __syncthreads</text>
+  <rect class="bx-a" x="505" y="44" width="165" height="46" rx="4"/>
+  <text x="587" y="66" text-anchor="middle">P·V</text>
+  <text x="587" y="82" text-anchor="middle" class="sub">MMA — busy</text>
+  <line class="ln" x1="30" y1="116" x2="675" y2="116" marker-end="url(#arr)"/>
+  <text x="350" y="138" text-anchor="middle" class="sub">every optimization here exists to shrink or hide the red gap</text>
+</svg><figcaption>The bubble. Tensor cores stall through the softmax on every tile; closing that gap — via occupancy and load overlap — is the whole game.</figcaption></figure>
+<p>
+On datacenter GPUs you hide it with hardware: <strong>WGMMA</strong> (128-thread MMA
+reading B straight from shared memory), <strong>TMA</strong> (a DMA engine that
+copies tiles with zero thread cost), and <strong>warp specialization</strong>
+(dedicated load warps overlapping math warps). None of that exists on sm_120. The
+whole project is: how close to the roofline can you get with only the consumer
+instruction set?
+</p>
+
+<section class="ref">
+<h3 class="refh">Memory layout reference — every item, every tier</h3>
+<p class="refsub">Three storage tiers, far to close: bigger and slower at the top, smaller and
+faster at the bottom. Sizes are the D=64, N=2048 causal configuration; where a
+value scales with head dim it is noted.</p>
+
+<div class="tier">
+  <div class="th">DRAM — global memory</div>
+  <div class="ts">GDDR7 on the RTX 5080 — ~960 GB/s, ~16 GB total. The slow substrate every SM reaches through (~500-cycle latency).</div>
+  <div class="cards">
+    <div class="card c-teal"><span class="nm">Q</span>queries — N × d<br>"what am I looking for"<br>read <strong>once per block</strong> → smem_q
+      <span class="sz">256 KB / head</span></div>
+    <div class="card c-coral"><span class="nm">K</span>keys — N × d<br>"how each token is labelled"<br>streamed in tiles → smem_k each iter
+      <span class="sz">256 KB / head</span></div>
+    <div class="card c-coral"><span class="nm">V</span>values — N × d<br>"what each token contributes"<br>streamed → smem_v each iter
+      <span class="sz">256 KB / head</span></div>
+    <div class="card c-teal"><span class="nm">O</span>output — N × d<br>written <strong>once at the end</strong><br>materialized from o_acc
+      <span class="sz">256 KB / head</span></div>
   </div>
-  <div class="scroll-hint">↓ Scroll to explore</div>
 </div>
 
-<!-- ===================== THE PROBLEM ===================== -->
-<section>
-  <div class="section-label">01 — The Challenge</div>
-  <h2>Flash Attention on a GPU<br>without datacenter features</h2>
-  <p class="body-text">
-    The RTX 5080 is NVIDIA's consumer Blackwell chip — fast tensor cores, but none of the 
-    datacenter magic that makes H100 and B200 kernels fly. No WGMMA (warp group MMA), no TMA 
-    (tensor memory accelerator), no warp specialization barriers. Just raw CUDA, shared memory, 
-    and 84 streaming multiprocessors.
-  </p>
-  <p class="body-text">
-    Flash Attention is memory-bound by nature: the softmax in the inner loop breaks the pure 
-    GEMM pattern that tensor cores crave. The question was — how close to peak can we get 
-    with only the tools available on consumer silicon?
-  </p>
-
-  <div class="concept-grid">
-    <div class="concept-card">
-      <div class="icon">⚡</div>
-      <h3>234.8 TFLOPS Peak</h3>
-      <p>The RTX 5080's theoretical FP16 throughput. Our target ceiling. Production Flash Attention on H100 achieves 50-70% of peak — could we match that ratio?</p>
-    </div>
-    <div class="concept-card">
-      <div class="icon">🧱</div>
-      <h3>No WGMMA / TMA</h3>
-      <p>sm_120 (consumer Blackwell) is architecturally closer to Ada Lovelace than datacenter Blackwell. 32-thread warps, not 128-thread warp groups. Manual memory management.</p>
-    </div>
-    <div class="concept-card">
-      <div class="icon">🔥</div>
-      <h3>The Softmax Wall</h3>
-      <p>Every KV tile needs a full softmax: find max, compute exp, sum, normalize. This serial dependency between tiles is what makes attention fundamentally harder than GEMM.</p>
-    </div>
+<div class="tier">
+  <div class="th">Shared memory — per SM, 100 KB available (sm_120)</div>
+  <div class="ts">28 KB used per block (after the P-onto-K alias) — <strong>3 blocks fit per SM</strong>. On-chip scratch shared by all warps, ~20-cycle latency.</div>
+  <div class="cards">
+    <div class="card c-teal"><span class="nm">smem_q</span>64 × (64+8) halves<br>persistent — whole block
+      <span class="sz">9 KB</span></div>
+    <div class="card c-coral"><span class="nm">smem_k</span>64 × (64+8) halves<br>refilled per iteration
+      <span class="sz">9 KB</span></div>
+    <div class="card c-coral"><span class="nm">smem_v</span>64 × (64+8) halves<br>refilled per iteration
+      <span class="sz">9 KB</span></div>
+    <div class="card c-amber"><span class="nm">smem_p</span>aliased onto smem_k<br>brief P → ldmatrix staging
+      <span class="sz">+0 KB</span></div>
+    <div class="card c-amber wide"><span class="nm">smem_partial_max + smem_partial_sum</span>
+      2 warp-halves × 64 rows × 4 bytes × 2 (max, sum) = 1 KB · cross-warp-half exchange for the softmax reduction — the only shared-memory trip softmax takes · scratch, overwritten every phase
+      <span class="sz">1 KB → 28 KB total / block</span></div>
   </div>
-</section>
-
-<!-- ===================== THE JOURNEY ===================== -->
-<section>
-  <div class="section-label">02 — The Optimization Journey</div>
-  <h2>Five versions, five breakthroughs</h2>
-  <p class="body-text">
-    Each version identified and eliminated a specific bottleneck. The profiler told us where 
-    time was being wasted; the architecture told us how to fix it.
-  </p>
-
-  <div class="timeline" id="timeline">
-    <div class="timeline-item" data-delay="0">
-      <div class="timeline-dot"></div>
-      <div class="timeline-version">V1 — BASELINE</div>
-      <div class="timeline-title">Scalar FP32 Attention</div>
-      <div class="timeline-desc">
-        No tensor cores. Each thread computes one element of Q×K^T using scalar multiply-add. 
-        The entire 64×64 attention matrix computed element-by-element. The GPU's tensor cores 
-        sit completely idle.
-      </div>
-      <div class="timeline-perf">
-        <span class="tflops">~2.7</span> TFLOPS
-      </div>
-    </div>
-
-    <div class="timeline-item" data-delay="100">
-      <div class="timeline-dot"></div>
-      <div class="timeline-version">V3 — TENSOR CORES</div>
-      <div class="timeline-title">WMMA Fragment Operations</div>
-      <div class="timeline-desc">
-        Switched to nvcuda::wmma — NVIDIA's C++ API for tensor cores. Each warp now computes 
-        16×16 matrix tiles in a single instruction. 10× faster compute, but we immediately 
-        hit a new wall: global memory bandwidth.
-      </div>
-      <div class="timeline-perf">
-        <span class="tflops">26.7</span> TFLOPS · <span style="color: var(--accent2)">10× from baseline</span>
-      </div>
-    </div>
-
-    <div class="timeline-item" data-delay="200">
-      <div class="timeline-dot"></div>
-      <div class="timeline-version">V6 — VECTORIZED LOADS</div>
-      <div class="timeline-title">uint4 Coalesced Memory Access</div>
-      <div class="timeline-desc">
-        Replaced individual half-precision loads with 128-bit uint4 vector loads. Each thread 
-        now moves 16 bytes per transaction instead of 2. Global memory bandwidth utilization 
-        jumped from ~15% to ~40%.
-      </div>
-      <div class="timeline-perf">
-        <span class="tflops">38.3</span> TFLOPS · <span style="color: var(--accent2)">+43% from WMMA</span>
-      </div>
-    </div>
-
-    <div class="timeline-item" data-delay="300">
-      <div class="timeline-dot"></div>
-      <div class="timeline-version">V7 — RAW PTX</div>
-      <div class="timeline-title">PTX MMA + ldmatrix Instructions</div>
-      <div class="timeline-desc">
-        Replaced WMMA's opaque fragment API with raw PTX assembly. 
-        <code>mma.sync.aligned.m16n8k16</code> gives us known register layouts — 
-        each thread holds exactly 4 floats at deterministic (row, col) positions. 
-        <code>ldmatrix.sync</code> loads tiles directly from shared memory into MMA-ready registers.
-      </div>
-      <div class="timeline-perf">
-        <span class="tflops">49.2</span> TFLOPS · <span style="color: var(--accent2)">Known register layout unlocked</span>
-      </div>
-    </div>
-
-    <div class="timeline-item" data-delay="400">
-      <div class="timeline-dot"></div>
-      <div class="timeline-version">V8 — IN-REGISTER SOFTMAX</div>
-      <div class="timeline-title">Eliminating smem_s</div>
-      <div class="timeline-desc">
-        S = Q×K^T results stay in registers — never written to shared memory. 
-        Softmax computed via intra-warp shuffles + tiny cross-warp exchange (1KB vs 16KB). 
-        Eliminated the largest shared memory round-trip and one synchronization barrier per tile.
-      </div>
-      <div class="timeline-perf">
-        <span class="tflops">125.2</span> TFLOPS · <span style="color: var(--accent2)">53% of peak</span>
-      </div>
-    </div>
-
-    <div class="timeline-item" data-delay="500">
-      <div class="timeline-dot" style="border-color: var(--gold); background: var(--gold); box-shadow: 0 0 30px rgba(255,215,0,0.5);"></div>
-      <div class="timeline-version" style="color: var(--gold);">V9 — DIRECT NEW_MAX RESCALE</div>
-      <div class="timeline-title">The Final Push: exp(S − new_max)</div>
-      <div class="timeline-desc">
-        Instead of computing exp(S − tile_max) then post-scaling by exp(tile_max − new_max), 
-        compute exp(S − new_max) directly. P is written to smem already at the correct scale.
-        Eliminates multiply ops from the critical path and fixes subtle accuracy drift on 
-        long sequences where previous tiles dominate the running maximum.
-      </div>
-      <div class="timeline-perf" style="background: rgba(255,215,0,0.1); border-color: rgba(255,215,0,0.3);">
-        <span class="tflops" style="color: var(--gold);">135.9</span> TFLOPS · <span style="color: var(--gold)">58% of peak · 50× from baseline</span>
-      </div>
-    </div>
-  </div>
-</section>
-
-<!-- ===================== PERFORMANCE CHART ===================== -->
-<section>
-  <div class="section-label">03 — Performance Progression</div>
-  <h2>The numbers speak</h2>
-
-  <div class="perf-chart" id="perfChart">
-    <div class="perf-row">
-      <div class="perf-label">Scalar Baseline</div>
-      <div class="perf-bar-bg">
-        <div class="perf-bar" style="background: linear-gradient(90deg, #444, #555);" data-width="2"></div>
-      </div>
-      <div class="perf-val">2.7</div>
-    </div>
-    <div class="perf-row">
-      <div class="perf-label">WMMA v3</div>
-      <div class="perf-bar-bg">
-        <div class="perf-bar" style="background: linear-gradient(90deg, #665, #886);" data-width="19.6"></div>
-      </div>
-      <div class="perf-val">26.7</div>
-    </div>
-    <div class="perf-row">
-      <div class="perf-label">Vectorized v6</div>
-      <div class="perf-bar-bg">
-        <div class="perf-bar" style="background: linear-gradient(90deg, var(--accent2), #ff9466);" data-width="28.2"></div>
-      </div>
-      <div class="perf-val">38.3</div>
-    </div>
-    <div class="perf-row">
-      <div class="perf-label">PTX MMA v7</div>
-      <div class="perf-bar-bg">
-        <div class="perf-bar" style="background: linear-gradient(90deg, var(--accent3), #6ee7c0);" data-width="36.2"></div>
-      </div>
-      <div class="perf-val">49.2</div>
-    </div>
-    <div class="perf-row">
-      <div class="perf-label">In-Register v8</div>
-      <div class="perf-bar-bg">
-        <div class="perf-bar" style="background: linear-gradient(90deg, var(--accent), #66ffaa);" data-width="92.1"></div>
-      </div>
-      <div class="perf-val">125.2</div>
-    </div>
-    <div class="perf-row">
-      <div class="perf-label">Corrected v9</div>
-      <div class="perf-bar-bg">
-        <div class="perf-bar" style="background: linear-gradient(90deg, var(--accent), var(--gold));" data-width="100"></div>
-      </div>
-      <div class="perf-val" style="color: var(--gold);">135.9</div>
-    </div>
-  </div>
-</section>
-
-<!-- ===================== KEY INSIGHT ===================== -->
-<section>
-  <div class="section-label">04 — The Key Insight</div>
-  <h2>Why in-register softmax<br>changes everything</h2>
-  <p class="body-text">
-    In a standard flash attention kernel, the S = Q×K^T matrix is written to shared memory 
-    (16KB), a barrier fires, then softmax reads it back. This round-trip dominates the inner loop.
-  </p>
-
-  <div class="comparison">
-    <div class="comp-side before">
-      <h4>Before: smem_s Round-Trip</h4>
-      <ul>
-        <li>MMA writes S to shared memory (16KB)</li>
-        <li>__syncthreads() — all 8 warps stall</li>
-        <li>Each warp reads 8 rows from smem_s</li>
-        <li>Compute softmax per row</li>
-        <li>Write P to smem_p (9KB)</li>
-        <li>__syncthreads() again</li>
-        <li>4 barriers per KV tile</li>
-        <li>~54KB shared memory</li>
-      </ul>
-    </div>
-    <div class="comp-side after">
-      <h4>After: Register Softmax + Direct Rescale</h4>
-      <ul>
-        <li>MMA results stay in s_acc[4][4] registers</li>
-        <li>Shuffle reduce across 4 threads per row</li>
-        <li>Exchange 128 floats between warp halves</li>
-        <li>Compute new_max before exp()</li>
-        <li>exp(S − new_max) directly — no post-scaling</li>
-        <li>Write P to smem_p already at correct scale</li>
-        <li>Only 3 barriers per KV tile</li>
-        <li>Tensor cores active 50%+ → 135.9 TFLOPS</li>
-      </ul>
-    </div>
-  </div>
-
-  <div class="diagram-wrapper">
-    <div class="diagram-title">Data Flow — Register Softmax Pipeline</div>
-    <div class="reg-flow">
-      <div class="reg-box" style="background: rgba(78,205,196,0.2); border: 1px solid var(--accent3); color: var(--accent3);">
-        Q × K^T<br><small>PTX MMA</small>
-      </div>
-      <div class="reg-arrow">→</div>
-      <div class="reg-box" style="background: rgba(0,255,136,0.15); border: 1px solid var(--accent); color: var(--accent);">
-        s_acc[4][4]<br><small>IN REGISTERS</small>
-      </div>
-      <div class="reg-arrow">→</div>
-      <div class="reg-box" style="background: rgba(255,215,0,0.15); border: 1px solid var(--gold); color: var(--gold);">
-        shuffle → new_max<br><small>CROSS-WARP</small>
-      </div>
-      <div class="reg-arrow">→</div>
-      <div class="reg-box" style="background: rgba(255,107,53,0.15); border: 1px solid var(--accent2); color: var(--accent2);">
-        exp(S − new_max)<br><small>DIRECT RESCALE</small>
-      </div>
-      <div class="reg-arrow">→</div>
-      <div class="reg-box" style="background: rgba(78,205,196,0.2); border: 1px solid var(--accent3); color: var(--accent3);">
-        P × V<br><small>PTX MMA</small>
-      </div>
-    </div>
-  </div>
-</section>
-
-<!-- ===================== LDMATRIX BUG ===================== -->
-<section>
-  <div class="section-label">05 — The Bug That Nearly Stopped Us</div>
-  <h2>ldmatrix.x2.trans:<br>when half the matrix goes missing</h2>
-  <p class="body-text">
-    PTX's <code>ldmatrix.sync.aligned.m8n8.x2.trans</code> loads two 8×8 matrices. 
-    Threads 0-7 provide addresses for matrix 0, threads 8-15 for matrix 1. 
-    Our code used <code>lane_id % 8</code> for both groups — making threads 8-15 
-    load identical data to threads 0-7.
-  </p>
-  <p class="body-text">
-    The result: only half the K-dimension was loaded, duplicated into both halves. 
-    Rows 0-7 of the output looked correct (they only needed the first half), 
-    but rows 8-15 were corrupted. The identity matrix test made it obvious — 
-    row 8 showed values 1-8 instead of 65-72.
-  </p>
-
-  <div class="code-block" data-lang="PTX Fix">
-    <code>
-<span class="cm">// BUG: threads 8-15 duplicate threads 0-7</span>
-<span class="kw">int</span> k_row = lane_id % <span class="num">8</span>;
-<span class="fn">ldmatrix_x2_trans</span>(b0, b1,
-    smem_k + (ni * <span class="num">8</span> + k_row) * KV_STRIDE + ki * <span class="num">16</span>);
-
-<span class="cm">// FIX: matrix 1 reads the next 8 columns</span>
-<span class="kw">int</span> k_row = lane_id % <span class="num">8</span>;
-<span class="kw">int</span> <span class="acc">mat</span> = (lane_id / <span class="num">8</span>) % <span class="num">2</span>;
-<span class="fn">ldmatrix_x2_trans</span>(b0, b1,
-    smem_k + (ni * <span class="num">8</span> + k_row) * KV_STRIDE + ki * <span class="num">16</span> + <span class="acc">mat * 8</span>);
-    </code>
-  </div>
-</section>
-
-<!-- ===================== V9 CORRECTION ===================== -->
-<section>
-  <div class="section-label">06 — The Subtle Correctness Fix</div>
-  <h2>exp(S − tile_max) vs<br>exp(S − new_max)</h2>
-  <p class="body-text">
-    Flash Attention's online softmax maintains a running maximum across KV tiles.
-    When a new tile arrives, the algorithm must reconcile two different scales:
-    the old accumulator (at <code>prev_max</code>) and the new P values (at <code>tile_max</code>).
-  </p>
-  <p class="body-text">
-    v8 computed <code>P = exp(S − tile_max)</code> then needed a post-correction
-    <code>pv_scale = exp(tile_max − new_max)</code> on both the tile sum and P×V result.
-    v9 instead computes <code>new_max = max(prev_max, tile_max)</code> <em>before</em> the exp,
-    then writes <code>P = exp(S − new_max)</code> directly. The P values land in shared memory 
-    already at the correct scale — no post-multiply needed.
-  </p>
-
-  <div class="code-block" data-lang="The Fix">
-    <code>
-<span class="cm">// v8: two-step (compute then rescale)</span>
-<span class="kw">float</span> e0 = <span class="fn">expf</span>(s_acc - <span class="st">tile_max</span>);
-<span class="cm">// ... later, after computing new_max:</span>
-tile_sum *= <span class="fn">expf</span>(<span class="st">tile_max</span> - new_max);  <span class="cm">// extra multiply</span>
-
-<span class="cm">// v9: direct (compute new_max first, subtract it)</span>
-<span class="kw">float</span> new_max = <span class="fn">fmaxf</span>(prev_max, tile_max);
-<span class="kw">float</span> e0 = <span class="fn">expf</span>(s_acc - <span class="acc">new_max</span>);  <span class="cm">// already correct scale</span>
-<span class="cm">// tile_sum needs no correction — P is at new_max basis</span>
-    </code>
-  </div>
-
-  <p class="body-text">
-    This isn't just cleaner — it's faster. The eliminated multiplies were in the critical
-    path between softmax and P×V. On long sequences (S=4096), this improved from
-    116 → 128 TFLOPS because multi-tile corrections fire more often. At the sweet spot
-    (B=4, S=2048), it pushed from 125 → 136 TFLOPS.
-  </p>
-</section>
-
-<!-- ===================== PROFILING ===================== -->
-<section>
-  <div class="section-label">07 — Profiling with Nsight Compute</div>
-  <h2>The profiler doesn't lie</h2>
-  <p class="body-text">
-    Every optimization was validated with <code>ncu</code>. Three metrics told the whole story: 
-    tensor core utilization, shared memory throughput, and active warps.
-  </p>
-
-  <table class="profile-table">
-    <thead>
-      <tr>
-        <th>Metric</th>
-        <th>B=1 smem_s</th>
-        <th>B=4 smem_s</th>
-        <th>B=4 In-Register v8</th>
-        <th>B=4 Corrected v9</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td>Tensor Cores Active</td>
-        <td class="hot">8.5%</td>
-        <td class="warm">17.9%</td>
-        <td class="highlight">50.1%</td>
-        <td class="highlight">~54%</td>
-      </tr>
-      <tr>
-        <td>L1/Smem Throughput</td>
-        <td>15.2%</td>
-        <td>31.3%</td>
-        <td>32.5%</td>
-        <td>32.5%</td>
-      </tr>
-      <tr>
-        <td>Active Warps</td>
-        <td class="hot">9.1%</td>
-        <td>15.6%</td>
-        <td>29.7%</td>
-        <td class="highlight">~32%</td>
-      </tr>
-      <tr>
-        <td>TFLOPS</td>
-        <td>37.3</td>
-        <td>45.2</td>
-        <td>125.2</td>
-        <td style="color: var(--gold); font-weight: 700;">135.9</td>
-      </tr>
-    </tbody>
-  </table>
-
-  <p class="body-text">
-    At 8.5% tensor core utilization, the MMA units were idle 91% of the time — starved by 
-    shared memory traffic and synchronization barriers. Eliminating smem_s freed the pipeline, 
-    letting tensor cores sustain 50% activity. The remaining 50% is the irreducible cost of 
-    softmax, P write, and global memory access.
-  </p>
-</section>
-
-<!-- ===================== ARCHITECTURE ===================== -->
-<section>
-  <div class="section-label">08 — What Consumer Blackwell Can't Do</div>
-  <h2>The datacenter features<br>we worked without</h2>
-  <p class="body-text">
-    Examining DeepSeek's production kernels for H100 (sm_90) and B200 (sm_100) revealed 
-    an entirely different class of hardware. Here's what was available to them but not to us.
-  </p>
-
-  <div class="concept-grid">
-    <div class="concept-card">
-      <div class="icon">🔄</div>
-      <h3>WGMMA</h3>
-      <p>Warp Group MMA — 128 threads issue a single matrix multiply. B operand reads directly from shared memory, eliminating register pressure entirely. 4× wider than our 32-thread MMA.</p>
-    </div>
-    <div class="concept-card">
-      <div class="icon">📦</div>
-      <h3>TMA</h3>
-      <p>Tensor Memory Accelerator — hardware DMA that copies tiles from global to shared memory with zero thread involvement. Address generation, bounds checking, and swizzling all in silicon.</p>
-    </div>
-    <div class="concept-card">
-      <div class="icon">🧵</div>
-      <h3>Warp Specialization</h3>
-      <p>Dedicated TMA warps load data while math warps compute — true pipeline parallelism. ClusterTransactionBarrier synchronizes across warp groups with minimal overhead.</p>
-    </div>
-    <div class="concept-card">
-      <div class="icon">🧠</div>
-      <h3>TMEM (sm_100)</h3>
-      <p>Tensor Memory — a hardware-managed register file separate from the standard RF. B200's UMMA reads operands directly from TMEM, eliminating shared memory for the B matrix entirely.</p>
-    </div>
-  </div>
-</section>
-
-<!-- ===================== SHARED MEMORY LAYOUT ===================== -->
-<section>
-  <div class="section-label">09 — Memory Architecture</div>
-  <h2>Shared memory layout evolution</h2>
-  
-  <div class="diagram-wrapper">
-    <div class="diagram-title">Before: 54KB with smem_s</div>
-    <div class="smem-layout" id="smemBefore">
-      <div class="smem-block">
-        <div class="smem-label">smem_q</div>
-        <div class="smem-bar" style="width: 170px; background: var(--accent3);" data-w="170">9.2 KB</div>
-      </div>
-      <div class="smem-block">
-        <div class="smem-label">smem_k</div>
-        <div class="smem-bar" style="width: 170px; background: #78dce8;" data-w="170">9.2 KB</div>
-      </div>
-      <div class="smem-block">
-        <div class="smem-label">smem_v</div>
-        <div class="smem-bar" style="width: 170px; background: #78dce8;" data-w="170">9.2 KB</div>
-      </div>
-      <div class="smem-block">
-        <div class="smem-label">smem_s</div>
-        <div class="smem-bar" style="width: 300px; background: var(--hot);" data-w="300">16 KB ← ELIMINATED</div>
-      </div>
-      <div class="smem-block">
-        <div class="smem-label">smem_p</div>
-        <div class="smem-bar" style="width: 170px; background: var(--accent2);" data-w="170">9.2 KB</div>
-      </div>
-    </div>
-  </div>
-
-  <div class="diagram-wrapper">
-    <div class="diagram-title">After: 38KB — in-register softmax</div>
-    <div class="smem-layout" id="smemAfter">
-      <div class="smem-block">
-        <div class="smem-label">smem_q</div>
-        <div class="smem-bar" style="width: 170px; background: var(--accent3);" data-w="170">9.2 KB</div>
-      </div>
-      <div class="smem-block">
-        <div class="smem-label">smem_k</div>
-        <div class="smem-bar" style="width: 170px; background: #78dce8;" data-w="170">9.2 KB</div>
-      </div>
-      <div class="smem-block">
-        <div class="smem-label">smem_v</div>
-        <div class="smem-bar" style="width: 170px; background: #78dce8;" data-w="170">9.2 KB</div>
-      </div>
-      <div class="smem-block">
-        <div class="smem-label">smem_p</div>
-        <div class="smem-bar" style="width: 170px; background: var(--accent2);" data-w="170">9.2 KB</div>
-      </div>
-      <div class="smem-block">
-        <div class="smem-label">exchange</div>
-        <div class="smem-bar" style="width: 18px; background: var(--accent);" data-w="18">1 KB</div>
-      </div>
-    </div>
-  </div>
-</section>
-
-<!-- ===================== MMA REGISTER LAYOUT ===================== -->
-<section>
-  <div class="section-label">10 — PTX MMA Register Layout</div>
-  <h2>The layout that made it possible</h2>
-  <p class="body-text">
-    <code>mma.sync.aligned.m16n8k16</code> produces a 16×8 output tile. Each of the 32 threads 
-    holds exactly 4 float values at deterministic positions. This known layout is what enables 
-    in-register softmax — we can compute row-wise operations without ever touching shared memory.
-  </p>
-
-  <div class="diagram-wrapper">
-    <div class="diagram-title">Thread → Output Element Mapping</div>
-    <div style="font-family: var(--mono); font-size: 0.75rem; color: var(--dim); margin-bottom: 1rem;">
-      Each thread t holds: d0=C[row0,col0] d1=C[row0,col1] d2=C[row1,col0] d3=C[row1,col1]<br>
-      row0 = (t/4)%8 &nbsp;&nbsp; row1 = row0+8 &nbsp;&nbsp; col0 = (t%4)*2 &nbsp;&nbsp; col1 = col0+1
-    </div>
-    <div class="warp-visual" id="warpVis"></div>
-    <div style="display: flex; gap: 2rem; margin-top: 1rem; font-family: var(--mono); font-size: 0.7rem; color: var(--dim);">
-      <span>■ <span style="color: var(--accent)">Rows 0-7 (d0, d1)</span></span>
-      <span>■ <span style="color: var(--accent2)">Rows 8-15 (d2, d3)</span></span>
-    </div>
-  </div>
-
-  <p class="body-text">
-    Four threads share each row (varying in lane_id%4). A shuffle reduction with 
-    <code>__shfl_xor_sync</code> across delta 1 and 2 gives the partial max/sum for 32 columns. 
-    One tiny smem exchange between warp halves completes the full 64-column reduction.
-  </p>
-</section>
-
-<!-- ===================== FOOTER ===================== -->
-<div class="footer">
-  <div class="big-num">135.9</div>
-  <p>TFLOPS · FP16 Flash Attention · RTX 5080</p>
-  <p style="margin-top: 0.5rem; font-size: 0.75rem; color: #444;">
-    Hand-written PTX · In-Register Softmax · Direct Rescale · 58% of Theoretical Peak
-  </p>
 </div>
 
-<!-- ===================== SCRIPTS ===================== -->
-<script>
-// Intersection Observer for scroll animations
-const observer = new IntersectionObserver((entries) => {
-  entries.forEach(entry => {
-    if (entry.isIntersecting) {
-      entry.target.classList.add('visible');
-      
-      // Animate perf bars
-      if (entry.target.id === 'perfChart') {
-        entry.target.querySelectorAll('.perf-bar').forEach((bar, i) => {
-          setTimeout(() => {
-            bar.style.width = bar.dataset.width + '%';
-          }, i * 150);
-        });
-      }
-    }
-  });
-}, { threshold: 0.2 });
+<div class="tier">
+  <div class="th">Registers — per thread, 65,536 / SM (256 KB) split across resident threads</div>
+  <div class="ts">~144 bytes of named state per thread, each thread holding its own slice of every tile. Single-cycle access — the fastest tier and where the math lives.</div>
+  <div class="cards">
+    <div class="card c-pink"><span class="nm">s_acc[4][4]</span>16 floats / thread<br>scores from Q·Kᵀ<br>per iteration, then dies<br><em>distributed across all threads</em>
+      <span class="sz">64 bytes</span></div>
+    <div class="card c-purple"><span class="nm">o_acc[4][4]</span>16 floats / thread<br>running output<br><strong>persistent</strong> — += P·V each iter
+      <span class="sz">64 bytes</span></div>
+    <div class="card c-purple"><span class="nm">row_max, row_sum</span>4 floats / thread<br>m and ℓ for this thread's 2 rows<br><strong>persistent</strong><br><em>m = running max, ℓ = Σ exp</em>
+      <span class="sz">16 bytes</span></div>
+    <div class="card wide" style="background:#f6f6f1;border-color:var(--rule2);color:#4a4940;">
+      <span class="nm" style="color:#4a4940;">per-thread register budget</span>
+      named state ≈ 144 bytes · the kernel compiles to <strong>78 registers (312 bytes/thread)</strong> — the rest is MMA operands, tile addresses, and loop counters. 78 regs keeps all 3 blocks resident; pushing for a 4th forces a 64-register cap that spills (see §9).
+      <span class="sz" style="color:#4a4940;">78 registers · 0 spills</span></div>
+  </div>
+</div>
 
-// Observe timeline items
-document.querySelectorAll('.timeline-item').forEach((item, i) => {
-  item.style.transitionDelay = (i * 0.15) + 's';
-  observer.observe(item);
-});
+<div class="legend">
+  <div><span class="sw" style="background:#e9f4ef;border-color:#54a888;"></span>teal — persistent across iterations (Q, smem_q)</div>
+  <div><span class="sw" style="background:#fbe8f0;border-color:#cf6594;"></span>pink — register-only, per iteration (S)</div>
+  <div><span class="sw" style="background:#fcecea;border-color:#d57a74;"></span>coral — streamed per iteration (K, V tiles)</div>
+  <div><span class="sw" style="background:#edeafb;border-color:#8169c9;"></span>purple — register-only, persistent (O, m, ℓ)</div>
+  <div><span class="sw" style="background:#fbf2da;border-color:#cc9b3c;"></span>amber — brief / forced detour through smem (P, partials)</div>
+  <div><span class="sw" style="background:#f6f6f1;border-color:var(--rule2);"></span>grey — capacity / budget annotation</div>
+</div>
+</section>
 
-// Observe perf chart
-const perfChart = document.getElementById('perfChart');
-if (perfChart) observer.observe(perfChart);
+<h2><span class="no">2</span>The optimization progression</h2>
+<p>
+Each version removed one specific bottleneck, validated by Nsight Compute and
+interleaved A/B timing. Numbers are at the B=8, S=2048, D=64 causal configuration
+unless noted.
+</p>
+<table>
+  <thead><tr><th>Version</th><th class="num">TFLOPS</th><th>Bottleneck removed</th></tr></thead>
+  <tbody>
+    <tr><td>v1 — scalar FP32</td><td class="num">2.7</td><td>baseline, no tensor cores</td></tr>
+    <tr><td>v3 — WMMA fragments</td><td class="num">26.7</td><td>enabled tensor-core MMA</td></tr>
+    <tr><td>v6 — vectorized loads</td><td class="num">38.3</td><td>uint4 coalesced global access</td></tr>
+    <tr><td>v7 — PTX MMA + ldmatrix</td><td class="num">49.2</td><td>known register layout; no fragment opacity</td></tr>
+    <tr><td>v8 — in-register softmax</td><td class="num">125.2</td><td>eliminated the 16 KB smem_s round-trip</td></tr>
+    <tr><td>v9 — direct rescale</td><td class="num">135.9</td><td>exp(S−new_max); fewer critical-path ops</td></tr>
+    <tr><td>v10 — cp.async loads</td><td class="num">156.4</td><td>gmem→smem direct; LSU freed</td></tr>
+    <tr class="hi"><td>v11 — occupancy</td><td class="num">~170</td><td>alias P onto K (2→3 blocks/SM) + staged cp.async</td></tr>
+  </tbody>
+  <caption>Peak across configs is ~183 TFLOPS at B=4, S=4096, D=128. v3/v6 spanned several intermediate steps.</caption>
+</table>
 
-// Generate warp visualization (16x8 output tile)
-const warpVis = document.getElementById('warpVis');
-if (warpVis) {
-  for (let row = 0; row < 16; row++) {
-    for (let col = 0; col < 8; col++) {
-      const cell = document.createElement('div');
-      cell.className = 'warp-cell';
-      
-      // Find which thread owns this cell
-      const localRow = row % 8;
-      const isRow1 = row >= 8;
-      const colPair = Math.floor(col / 2);
-      const threadId = localRow * 4 + colPair;
-      
-      const isTop = row < 8;
-      cell.style.background = isTop 
-        ? `rgba(0,255,136,${0.3 + (threadId/32)*0.5})`
-        : `rgba(255,107,53,${0.3 + (threadId/32)*0.5})`;
-      cell.textContent = `t${threadId}`;
-      cell.style.animationDelay = `${(row * 8 + col) * 20}ms`;
-      warpVis.appendChild(cell);
-    }
-  }
-}
+<h2><span class="no">3</span>Standing up the tensor-core pipeline (v1 → v7)</h2>
+<p>
+Before any softmax trick, the kernel had to get onto the tensor cores at all — and
+then earn the right to do softmax in registers. Three steps did that, and the table
+above compresses them into one line each. They deserve more, because the third is the
+hinge the whole project turns on.
+</p>
 
-// Smooth reveal on scroll for all sections
-document.querySelectorAll('section').forEach(section => {
-  observer.observe(section);
-  section.style.opacity = '0';
-  section.style.transform = 'translateY(20px)';
-  section.style.transition = 'all 0.8s cubic-bezier(0.16, 1, 0.3, 1)';
-});
+<p>
+<strong>v3 — WMMA fragments (2.7 → 26.7).</strong> The v1 baseline does both matmuls
+with FP32 FMAs on the CUDA cores, leaving the tensor cores — which hold far more FP16
+throughput than the CUDA-core FP32 path can ever reach — completely idle. (v1's 2.7
+isn't near the CUDA cores' own FP32 ceiling either; it's bound by memory and overhead.)
+The easy on-ramp is NVIDIA's <code>nvcuda::wmma</code> API: declare
+<code>wmma::fragment</code> operands, <code>load_matrix_sync</code>, <code>mma_sync</code>
+a 16×16 output tile (the m16n16k16 shape), <code>store_matrix_sync</code> back. It is
+warp-cooperative — 32 threads jointly own one tile — and it just works. Idle to busy
+buys ~10×.
+</p>
+<p>
+The catch is that a fragment is an <em>opaque</em> handle: the API deliberately leaves
+unspecified which thread and register hold which element. Pointwise work (subtract, exp)
+can run blind on the fragment, but softmax's <em>cross-thread reductions</em> — the
+per-row max and sum — need to know which lane holds which score. With WMMA the only
+supported way to get that is to <code>store_matrix_sync</code> the scores to shared
+memory and read them back addressably: a full score-matrix round-trip every tile. That
+round-trip, not the FLOPs, is what keeps the tensor cores stalling between the two
+matmuls.
+</p>
+<figure class="fig"><svg viewBox="0 0 700 200" role="img" aria-label="WMMA: tensor cores busy but scores locked in opaque fragments">
+  <text x="22" y="24" class="cap">v3 WMMA — both matmuls busy; the score layout is hidden</text>
+  <rect class="bx-a" x="22" y="46" width="104" height="42" rx="4"/>
+  <text x="74" y="66" text-anchor="middle">Q·Kᵀ</text><text x="74" y="81" text-anchor="middle" class="sub">MMA busy</text>
+  <line class="ln" x1="126" y1="67" x2="150" y2="67" marker-end="url(#arr)"/>
+  <rect class="bx-d" x="152" y="46" width="126" height="42" rx="4"/>
+  <text x="215" y="65" text-anchor="middle" class="mn">S — fragment</text><text x="215" y="81" text-anchor="middle" class="sub">layout opaque</text>
+  <rect class="bx" x="446" y="46" width="104" height="42" rx="4"/>
+  <text x="498" y="71" text-anchor="middle">softmax</text>
+  <line class="ln" x1="550" y1="67" x2="574" y2="67" marker-end="url(#arr)"/>
+  <rect class="bx-a" x="576" y="46" width="104" height="42" rx="4"/>
+  <text x="628" y="66" text-anchor="middle">P·V</text><text x="628" y="81" text-anchor="middle" class="sub">MMA busy</text>
+  <rect class="bx-r" x="200" y="138" width="252" height="30" rx="4"/>
+  <text x="326" y="157" text-anchor="middle" class="sub rd">shared memory — store the scores, read them back</text>
+  <path d="M215,88 L215,138" fill="none" stroke="#cf6b66" stroke-width="1.6" stroke-dasharray="4 3"/>
+  <path d="M440,138 L498,88" fill="none" stroke="#cf6b66" stroke-width="1.6" stroke-dasharray="4 3"/>
+  <text x="500" y="118" class="sub rd">round-trip / tile</text>
+</svg><figcaption>WMMA turns the tensor cores on (~10×). But a fragment hides which lane holds which score, so softmax's per-row reductions can't run in place — the whole score matrix spills to shared memory and back, every tile. That round-trip, not the FLOPs, stalls the cores between the matmuls.</figcaption></figure>
 
-// Override section visible state
-const sectionObserver = new IntersectionObserver((entries) => {
-  entries.forEach(entry => {
-    if (entry.isIntersecting) {
-      entry.target.style.opacity = '1';
-      entry.target.style.transform = 'translateY(0)';
-    }
-  });
-}, { threshold: 0.1 });
+<p>
+<strong>v6 — vectorized uint4 loads (→ 38.3).</strong> With the cores on, the limiter
+was <em>not</em> HBM bandwidth — attention reuses each K/V tile from shared memory many
+times, so its arithmetic intensity is high and the bus is not the ceiling. The limiter
+was the load path itself: streaming Q/K/V as scalar <code>half</code> issued one narrow
+global load per element, flooding the load/store unit with instructions and leaving the
+tensor cores waiting on stragglers. Commit <code>6438d37</code> reinterprets each row
+pointer as <code>uint4</code> — 128 bits, 8 halves — so one instruction moves 8 elements
+(<code>VEC_COLS = D_HEAD/8 = 8</code> loads per D=64 row). The scalar loads were already
+coalesced and the bytes moved are identical; the win is <strong>8× fewer load
+instructions</strong>, the full 128-bit load width, and more bytes in flight to hide
+latency. +12 TFLOPS — and the math, the fragments, and the smem softmax round-trip are
+all untouched.
+</p>
+<figure class="fig"><svg viewBox="0 0 700 196" role="img" aria-label="scalar half loads versus one uint4 load">
+  <text x="22" y="24" class="cap">loading one D=64 row into shared memory</text>
+  <text x="22" y="73" class="sub">v3 · scalar half</text>
+  <rect class="bx" x="130" y="54" width="34" height="28" rx="2"/><text x="147" y="73" text-anchor="middle" class="sub">h</text>
+  <rect class="bx" x="170" y="54" width="34" height="28" rx="2"/><text x="187" y="73" text-anchor="middle" class="sub">h</text>
+  <rect class="bx" x="210" y="54" width="34" height="28" rx="2"/><text x="227" y="73" text-anchor="middle" class="sub">h</text>
+  <rect class="bx" x="250" y="54" width="34" height="28" rx="2"/><text x="267" y="73" text-anchor="middle" class="sub">h</text>
+  <rect class="bx" x="290" y="54" width="34" height="28" rx="2"/><text x="307" y="73" text-anchor="middle" class="sub">h</text>
+  <rect class="bx" x="330" y="54" width="34" height="28" rx="2"/><text x="347" y="73" text-anchor="middle" class="sub">h</text>
+  <rect class="bx" x="370" y="54" width="34" height="28" rx="2"/><text x="387" y="73" text-anchor="middle" class="sub">h</text>
+  <rect class="bx" x="410" y="54" width="34" height="28" rx="2"/><text x="427" y="73" text-anchor="middle" class="sub">h</text>
+  <text x="470" y="73" class="sub">→ 8 loads</text>
+  <text x="22" y="137" class="sub">v6 · uint4</text>
+  <rect class="bx-g" x="130" y="118" width="314" height="28" rx="3"/>
+  <text x="287" y="137" text-anchor="middle" class="mn">uint4 — 8 halves, 128 bits</text>
+  <text x="470" y="137" class="sub gr">→ 1 load</text>
+  <text x="22" y="180" class="sub">Same bytes; 8× fewer instructions. Attention reuses K/V from smem (not bandwidth-bound), so the gain is load-issue relief + latency hiding.</text>
+</svg><figcaption>The scalar loads were already coalesced, so this isn't a coalescing fix. uint4 moves eight halves per instruction — 8× fewer load-instructions and more in-flight bytes. Since compute peak dwarfs the ~960 GB/s bus, the scarce resource was load-issue throughput, not bandwidth.</figcaption></figure>
 
-document.querySelectorAll('section').forEach(s => sectionObserver.observe(s));
-</script>
+<p>
+<strong>v7 — PTX mma.sync + ldmatrix (→ 49.2).</strong> Swap <code>nvcuda::wmma</code>
+for inline-PTX <code>mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32</code>, fed by
+<code>ldmatrix.sync.aligned.m8n8.x2.trans</code>. The direct gain is modest (~+11,
+plausibly from lower fragment and load overhead — not separately profiled). The real
+prize is that the register-to-thread mapping is now <em>documented and fixed</em>. For
+this opcode A is four 32-bit registers (eight halves) and B is two (four halves), and
+each thread holds its four FP32 outputs at known positions:
+</p>
+<pre><code>row0 = (lane/4) % 8     row1 = row0 + 8
+col0 = (lane % 4) * 2   col1 = col0 + 1</code></pre>
+<p>
+For the first time you know exactly which lane owns which score. That is the precondition
+for the in-register softmax of §4: the per-row max/sum reduction runs as
+<code>__shfl_xor_sync</code> across the four lanes sharing a row, and the 16 KB score
+round-trip disappears (only a 1 KB cross-warp-half exchange remains). The known layout is
+<em>necessary but not sufficient</em> — §4 is where it's actually spent, taking 49 → 125
+— but v7 is what makes that step possible. (<code>ldmatrix.x2.trans</code> has its own
+trap: lanes 0–7 address the first 8×8 block, 8–15 the second with a <code>+8</code>
+offset; getting it wrong is the bug in §4.)
+</p>
+<figure class="fig"><svg viewBox="0 0 700 212" role="img" aria-label="opaque WMMA fragment versus known mma.sync register layout">
+  <text x="22" y="24" class="cap">which lane holds which score?</text>
+  <text x="22" y="54" class="sub">WMMA fragment</text>
+  <rect class="bx-d" x="22" y="64" width="196" height="86" rx="5"/>
+  <text x="120" y="102" text-anchor="middle" class="mn" style="font-size:20px">?   ?   ?</text>
+  <text x="120" y="126" text-anchor="middle" class="sub">not addressable</text>
+  <text x="120" y="172" text-anchor="middle" class="sub rd">→ dump to smem to find out</text>
+  <text x="300" y="54" class="sub">mma.sync — known layout</text>
+  <text x="296" y="84" text-anchor="end" class="sub">row 0</text>
+  <rect class="bx-a" x="340" y="66" width="34" height="26" rx="2"/>
+  <rect class="bx-a" x="378" y="66" width="34" height="26" rx="2"/>
+  <rect class="bx" x="416" y="66" width="34" height="26" rx="2"/>
+  <rect class="bx" x="454" y="66" width="34" height="26" rx="2"/>
+  <rect class="bx" x="492" y="66" width="34" height="26" rx="2"/>
+  <rect class="bx" x="530" y="66" width="34" height="26" rx="2"/>
+  <rect class="bx" x="568" y="66" width="34" height="26" rx="2"/>
+  <rect class="bx" x="606" y="66" width="34" height="26" rx="2"/>
+  <text x="296" y="122" text-anchor="end" class="sub">row 8</text>
+  <rect class="bx-a" x="340" y="104" width="34" height="26" rx="2"/>
+  <rect class="bx-a" x="378" y="104" width="34" height="26" rx="2"/>
+  <rect class="bx" x="416" y="104" width="34" height="26" rx="2"/>
+  <rect class="bx" x="454" y="104" width="34" height="26" rx="2"/>
+  <rect class="bx" x="492" y="104" width="34" height="26" rx="2"/>
+  <rect class="bx" x="530" y="104" width="34" height="26" rx="2"/>
+  <rect class="bx" x="568" y="104" width="34" height="26" rx="2"/>
+  <rect class="bx" x="606" y="104" width="34" height="26" rx="2"/>
+  <text x="340" y="154" class="sub">lane 0 owns the 4 shaded cells — <tspan class="mn">row0=(lane/4)%8, col0=(lane%4)*2</tspan></text>
+  <text x="340" y="190" class="acc">→ softmax in registers · __shfl_xor across the 4 lanes sharing a row</text>
+</svg><figcaption>The PTX m16n8k16 output has a fixed map: each lane owns four FP32 scores at <code>row0=(lane/4)%8</code> (and +8), <code>col0=(lane%4)*2</code> (and +1). Knowing which lane holds which score is what lets the per-row reductions run as register shuffles — the precondition for §4's in-register softmax. ldmatrix.x2.trans feeds operands the same way: lanes 0–7 address one 8×8 block, 8–15 the next with the <code>+8</code> that §4 calls the longest-hunted bug.</figcaption></figure>
 
+<h2><span class="no">4</span>Keeping the score matrix in registers (v8)</h2>
+<p>
+The standard kernel writes <code>S = Q·Kᵀ</code> to shared memory (16 KB), syncs,
+reads it back for softmax, writes <code>P</code> back to smem, syncs again — two
+full round-trips per tile. We instead keep <code>S</code> in registers
+(<code>s_acc[4][4]</code> per thread, 16 values at known MMA positions) and do the
+softmax there: a shuffle reduction across the four threads that share a row, then a
+1 KB cross-warp exchange for the full 64-column max and sum. That single change —
+deleting the smem_s round-trip and a barrier — took tensor-core utilization from
+~18% to ~50% and the kernel from 38 to 125 TFLOPS.
+</p>
+<figure class="fig"><svg viewBox="0 0 700 220" role="img" aria-label="shared-memory round-trip versus in-register softmax">
+  <text x="22" y="24" class="cap">v7 · the score matrix goes through shared memory</text>
+  <rect class="bx" x="30" y="40" width="120" height="42" rx="4"/><text x="90" y="66" text-anchor="middle">Q·Kᵀ</text>
+  <line class="ln" x1="150" y1="61" x2="186" y2="61" marker-end="url(#arr)"/>
+  <rect class="bx-r" x="188" y="40" width="156" height="42" rx="4"/>
+  <text x="266" y="58" text-anchor="middle" class="rd mn">smem_s · 16 KB</text>
+  <text x="266" y="73" text-anchor="middle" class="sub">write → sync → read</text>
+  <line class="ln" x1="344" y1="61" x2="380" y2="61" marker-end="url(#arr)"/>
+  <rect class="bx" x="382" y="40" width="116" height="42" rx="4"/><text x="440" y="66" text-anchor="middle">softmax</text>
+  <line class="ln" x1="498" y1="61" x2="534" y2="61" marker-end="url(#arr)"/>
+  <rect class="bx" x="536" y="40" width="120" height="42" rx="4"/><text x="596" y="66" text-anchor="middle">P·V</text>
+  <text x="22" y="118" class="cap">v8 · the score matrix stays in registers</text>
+  <rect class="bx" x="30" y="134" width="120" height="42" rx="4"/><text x="90" y="160" text-anchor="middle">Q·Kᵀ</text>
+  <line class="ln" x1="150" y1="155" x2="186" y2="155" marker-end="url(#arrA)"/>
+  <rect class="bx-g" x="188" y="134" width="156" height="42" rx="4"/>
+  <text x="266" y="152" text-anchor="middle" class="gr mn">s_acc[4][4]</text>
+  <text x="266" y="167" text-anchor="middle" class="sub">in registers — no smem</text>
+  <line class="ln" x1="344" y1="155" x2="380" y2="155" marker-end="url(#arr)"/>
+  <rect class="bx" x="382" y="134" width="116" height="42" rx="4"/>
+  <text x="440" y="152" text-anchor="middle">softmax</text><text x="440" y="167" text-anchor="middle" class="sub">shuffle + 1 KB</text>
+  <line class="ln" x1="498" y1="155" x2="534" y2="155" marker-end="url(#arr)"/>
+  <rect class="bx" x="536" y="134" width="120" height="42" rx="4"/><text x="596" y="160" text-anchor="middle">P·V</text>
+  <text x="350" y="206" text-anchor="middle" class="sub">deleting the 16 KB round-trip and a barrier: ~18% → ~50% tensor utilization</text>
+</svg><figcaption>The biggest single jump (v8). The MMA output never leaves registers; the softmax runs on it directly, with only a 1 KB cross-warp exchange.</figcaption></figure>
+<p>
+It depends on raw PTX. <code>mma.sync.aligned.m16n8k16</code> has a known,
+documented register layout, so each thread knows exactly which (row, col) of S it
+holds — which is what makes in-register softmax possible at all.
+<code>ldmatrix</code> loads 8×8 tiles from smem straight into MMA-ready registers.
+The single hardest bug was its transposed variant: <code>ldmatrix.x2.trans</code>
+needs threads 8–15 to address the <em>second</em> 8×8 block
+(<code class="mono">+8</code> cols for K, <code class="mono">+8</code> rows for V);
+getting it wrong silently loads half the K-dimension and only corrupts the bottom
+half of the output.
+</p>
+<figure class="fig"><svg viewBox="0 0 700 210" role="img" aria-label="ldmatrix.x2.trans addressing bug">
+  <text x="22" y="24" class="cap">loading the 16-wide K-tile as two 8×8 blocks</text>
+  <text x="30" y="60" class="gr">correct</text>
+  <rect class="bx-g" x="120" y="42" width="120" height="44" rx="4"/><text x="180" y="62" text-anchor="middle" class="mn">block 0</text><text x="180" y="77" text-anchor="middle" class="sub">cols 0–7</text>
+  <rect class="bx-g" x="248" y="42" width="120" height="44" rx="4"/><text x="308" y="62" text-anchor="middle" class="mn">block 1</text><text x="308" y="77" text-anchor="middle" class="sub">cols 8–15</text>
+  <text x="392" y="60" class="sub mn">threads 0–7  → block 0</text>
+  <text x="392" y="78" class="sub mn">threads 8–15 → block 1  (+8)</text>
+  <text x="30" y="134" class="rd">bug</text>
+  <rect class="bx-r" x="120" y="116" width="120" height="44" rx="4"/><text x="180" y="136" text-anchor="middle" class="mn">block 0</text><text x="180" y="151" text-anchor="middle" class="sub">cols 0–7</text>
+  <rect class="bx-d" x="248" y="116" width="120" height="44" rx="4"/><text x="308" y="142" text-anchor="middle" class="sub">never loaded</text>
+  <text x="392" y="134" class="sub mn">both groups use lane%8</text>
+  <text x="392" y="152" class="sub mn">→ block 1 duplicates block 0</text>
+  <text x="30" y="190" class="sub">Rows 0–7 of the output look fine; rows 8–15 are corrupt.  Fix: <tspan class="mn">addr += ((lane/8)%2) * 8;</tspan></text>
+</svg><figcaption>The longest-hunted bug. The transposed load needs threads 8–15 to address the <em>second</em> 8×8 block; miss the +8 and half the K-dimension silently vanishes.</figcaption></figure>
+
+<h2><span class="no">5</span>Direct new-max rescale (v9)</h2>
+<p>
+Online softmax tracks a running maximum across tiles. v8 computed
+<code>exp(S − tile_max)</code> then post-multiplied the sum and the output by
+<code>exp(tile_max − new_max)</code> to reconcile scales. v9 computes
+<code>new_max = max(prev_max, tile_max)</code> <em>before</em> the exponential and
+subtracts it directly, so <code>P = exp(S − new_max)</code> lands in smem already at
+the right scale — no post-multiply. It removes multiplies from the softmax→P·V
+critical path and fixes accuracy drift on long sequences.
+</p>
+<figure class="fig"><svg viewBox="0 0 700 158" role="img" aria-label="online softmax running maximum">
+  <text x="22" y="24" class="cap">reconciling scales when a new KV tile arrives</text>
+  <line class="ln" x1="40" y1="74" x2="660" y2="74" marker-end="url(#arr)"/>
+  <text x="652" y="94" text-anchor="end" class="sub">score →</text>
+  <line class="lnd" x1="300" y1="46" x2="300" y2="86"/>
+  <text x="300" y="40" text-anchor="middle" class="sub mn">prev_max</text>
+  <text x="300" y="104" text-anchor="middle" class="sub">old O lives here</text>
+  <line class="lnd" x1="470" y1="46" x2="470" y2="86"/>
+  <text x="470" y="40" text-anchor="middle" class="sub mn">tile_max</text>
+  <circle cx="470" cy="74" r="5" class="gd"/>
+  <text x="470" y="104" text-anchor="middle" class="gd mn">new_max</text>
+  <text x="350" y="138" text-anchor="middle" class="sub">v9: subtract new_max before exp → new P already correct; only old O is rescaled by exp(prev_max − new_max)</text>
+</svg><figcaption>Online softmax keeps a running max. v9 picks <code>new_max</code> first, so the new tile's P needs no post-scaling — one fewer multiply on the critical path.</figcaption></figure>
+
+<h2><span class="no">6</span>Async loads, then occupancy (v10 → v11)</h2>
+<p>
+<strong>v10</strong> replaced the staged uint4 loads with <code>cp.async</code>:
+K and V stream gmem→smem without passing through registers, freeing the load/store
+units for compute and letting the K+V load hide behind a single wait. +13% to 156 TFLOPS.
+</p>
+<figure class="fig"><svg viewBox="0 0 700 178" role="img" aria-label="cp.async bypasses registers">
+  <text x="22" y="24" class="cap">v6 · staged load through registers</text>
+  <rect class="bx" x="40" y="36" width="124" height="40" rx="4"/><text x="102" y="61" text-anchor="middle" class="mn">global mem</text>
+  <line class="ln" x1="164" y1="56" x2="214" y2="56" marker-end="url(#arr)"/>
+  <rect class="bx-r" x="216" y="36" width="124" height="40" rx="4"/><text x="278" y="61" text-anchor="middle" class="rd">registers</text>
+  <line class="ln" x1="340" y1="56" x2="390" y2="56" marker-end="url(#arr)"/>
+  <rect class="bx" x="392" y="36" width="124" height="40" rx="4"/><text x="454" y="61" text-anchor="middle" class="mn">shared mem</text>
+  <text x="528" y="61" class="sub">occupies the LSU</text>
+  <text x="22" y="116" class="cap">v10 · cp.async — direct to shared memory</text>
+  <rect class="bx" x="40" y="128" width="124" height="40" rx="4"/><text x="102" y="153" text-anchor="middle" class="mn">global mem</text>
+  <path class="ln" d="M164,148 C 300,148 300,148 390,148" marker-end="url(#arrA)"/>
+  <text x="278" y="142" text-anchor="middle" class="sub">registers bypassed</text>
+  <rect class="bx-g" x="392" y="128" width="124" height="40" rx="4"/><text x="454" y="153" text-anchor="middle" class="mn">shared mem</text>
+  <text x="528" y="153" class="sub">LSU free for math</text>
+</svg><figcaption>cp.async streams tiles straight to shared memory without staging through registers — the closest consumer Blackwell gets to a hardware DMA.</figcaption></figure>
+<p>
+By v10 the profiler still showed ~54% tensor utilization — the softmax bubble,
+unhidden. The lever for that is <strong>occupancy</strong>: more resident thread
+blocks per SM let the scheduler run another block's matmuls during this block's
+softmax. We were pinned at <strong>2 blocks/SM</strong> by shared memory (37 KB/block
+against 100 KB/SM). Two changes broke the pin:
+</p>
+<h3>Alias P onto K — 37 KB → 28 KB</h3>
+<p>
+<code>P</code> doesn't exist while <code>K</code> is in use: it's the softmax output,
+born <em>after</em> Q·Kᵀ has finished reading K — and there is already a
+<code>__syncthreads</code> between the last K read and the first P write. So P can
+reuse K's 9 KB:
+</p>
+<pre><code><span class="c">// K is dead after Q·Kᵀ; the phase-3 barrier separates the last</span>
+<span class="c">// K read from the first P write, so P safely reuses K's storage.</span>
+half* smem_p = smem_k;   <span class="c">// 37 KB → 28 KB  ⇒  2 → 3 blocks/SM</span></code></pre>
+<p>
+Three lines, output bit-identical, occupancy 33% → 50%. <strong>+5 to +9%.</strong>
+</p>
+<figure class="fig"><svg viewBox="0 0 700 262" role="img" aria-label="aliasing P onto K frees a third resident block">
+  <text x="22" y="22" class="cap">per-block shared memory</text>
+  <text x="22" y="58" class="sub">v10</text>
+  <rect class="bx" x="64" y="42" width="118" height="26" rx="3"/><text x="123" y="60" text-anchor="middle" class="sub mn">Q 9KB</text>
+  <rect class="bx" x="186" y="42" width="118" height="26" rx="3"/><text x="245" y="60" text-anchor="middle" class="sub mn">K 9KB</text>
+  <rect class="bx" x="308" y="42" width="118" height="26" rx="3"/><text x="367" y="60" text-anchor="middle" class="sub mn">V 9KB</text>
+  <rect class="bx-r" x="430" y="42" width="118" height="26" rx="3"/><text x="489" y="60" text-anchor="middle" class="sub mn">P 9KB</text>
+  <text x="560" y="60" class="sub">= 37 KB</text>
+  <text x="22" y="100" class="sub">v11</text>
+  <rect class="bx" x="64" y="84" width="118" height="26" rx="3"/><text x="123" y="102" text-anchor="middle" class="sub mn">Q 9KB</text>
+  <rect class="bx-g" x="186" y="84" width="118" height="26" rx="3"/><text x="245" y="102" text-anchor="middle" class="sub mn">K = P 9KB</text>
+  <rect class="bx" x="308" y="84" width="118" height="26" rx="3"/><text x="367" y="102" text-anchor="middle" class="sub mn">V 9KB</text>
+  <text x="560" y="102" class="sub">= 28 KB</text>
+  <text x="186" y="126" class="sub gr">P reuses K's storage — K is dead after Q·Kᵀ</text>
+  <text x="22" y="166" class="cap">one SM · 100 KB shared memory</text>
+  <rect class="bx-d" x="64" y="178" width="250" height="56" rx="4"/>
+  <rect class="bx" x="74" y="186" width="78" height="40" rx="3"/><text x="113" y="210" text-anchor="middle" class="sub">block</text>
+  <rect class="bx" x="160" y="186" width="78" height="40" rx="3"/><text x="199" y="210" text-anchor="middle" class="sub">block</text>
+  <text x="189" y="252" text-anchor="middle" class="sub">2 blocks · 33% occupancy</text>
+  <rect class="bx-d" x="380" y="178" width="290" height="56" rx="4"/>
+  <rect class="bx-a" x="390" y="186" width="84" height="40" rx="3"/><text x="432" y="210" text-anchor="middle" class="sub acc">block</text>
+  <rect class="bx-a" x="478" y="186" width="84" height="40" rx="3"/><text x="520" y="210" text-anchor="middle" class="sub acc">block</text>
+  <rect class="bx-a" x="566" y="186" width="84" height="40" rx="3"/><text x="608" y="210" text-anchor="middle" class="sub acc">block</text>
+  <text x="525" y="252" text-anchor="middle" class="acc">3 blocks · 50% occupancy</text>
+</svg><figcaption>Aliasing P onto K drops the block from 37 to 28 KB — enough that a third block now fits on the SM. More resident blocks means another block's matmuls can fill this block's softmax bubble.</figcaption></figure>
+<h3>Staged cp.async — hide V behind the softmax</h3>
+<p>
+Q·Kᵀ only needs K; V isn't touched until P·V, a whole softmax later. So commit K
+and V as <em>separate</em> async groups and wait only for K up front, draining V
+just before P·V (reusing a barrier already there):
+</p>
+<pre><code>cp_async_commit_group();   <span class="c">// group 1: K</span>
+cp_async_commit_group();   <span class="c">// group 2: V</span>
+cp_async_wait_group&lt;1&gt;();   <span class="c">// wait K only; V streams behind QK+softmax</span></code></pre>
+<p>
+Zero extra smem, +1 to +4.5% on top. Combined, v11 is <strong>+5 to +15% over
+v10</strong> — ~170 TFLOPS at the sweet spot, ~183 peak.
+</p>
+<figure class="fig"><svg viewBox="0 0 700 162" role="img" aria-label="staged cp.async hides the V load">
+  <text x="22" y="24" class="cap">one KV tile — what runs when</text>
+  <text x="22" y="64" class="sub">compute</text>
+  <rect class="bx" x="90" y="46" width="70" height="34" rx="3"/><text x="125" y="67" text-anchor="middle" class="sub mn">load K</text>
+  <rect class="bx-a" x="162" y="46" width="206" height="34" rx="3"/><text x="265" y="67" text-anchor="middle">Q·Kᵀ + softmax</text>
+  <rect class="bx-a" x="372" y="46" width="150" height="34" rx="3"/><text x="447" y="67" text-anchor="middle">P·V</text>
+  <text x="125" y="100" text-anchor="middle" class="sub">wait K only</text>
+  <text x="22" y="124" class="sub">memory</text>
+  <rect class="bx-g" x="162" y="106" width="206" height="30" rx="3"/><text x="265" y="125" text-anchor="middle" class="sub gr mn">V streaming (cp.async)</text>
+  <line class="lnd" x1="368" y1="42" x2="368" y2="136"/>
+  <text x="450" y="125" class="sub">drain V here — wait_group&lt;0&gt;</text>
+</svg><figcaption>K and V are committed as separate async groups. The kernel waits for K, computes Q·Kᵀ and softmax while V streams in underneath, then drains V just before P·V — V's load latency disappears.</figcaption></figure>
+
+<h2><span class="no">7</span>Bigger heads: D=128 and the BN=32 tile</h2>
+<p>
+The kernel was secretly generic over head dim — one literal
+(<code>PV_TILES_PER_WARP = 4</code>) hard-coded D=64. Deriving it as
+<code>D_HEAD/16</code> made D=128 work with byte-identical D=64 codegen. But the
+64×64 tile that's optimal at D=64 is wrong at D=128: it needs 52 KB → only
+<strong>1 block/SM</strong>. Halving the K/V tile to <strong>BN=32</strong> drops it
+to ~36 KB → 2 blocks/SM (16 warps), worth <strong>+28 to +31%</strong>. A per-D
+traits table picks the tile; D=128 now runs on par with D=64 (~72% of peak).
+</p>
+<figure class="fig"><svg viewBox="0 0 700 150" role="img" aria-label="BN=32 fits a second block at D=128">
+  <text x="22" y="24" class="cap">D=128 · one SM · 100 KB shared memory</text>
+  <text x="30" y="60" class="sub">tile 64×64</text>
+  <rect class="bx-d" x="130" y="42" width="150" height="52" rx="4"/>
+  <rect class="bx-r" x="138" y="50" width="110" height="36" rx="3"/><text x="193" y="72" text-anchor="middle" class="sub">block · 52 KB</text>
+  <text x="205" y="112" text-anchor="middle" class="rd">1 block/SM</text>
+  <text x="360" y="60" class="sub">tile 64×32</text>
+  <rect class="bx-d" x="440" y="42" width="232" height="52" rx="4"/>
+  <rect class="bx-a" x="448" y="50" width="104" height="36" rx="3"/><text x="500" y="72" text-anchor="middle" class="sub">36 KB</text>
+  <rect class="bx-a" x="560" y="50" width="104" height="36" rx="3"/><text x="612" y="72" text-anchor="middle" class="sub">36 KB</text>
+  <text x="556" y="112" text-anchor="middle" class="acc">2 blocks/SM · +28–31%</text>
+  <text x="350" y="138" text-anchor="middle" class="sub">halving BN is what buys the second resident block at D=128</text>
+</svg><figcaption>At D=128 the 64×64 tile is too big to double up (1 block/SM). Halving the K/V tile to BN=32 shrinks the block enough for a second one — the same occupancy lever as the alias.</figcaption></figure>
+<p>
+The obvious next step — push to 4 blocks/SM via XOR-swizzled shared memory (to drop
+padding to 25 KB) plus a 64-register cap — was implemented, verified correct, and
+<strong>lost 4–12%</strong>. See §9.
+</p>
+
+<h2><span class="no">8</span>Running the real models: GQA and BF16</h2>
+<p>
+Every modern decoder (GLM-4, Llama-3, Mistral, Qwen, Gemma) uses
+<strong>grouped-query attention</strong> — fewer K/V heads than query heads — and
+ships <strong>BF16</strong> weights. The kernel had to handle both honestly, not by
+faking MHA with replicated KV.
+</p>
+<p>
+<strong>GQA</strong> is a pure indexing change: Q/O use the query-head index, K/V use
+the mapped KV head. The inner compute is untouched; MHA is the special case
+group = 1.
+</p>
+<pre><code><span class="c">// query head h_q reads KV head h_kv (block grouping)</span>
+int h_kv = h_q / (num_q_heads / num_kv_heads);</code></pre>
+<figure class="fig"><svg viewBox="0 0 700 180" role="img" aria-label="GQA head mapping">
+  <text x="22" y="22" class="cap">GQA — 8 query heads share 2 KV heads (group = 4)</text>
+  <rect class="bx" x="40" y="40" width="60" height="28" rx="3"/><text x="70" y="58" text-anchor="middle" class="sub">Q0</text>
+  <rect class="bx" x="112" y="40" width="60" height="28" rx="3"/><text x="142" y="58" text-anchor="middle" class="sub">Q1</text>
+  <rect class="bx" x="184" y="40" width="60" height="28" rx="3"/><text x="214" y="58" text-anchor="middle" class="sub">Q2</text>
+  <rect class="bx" x="256" y="40" width="60" height="28" rx="3"/><text x="286" y="58" text-anchor="middle" class="sub">Q3</text>
+  <rect class="bx" x="328" y="40" width="60" height="28" rx="3"/><text x="358" y="58" text-anchor="middle" class="sub">Q4</text>
+  <rect class="bx" x="400" y="40" width="60" height="28" rx="3"/><text x="430" y="58" text-anchor="middle" class="sub">Q5</text>
+  <rect class="bx" x="472" y="40" width="60" height="28" rx="3"/><text x="502" y="58" text-anchor="middle" class="sub">Q6</text>
+  <rect class="bx" x="544" y="40" width="60" height="28" rx="3"/><text x="574" y="58" text-anchor="middle" class="sub">Q7</text>
+  <path class="lnd" d="M70,68 L178,130"/><path class="lnd" d="M142,68 L178,130"/>
+  <path class="lnd" d="M214,68 L178,130"/><path class="lnd" d="M286,68 L178,130"/>
+  <path class="lnd" d="M358,68 L466,130"/><path class="lnd" d="M430,68 L466,130"/>
+  <path class="lnd" d="M502,68 L466,130"/><path class="lnd" d="M574,68 L466,130"/>
+  <rect class="bx-g" x="118" y="130" width="120" height="30" rx="3"/><text x="178" y="150" text-anchor="middle" class="gr">KV0</text>
+  <rect class="bx-g" x="406" y="130" width="120" height="30" rx="3"/><text x="466" y="150" text-anchor="middle" class="gr">KV1</text>
+</svg><figcaption>Query heads 0–3 read KV head 0, 4–7 read KV head 1 — a 4× smaller KV cache. The kernel just maps <code>h_kv = h_q / 4</code>; everything else is unchanged.</figcaption></figure>
+<p>
+<strong>BF16</strong> is a one-type templating. <code>ldmatrix</code>,
+<code>cp.async</code>, and uint4 loads are all 16-bit/byte-agnostic, so only the MMA
+opcode and the float→element conversion change:
+</p>
+<pre><code>if constexpr (is_same&lt;T,__nv_bfloat16&gt;::value)
+  asm("mma.sync.aligned.m16n8k16.row.col.f32.<span class="k">bf16.bf16</span>.f32 ...");
+else
+  asm("mma.sync.aligned.m16n8k16.row.col.f32.<span class="k">f16.f16</span>.f32 ...");</code></pre>
+<p>
+The FP16 path stays byte-identical (an interleaved A/B vs the pre-templating commit
+showed ±0.3%); BF16 accuracy matches FP16 because accumulation is FP32 throughout.
+Both compile sm_80→sm_120 and validate against an FP64 reference across MHA, GQA
+(including non-power-of-two groups), and MQA.
+</p>
+
+<h2><span class="no">9</span>What didn't work</h2>
+<p>
+This is the useful part. Every "obvious" speedup below is correct and was rejected
+on measured numbers — because the kernel is <strong>occupancy- and
+latency-bound, not compute-bound</strong>. Cutting math or shared-memory traffic
+that is already hidden under the tensor cores buys nothing and adds scheduling noise.
+</p>
+<table>
+  <thead><tr><th>Attempted optimization</th><th class="num">Result</th><th>Why it failed</th></tr></thead>
+  <tbody>
+    <tr><td>exp2f fold (log₂e into scale)</td><td class="num loss">−2 to −6%</td><td>the SFU/exp was never the bottleneck; hidden under MMA</td></tr>
+    <tr><td>Hoist redundant ldmatrix loads</td><td class="num loss">−5 to −8%</td><td>kernel is MMA-bound, not LSU-bound; costs ILP</td></tr>
+    <tr><td>Pair-scoped <code>bar.sync</code></td><td class="num loss">−22 to −34%</td><td>full-CTA <code>__syncthreads</code> is hardware fast-pathed</td></tr>
+    <tr><td>Double-buffered cp.async</td><td class="num loss">regressed</td><td>+18 KB pushes over the occupancy cliff (2→1 block)</td></tr>
+    <tr><td>Swizzle → 4 blocks/SM (D=64)</td><td class="num loss">−4 to −12%</td><td>64-reg cap spills; the 4th block doesn't pay</td></tr>
+    <tr><td>BN=16 → 3 blocks/SM (D=128)</td><td class="num loss">−2 to −12%</td><td>finer tiling doubles softmax/sync overhead</td></tr>
+  </tbody>
+  <caption>The pattern: occupancy gains pay only when they're <em>cheap</em> and you're <em>genuinely</em> under-occupied. The alias win (free, 33%→50%) qualified; pushing further did not.</caption>
+</table>
+
+<h2><span class="no">10</span>Versus CUTLASS on consumer Blackwell</h2>
+<p>
+A fair comparison on this hardware is awkward, and the awkwardness is itself the
+result. CUTLASS's fast FMHA kernels need WGMMA/TMA (sm_90) or tcgen05 (sm_100) —
+none on sm_120 — and CUTLASS ships <em>no</em> consumer-Blackwell attention kernel.
+What actually compiles and runs on a 5080 is the Ampere-class example 41. Measured
+identically (FP16, causal, same shapes, same FLOP convention, same session):
+</p>
+<figure class="fig"><svg viewBox="0 0 700 130" role="img" aria-label="this kernel versus CUTLASS on RTX 5080">
+  <text x="22" y="24" class="cap">prefill · B=8 S=2048 D=128 causal · RTX 5080</text>
+  <line class="lnd" x1="680" y1="36" x2="680" y2="100"/><text x="676" y="116" text-anchor="end" class="sub">234 = FP16 peak</text>
+  <text x="20" y="58" class="sub">this kernel</text>
+  <rect class="bx-a" x="120" y="44" width="400" height="22" rx="2"/><text x="528" y="61" class="acc mn">170</text>
+  <text x="20" y="92" class="sub">CUTLASS ex.41</text>
+  <rect class="bx" x="120" y="78" width="228" height="22" rx="2"/><text x="356" y="95" class="sub mn">97</text>
+  <text x="600" y="60" text-anchor="middle" class="win" font-size="15">1.7×</text>
+</svg><figcaption>Against the only CUTLASS attention that compiles for consumer Blackwell (Ampere-class example 41), tuning for the actual silicon is worth ~1.7×. TFLOPS by a single shared formula.</figcaption></figure>
+<table>
+  <thead><tr><th>Config (causal)</th><th class="num">CUTLASS ex.41</th><th class="num">This kernel</th><th class="num">Speedup</th></tr></thead>
+  <tbody>
+    <tr><td>B=8 S=2048 D=128</td><td class="num">2.12 ms</td><td class="num">1.21 ms</td><td class="num win">1.75×</td></tr>
+    <tr><td>B=4 S=4096 D=128</td><td class="num">4.01 ms</td><td class="num">2.29 ms</td><td class="num win">1.76×</td></tr>
+    <tr><td>B=8 S=2048 D=64</td><td class="num">1.01 ms</td><td class="num">0.59 ms</td><td class="num win">1.72×</td></tr>
+  </tbody>
+  <caption>Not a comparison against CUTLASS's flagship FlashAttention (that needs a datacenter GPU) — it's against what a 5080/5090 owner actually gets. ~1.7× is the value of tuning for the silicon you have.</caption>
+</table>
+
+<h2><span class="no">11</span>What this GPU can't do</h2>
+<p>
+For context, the datacenter features the kernel works <em>without</em> — and that
+CUTLASS's fast paths depend on:
+</p>
+<table>
+  <thead><tr><th>Feature</th><th>What it buys</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>WGMMA</td><td>128-thread MMA, B operand from smem — no register pressure</td><td>sm_90+</td></tr>
+    <tr><td>TMA</td><td>hardware DMA: tile copy with zero thread cost</td><td>sm_90+</td></tr>
+    <tr><td>Warp specialization</td><td>dedicated load warps overlapping math warps</td><td>sm_90+</td></tr>
+    <tr><td>TMEM / tcgen05</td><td>dedicated tensor register file for MMA operands</td><td>sm_100</td></tr>
+  </tbody>
+  <caption>This kernel uses only mma.sync (32-thread, B from registers), manual cp.async loads, uniform warps, and the standard register file.</caption>
+</table>
+
+<h2><span class="no">12</span>The other phase: decode</h2>
+<p>
+Everything above is <strong>prefill</strong> — full-sequence, compute-bound, tensor-core
+heavy. Single-token <strong>decode</strong> (one query row against a long KV cache) is a
+different kernel entirely: memory-bandwidth-bound, M=1 so no tensor cores, parallelized
+across SMs by <em>splitting the KV cache</em> (flash-decoding). A group-resident variant
+that loads each KV head once and reuses it across the query-head group reaches
+<strong>~99% of HBM bandwidth at long context</strong>. That kernel — same GQA/BF16
+support — lives separately; it's bound by a different roofline, and "% of peak FLOPS"
+simply doesn't apply to it.
+</p>
+
+<footer>
+  Hand-written CUDA/PTX for consumer NVIDIA GPUs · MIT.
+  Measured on an RTX 5080 (84 SMs, 234.8 TFLOPS FP16 theoretical peak).
+  Validation against an FP32/FP64 CPU reference; performance via interleaved A/B (median of 9).
+</footer>
+
+</div>
 </body>
 </html>
