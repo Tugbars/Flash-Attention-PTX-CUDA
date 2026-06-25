@@ -66,4 +66,39 @@ struct FlashAttentionParams {
 // Implemented in kernels/flash_attention.cu
 void launch_flash_attention(const FlashAttentionParams& params);
 
+// ============================================================================
+// Decode (single-query) attention — a SEPARATE, memory-bound kernel.
+//
+// The prefill kernel above is compute/tensor-core bound (big Q tiles). DECODE
+// generates one token: q_len=1 vs a long KV cache, which is bandwidth-bound and
+// uses no tensor cores. This is split-KV flash-decoding: the KV cache is split
+// across SMs (partial kernel → scratch), then a combine kernel merges the
+// partials with the log-sum-exp rescale. GQA/MQA-aware.
+//
+// Layouts (D-contiguous, FP16):
+//   Q, O : [B, H_q,        D]   (one query row per batch × query-head)
+//   K, V : [B, H_kv, S_kv, D]   (H_q % H_kv == 0; query head h reads KV head h/(H_q/H_kv))
+// ============================================================================
+struct FlashDecodeParams {
+    const half* Q;            // [B, H_q, D]
+    const half* K;            // [B, H_kv, S_kv, D]
+    const half* V;            // [B, H_kv, S_kv, D]
+    half*       O;            // [B, H_q, D]
+    float*      LSE;          // [B*H_q] log-sum-exp (optional — can be nullptr)
+    void*       scratch;      // caller-owned workspace (size via flash_decode_scratch_bytes)
+    int         batch_size;   // B
+    int         num_q_heads;  // H_q
+    int         num_kv_heads; // H_kv  (H_q % H_kv == 0)
+    int         seq_len_kv;   // S_kv
+    int         d_head;       // D in {64, 128}
+    float       scale;        // 1/sqrt(D)
+    int         num_splits;   // 0 = auto-pick (recommended)
+    cudaStream_t stream;
+};
+
+// Implemented in kernels/flash_attention_decode.cu
+// Size the caller-owned scratch workspace (depends on the auto-picked num_splits).
+size_t flash_decode_scratch_bytes(const FlashDecodeParams& params);
+void   launch_flash_attention_decode(const FlashDecodeParams& params);
+
 } // namespace transformer

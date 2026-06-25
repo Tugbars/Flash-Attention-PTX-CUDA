@@ -620,13 +620,19 @@ inline int get_sm_count() {
 //          (which is 52 KB → only 1 block/SM) measured +28–31% on saturated
 //          configs — pure occupancy, the same lever as the D=64 alias win.
 // BM_SMALL/W_SMALL is the under-saturated grid-doubling variant (see dispatcher).
+// SAT_MULT is the small→big crossover, in units of SM count: use the small tile
+// while (big-geometry blocks < SAT_MULT * sm_count). It differs by D because the
+// big tile's occupancy differs — D=64 big = 3 blocks/SM, so it saturates early
+// (×2); D=128 big = only 2 blocks/SM (BN=32), so it needs more grid before it
+// beats the grid-doubling small tile. Measured small-tile wins for D=128:
+// +46%@32 blocks, +21%@96, +6-11%@192, ~tie@384; big wins ≥768 (so ×5 ≈ 420).
 template <int D> struct FaConfig;
-template <> struct FaConfig<64>  { static constexpr int BN = 64, BM_BIG = 64, W_BIG = 8, BM_SMALL = 32, W_SMALL = 4; };
-template <> struct FaConfig<128> { static constexpr int BN = 32, BM_BIG = 64, W_BIG = 8, BM_SMALL = 32, W_SMALL = 4; };
+template <> struct FaConfig<64>  { static constexpr int BN = 64, BM_BIG = 64, W_BIG = 8, BM_SMALL = 32, W_SMALL = 4, SAT_MULT = 2; };
+template <> struct FaConfig<128> { static constexpr int BN = 32, BM_BIG = 64, W_BIG = 8, BM_SMALL = 32, W_SMALL = 4, SAT_MULT = 5; };
 
 // Pick the small/big tile by GPU saturation, for a compile-time head dim. If we
-// don't have ~2 waves of big-tile blocks across the SMs, the GPU is under-
-// saturated and the small tile (half BLOCK_M, double the grid) wins.
+// don't have ~SAT_MULT waves of big-tile blocks across the SMs, the GPU is
+// under-saturated and the small tile (half BLOCK_M, double the grid) wins.
 template <int D_HEAD>
 inline void dispatch_by_saturation(const FlashAttentionParams& params) {
     using C = FaConfig<D_HEAD>;
@@ -635,7 +641,7 @@ inline void dispatch_by_saturation(const FlashAttentionParams& params) {
         * ((params.seq_len + C::BM_BIG - 1) / C::BM_BIG);
     const int sm_count = get_sm_count();
 
-    if (num_blocks_big < 2 * sm_count) {
+    if (num_blocks_big < C::SAT_MULT * sm_count) {
         launch_variant<C::BM_SMALL, C::BN, D_HEAD, C::W_SMALL>(params);
     } else {
         launch_variant<C::BM_BIG, C::BN, D_HEAD, C::W_BIG>(params);
