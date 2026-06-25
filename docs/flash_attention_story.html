@@ -718,7 +718,8 @@ across SMs by <em>splitting the KV cache</em> (flash-decoding). A group-resident
 that loads each KV head once and reuses it across the query-head group reaches
 <strong>~99% of HBM bandwidth at long context</strong>. That kernel — same GQA/BF16
 support — lives separately; it's bound by a different roofline, and "% of peak FLOPS"
-simply doesn't apply to it.
+simply doesn't apply to it. Its own write-up is here:
+<a href="flash_attention_decode_story.html">Flash decoding without tensor cores</a>.
 </p>
 
 <footer>

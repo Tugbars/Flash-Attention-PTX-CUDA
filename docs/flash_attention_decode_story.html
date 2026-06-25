@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flash Decoding on the RTX 5080 — at the memory roofline</title>
+<style>
+  :root{
+    --ink:#1c1c1a; --muted:#6c6b64; --faint:#8a8980;
+    --bg:#fbfbf8; --panel:#f5f4ee; --rule:#e5e4dd; --rule2:#d2d1c8;
+    --accent:#1f5f9e; --win:#1c7d4d; --loss:#b23b39;
+    --serif: Charter,"Bitstream Charter","Palatino Linotype","Book Antiqua",Palatino,Georgia,serif;
+    --sans: system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:"SF Mono","JetBrains Mono","Cascadia Mono",ui-monospace,Consolas,"Liberation Mono",monospace;
+  }
+  *{box-sizing:border-box;}
+  html{-webkit-text-size-adjust:100%;}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--serif);
+       font-size:19px;line-height:1.66;text-rendering:optimizeLegibility;
+       -webkit-font-smoothing:antialiased;}
+  .wrap{max-width:744px;margin:0 auto;padding:60px 24px 120px;}
+
+  header.doc{border-bottom:1px solid var(--rule2);padding-bottom:26px;margin-bottom:36px;}
+  .eyebrow{font-family:var(--sans);font-size:.72rem;letter-spacing:.13em;text-transform:uppercase;
+           color:var(--accent);font-weight:600;margin-bottom:14px;}
+  h1{font-size:2.05rem;line-height:1.18;font-weight:700;letter-spacing:-.012em;margin:0 0 14px;}
+  .subtitle{font-size:1.12rem;color:var(--muted);font-style:italic;margin:0 0 20px;line-height:1.5;}
+  .meta{font-family:var(--sans);font-size:.78rem;letter-spacing:.02em;color:var(--faint);}
+  .meta span{color:var(--muted);}
+
+  .abstract{font-size:.98rem;color:#37362f;background:var(--panel);border:1px solid var(--rule);
+            border-radius:6px;padding:18px 22px;margin:0 0 8px;line-height:1.6;}
+
+  h2{font-size:1.42rem;font-weight:700;letter-spacing:-.01em;margin:58px 0 14px;line-height:1.25;}
+  h2 .no{font-family:var(--sans);font-size:.72em;font-weight:600;color:var(--accent);margin-right:.55em;
+         vertical-align:.06em;}
+  h3{font-size:1.06rem;font-weight:700;margin:30px 0 8px;}
+  p{margin:0 0 18px;}
+  a{color:var(--accent);text-decoration:none;border-bottom:1px solid rgba(31,95,158,.32);}
+  a:hover{border-bottom-color:var(--accent);}
+  em{font-style:italic;}
+  strong{font-weight:700;}
+
+  code{font-family:var(--mono);font-size:.84em;background:#eeede6;padding:1px 5px;border-radius:3px;
+       color:#33322b;}
+  pre{font-family:var(--mono);font-size:.8rem;line-height:1.55;background:#f7f6f0;border:1px solid var(--rule);
+      border-left:3px solid var(--accent);border-radius:5px;padding:15px 17px;overflow-x:auto;margin:0 0 22px;
+      color:#33322b;}
+  pre code{background:none;padding:0;font-size:1em;color:inherit;}
+  pre .c{color:#9a9a8c;}      /* comment */
+  pre .k{color:#9b4a16;}      /* keyword/op highlight */
+
+  table{width:100%;border-collapse:collapse;font-family:var(--sans);font-size:.82rem;margin:6px 0 26px;}
+  caption{caption-side:bottom;font-family:var(--sans);font-size:.74rem;color:var(--faint);
+          text-align:left;padding-top:8px;line-height:1.45;}
+  th,td{text-align:left;padding:7px 11px;border-bottom:1px solid var(--rule);vertical-align:baseline;}
+  thead th{font-weight:600;color:var(--muted);border-bottom:1.5px solid var(--rule2);}
+  .num{text-align:right;font-variant-numeric:tabular-nums;}
+  tr.hi td{background:#f3f7fb;font-weight:600;}
+  .win{color:var(--win);font-weight:600;} .loss{color:var(--loss);font-weight:600;}
+  .mono{font-family:var(--mono);}
+
+  .note{border-left:3px solid var(--rule2);padding:2px 0 2px 18px;margin:0 0 20px;color:var(--muted);
+        font-size:.96rem;}
+
+  /* diagrams */
+  figure.fig{margin:14px 0 26px;}
+  figure.fig svg{width:100%;height:auto;display:block;background:#fff;border:1px solid var(--rule);border-radius:6px;}
+  figure.fig figcaption{font-family:var(--sans);font-size:.74rem;color:var(--faint);padding-top:9px;line-height:1.5;}
+  svg .bx{fill:var(--panel);stroke:var(--rule2);stroke-width:1;}
+  svg .bx-a{fill:#e9f1fa;stroke:var(--accent);stroke-width:1.3;}
+  svg .bx-g{fill:#e7f4ed;stroke:#3a9a63;stroke-width:1.3;}
+  svg .bx-r{fill:#fcebe9;stroke:#cf6b66;stroke-width:1.3;}
+  svg .bx-w{fill:#fbf2db;stroke:#c2912f;stroke-width:1.3;}
+  svg .bx-d{fill:#f3f2ec;stroke:var(--rule2);stroke-width:1;stroke-dasharray:4 3;}
+  svg text{font-family:var(--sans);font-size:12.5px;fill:var(--ink);}
+  svg .mn{font-family:var(--mono);}
+  svg .sub{fill:var(--muted);font-size:10.5px;}
+  svg .cap{fill:var(--faint);font-size:10px;letter-spacing:.06em;text-transform:uppercase;}
+  svg .ln{stroke:#6c6b64;stroke-width:1.4;fill:none;}
+  svg .lnd{stroke:#c9c8be;stroke-width:1.1;stroke-dasharray:4 4;fill:none;}
+  svg .acc{fill:var(--accent);} svg .gd{fill:#c2912f;} svg .gr{fill:#3a9a63;} svg .rd{fill:#cf6b66;}
+
+  hr{border:0;border-top:1px solid var(--rule);margin:0;}
+  ul{margin:0 0 18px;padding-left:22px;} li{margin:0 0 6px;}
+
+  footer{margin-top:70px;padding-top:22px;border-top:1px solid var(--rule2);
+         font-family:var(--sans);font-size:.8rem;color:var(--faint);line-height:1.6;}
+  footer a{color:var(--muted);}
+  @media(max-width:600px){ body{font-size:17px;} .wrap{padding:40px 18px 80px;} h1{font-size:1.7rem;} }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <marker id="arr" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#6c6b64"/></marker>
+  <marker id="arrA" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#1f5f9e"/></marker>
+  <marker id="arrR" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#cf6b66"/></marker>
+  <marker id="arrG" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#3a9a63"/></marker>
+</defs></svg>
+
+<header class="doc">
+  <div class="eyebrow">RTX 5080 · sm_120 · single-token decode</div>
+  <h1>Flash decoding without tensor cores</h1>
+  <p class="subtitle">The other half of attention — one query, a long KV cache, and a ~960 GB/s bandwidth wall.</p>
+  <div class="meta"><span>FP16/BF16 · MHA · MQA · GQA · D = 64 / 128 · split-KV + group-resident</span></div>
+</header>
+
+<p class="abstract">
+The companion to the <a href="flash_attention_story.html">prefill kernel</a>: single-token
+<strong>decode</strong>. One query row attends to a long KV cache, so M = 1 — no tensor
+cores, ~1 flop/byte, and the only thing that matters is how fast you can stream the KV
+cache through the chip. This kernel splits the KV cache across all 84 SMs
+(<em>flash-decoding</em>) and, for grouped-query models, loads each KV head once and
+reuses it across its whole query-head group. At long context that reaches
+<strong>~99% of the RTX 5080's ~960 GB/s HBM bandwidth</strong>. FP16 + BF16, MHA / MQA /
+GQA, D = 64 / 128, validated against an FP64 reference.
+</p>
+
+<h2><span class="no">1</span>Two phases, two rooflines</h2>
+<p>
+Generation has two phases with opposite personalities. <strong>Prefill</strong> consumes
+the whole prompt at once — big Q tiles, compute-bound, tensor cores running flat out
+(that is the <a href="flash_attention_story.html">other kernel</a>). <strong>Decode</strong>
+produces one token at a time: a single query row against the KV cache built up so far.
+The query length is <strong>1</strong>.
+</p>
+<p>
+That one fact changes everything. <code>S = Q·Kᵀ</code> with M = 1 is a matrix–vector
+product, not a matrix–matrix one, and the same is true of <code>O = P·V</code>. Arithmetic
+intensity collapses to roughly <strong>1 flop per byte</strong>: every value you read off
+the bus is used in a couple of multiply-adds and thrown away. The kernel is
+<strong>memory-bandwidth-bound</strong>, and the ceiling that matters is the ~960 GB/s HBM
+bus — not the 234.8 TFLOPS tensor-core peak. "Percent of peak FLOPS" is the wrong yardstick
+here; <strong>percent of HBM bandwidth</strong> is the right one.
+</p>
+<figure class="fig"><svg viewBox="0 0 700 244" role="img" aria-label="the decode roofline">
+  <text x="22" y="22" class="cap">throughput vs arithmetic intensity (roofline)</text>
+  <line class="ln" x1="80" y1="204" x2="80" y2="44"/>
+  <line class="ln" x1="80" y1="204" x2="666" y2="204"/>
+  <text transform="translate(34,150) rotate(-90)" class="sub">throughput →</text>
+  <text x="372" y="232" text-anchor="middle" class="sub">arithmetic intensity (flop / byte) →</text>
+  <path d="M80,204 L384,74 L666,74" fill="none" stroke="#1f5f9e" stroke-width="2"/>
+  <text x="660" y="66" text-anchor="end" class="sub">compute ceiling — 234.8 TFLOPS</text>
+  <text x="150" y="128" class="sub acc" transform="rotate(-23 150 128)">memory-bound · HBM ~960 GB/s</text>
+  <circle cx="148" cy="174" r="5" class="rd"/>
+  <text x="160" y="170" class="rd">decode ≈ 1 flop/byte</text>
+  <text x="160" y="186" class="sub">throughput set by the bus</text>
+  <circle cx="548" cy="74" r="5" class="acc"/>
+  <text x="540" y="64" text-anchor="end" class="acc">prefill</text>
+  <line class="lnd" x1="384" y1="74" x2="384" y2="204"/>
+</svg><figcaption>Decode's ~1 flop/byte puts it deep in the memory-bound region: throughput is fixed by the HBM bus, while prefill lives on the flat compute ceiling. Opposite phases need opposite optimizations — and a different metric: % of ~960 GB/s, not % of 234.8 TFLOPS.</figcaption></figure>
+
+<h2><span class="no">2</span>No tensor cores, just a stream</h2>
+<p>
+<code>mma.sync</code> processes a 16-row tile; with M = 1 it would waste fifteen of every
+sixteen rows. So decode drops the tensor cores entirely and runs a plain streaming
+dot-product with an online softmax on the CUDA cores. Per (batch, query-head): load the
+one Q row, then for every KV position <em>j</em> compute the score <code>q·kⱼ</code>, update
+the running softmax, and accumulate <code>pⱼ·vⱼ</code> into the output. State is three things
+— a running max <code>m</code>, a running sum <code>ℓ</code>, and the output accumulator.
+</p>
+<p>
+The cost is dominated by reading K and V <em>once</em>: <code>4·B·H_kv·S·D</code> bytes in
+FP16 (Q and O are a single row each — negligible). The best the kernel can do is
+<code>bytes / bandwidth</code>, and only if it (a) keeps every SM busy and (b) reads each
+KV byte exactly once. Those are the two fights, and the rest of this is them.
+</p>
+
+<h2><span class="no">3</span>Split-KV: filling 84 SMs with one query row</h2>
+<p>
+The natural grid is <code>(H_q, B)</code> CTAs. At batch 1 with a handful of heads, that's
+a handful of CTAs on an 84-SM GPU — the machine sits almost entirely idle, and a
+bandwidth-bound kernel that uses one SM achieves one SM's worth of bandwidth. Flash-decoding
+fixes this by <strong>splitting the KV cache</strong>: the grid becomes
+<code>(num_splits, H_q, B)</code>. Each CTA streams its own chunk of K/V, runs an
+<em>independent</em> online softmax over it, and writes a partial result — the chunk's max
+<code>m</code>, sum <code>ℓ</code>, and unnormalized output — to a scratch buffer. A small
+<strong>combine</strong> kernel then merges the splits.
+</p>
+<figure class="fig"><svg viewBox="0 0 700 232" role="img" aria-label="splitting the KV cache to fill the SMs">
+  <text x="22" y="22" class="cap">filling the SMs with a single query row</text>
+  <text x="24" y="52" class="sub">no split</text>
+  <rect class="bx-a" x="86" y="38" width="74" height="26" rx="3"/><text x="123" y="55" text-anchor="middle" class="sub">1 CTA</text>
+  <line class="ln" x1="160" y1="51" x2="196" y2="51" marker-end="url(#arr)"/>
+  <rect class="bx-a" x="206" y="38" width="26" height="26" rx="2"/>
+  <rect class="bx" x="236" y="38" width="26" height="26" rx="2"/><rect class="bx" x="266" y="38" width="26" height="26" rx="2"/>
+  <rect class="bx" x="296" y="38" width="26" height="26" rx="2"/><rect class="bx" x="326" y="38" width="26" height="26" rx="2"/>
+  <rect class="bx" x="356" y="38" width="26" height="26" rx="2"/><rect class="bx" x="386" y="38" width="26" height="26" rx="2"/>
+  <rect class="bx" x="416" y="38" width="26" height="26" rx="2"/><rect class="bx" x="446" y="38" width="26" height="26" rx="2"/>
+  <rect class="bx" x="476" y="38" width="26" height="26" rx="2"/><rect class="bx" x="506" y="38" width="26" height="26" rx="2"/>
+  <rect class="bx" x="536" y="38" width="26" height="26" rx="2"/>
+  <text x="576" y="55" class="sub rd">1 of 84 SMs busy</text>
+  <text x="24" y="146" class="sub">split-KV</text>
+  <rect class="bx" x="86" y="116" width="74" height="56" rx="3"/>
+  <text x="123" y="139" text-anchor="middle" class="sub">KV cache</text>
+  <line class="lnd" x1="105" y1="148" x2="105" y2="172"/><line class="lnd" x1="123" y1="148" x2="123" y2="172"/><line class="lnd" x1="141" y1="148" x2="141" y2="172"/>
+  <text x="123" y="166" text-anchor="middle" class="sub">N chunks</text>
+  <line class="ln" x1="160" y1="144" x2="196" y2="144" marker-end="url(#arr)"/>
+  <rect class="bx-a" x="206" y="131" width="26" height="26" rx="2"/><rect class="bx-a" x="236" y="131" width="26" height="26" rx="2"/>
+  <rect class="bx-a" x="266" y="131" width="26" height="26" rx="2"/><rect class="bx-a" x="296" y="131" width="26" height="26" rx="2"/>
+  <rect class="bx-a" x="326" y="131" width="26" height="26" rx="2"/><rect class="bx-a" x="356" y="131" width="26" height="26" rx="2"/>
+  <rect class="bx-a" x="386" y="131" width="26" height="26" rx="2"/><rect class="bx-a" x="416" y="131" width="26" height="26" rx="2"/>
+  <rect class="bx-a" x="446" y="131" width="26" height="26" rx="2"/><rect class="bx-a" x="476" y="131" width="26" height="26" rx="2"/>
+  <rect class="bx-a" x="506" y="131" width="26" height="26" rx="2"/><rect class="bx-a" x="536" y="131" width="26" height="26" rx="2"/>
+  <text x="576" y="148" class="sub gr">all SMs busy</text>
+  <text x="24" y="206" class="sub">N CTAs each stream a chunk → independent online softmax → a combine kernel merges the partials (log-sum-exp).</text>
+</svg><figcaption>At B = 1 the natural grid leaves most of the 84 SMs idle. Splitting the KV cache into chunks — one CTA each — fills the machine; the split count targets ~2 waves of CTAs across all SMs, each split at least 256 KV positions. A combine pass merges the partials.</figcaption></figure>
+<p>
+The combine is where correctness lives. Each split reports <code>(m, ℓ, O)</code> at its own
+scale; merging them is a log-sum-exp rescale to a common max. Two guards make it robust: an
+<em>empty</em> split (whose max never moved off <code>−FLT_MAX</code>) must contribute zero,
+and an all-empty row must never divide by zero.
+</p>
+<pre><code><span class="c">// merge num_splits partials onto a common max</span>
+float m = max_i  m[i];
+float l = 0, acc = 0;
+for each split i:
+  <span class="c">// guard 1: an empty split contributes nothing</span>
+  float a = (m[i] &gt; <span class="k">-FLT_MAX/2</span>) ? expf(m[i] - m) : 0;
+  l   += a * l[i];
+  acc += a * O_unnorm[i];
+O = (l &gt; 0) ? acc / l : 0;            <span class="c">// guard 2: no divide-by-zero</span></code></pre>
+<p>
+When the split count is 1 the partial kernel normalizes in place and the combine pass is
+skipped entirely. The whole plan — split count and chunk size — is computed with
+deterministic integer math shared by both the scratch-sizing and the launch, so the scratch
+buffer always matches exactly what the kernel writes.
+</p>
+
+<h2><span class="no">4</span>One coalesced load per lane</h2>
+<p>
+Inside a CTA the thread count is <code>2·D</code> (so <code>D/16</code> warps), and the D
+channels are split <em>contiguously</em> across a warp's 32 lanes: lane <em>l</em> owns
+channels <code>[l·CH, l·CH+CH)</code> with <code>CH = D/32</code> (2 at D = 64, 4 at
+D = 128). That mapping is the whole trick. Each K or V row is read with exactly one
+vectorized, fully coalesced load per lane — a <code>half2</code> at D = 64, a
+<code>uint2</code> at D = 128. The <code>Q·K</code> dot is a per-lane partial followed by a
+five-step <code>__shfl_xor</code> reduction across the warp; the <code>P·V</code> accumulate
+reuses the same per-lane mapping with no shuffle at all.
+</p>
+<pre><code><span class="c">// D channels split contiguously across 32 lanes</span>
+constexpr int CH = D / 32;              <span class="c">// 2 @D=64, 4 @D=128</span>
+dec_loadv(K + j*D + lane*CH, kf);       <span class="c">// one coalesced load per lane</span>
+float part = 0;
+for (c = 0; c &lt; CH; c++) part += qreg[c]*kf[c];
+for (off = 16; off &gt; 0; off &gt;&gt;= 1)       <span class="c">// reduce across the warp</span>
+  part += __shfl_xor_sync(-1, part, off);</code></pre>
+<figure class="fig"><svg viewBox="0 0 700 196" role="img" aria-label="one coalesced load per lane, then a warp reduce">
+  <text x="22" y="22" class="cap">one KV row → one vectorized load per lane → a scalar score</text>
+  <rect class="bx" x="40" y="42" width="74" height="30" rx="3"/><text x="77" y="61" text-anchor="middle" class="sub mn">L0</text>
+  <rect class="bx" x="118" y="42" width="74" height="30" rx="3"/><text x="155" y="61" text-anchor="middle" class="sub mn">L1</text>
+  <rect class="bx" x="196" y="42" width="74" height="30" rx="3"/><text x="233" y="61" text-anchor="middle" class="sub mn">L2</text>
+  <rect class="bx" x="274" y="42" width="74" height="30" rx="3"/><text x="311" y="61" text-anchor="middle" class="sub mn">L3</text>
+  <text x="372" y="61" class="sub">…</text>
+  <rect class="bx" x="392" y="42" width="74" height="30" rx="3"/><text x="429" y="61" text-anchor="middle" class="sub mn">L31</text>
+  <text x="490" y="56" class="sub">each lane: one</text><text x="490" y="70" class="sub">half2 / uint2 load</text>
+  <text x="40" y="98" class="sub">CH contiguous channels per lane (lane l owns [l·CH, +CH))</text>
+  <line class="ln" x1="253" y1="108" x2="253" y2="130" marker-end="url(#arr)"/>
+  <rect class="bx-a" x="150" y="132" width="206" height="28" rx="4"/><text x="253" y="150" text-anchor="middle">__shfl_xor reduce · 5 steps</text>
+  <line class="ln" x1="356" y1="146" x2="400" y2="146" marker-end="url(#arr)"/>
+  <rect class="bx-g" x="402" y="132" width="150" height="28" rx="4"/><text x="477" y="150" text-anchor="middle" class="gr">score sⱼ (scalar)</text>
+  <text x="40" y="184" class="sub">P·V accumulates per-lane with the same mapping — no shuffle. Softmax state (m, ℓ, acc) stays in registers; there is no score matrix to spill.</text>
+</svg><figcaption>The contiguous lane→channel map turns each KV-row read into one coalesced wide load per lane. The dot product reduces across the warp with shuffles; the value accumulate needs none. Because M = 1, the scores are scalars — the shared-memory round-trip that dominates prefill simply has nothing to round-trip.</figcaption></figure>
+
+<h2><span class="no">5</span>Group-resident KV: the real lever</h2>
+<p>
+Vectorizing the loads got the bandwidth only partway there. The honest measurement: wider
+loads on their own were worth <strong>+1 to +4%</strong>, and at D = 64 they actually
+<em>regressed</em>. The profiler was clear that load width wasn't the limiter — reading the
+same KV head many times was. In grouped-query attention, <code>group</code> query heads
+share one KV head; the per-q-head kernel runs one CTA per query head, and each of them
+re-reads that shared KV head through L2 (and, once it spills, HBM). That is <code>group</code>×
+redundant traffic on the one resource decode is bound by.
+</p>
+<p>
+The fix is to make the KV head <strong>resident</strong>. The group-resident kernel uses the
+grid <code>(num_splits, H_kv, B)</code> and assigns one warp per query head in the group. Each
+K/V tile (<code>TILE_N = 32</code> rows) is loaded <em>once</em> into shared memory with a
+<code>uint4</code>-coalesced copy and then reused by all <code>group</code> warps. HBM traffic
+collapses to the ideal <code>B·H_kv·S·D</code> — each KV byte crosses the bus exactly once.
+And since each warp owns a complete query head, there is no cross-warp combine: every warp
+writes its own partial directly.
+</p>
+<figure class="fig"><svg viewBox="0 0 700 232" role="img" aria-label="per-q-head re-reads versus group-resident reuse">
+  <text x="22" y="22" class="cap">GQA decode — reading each KV head (group = 4)</text>
+  <text x="40" y="48" class="sub">per-q-head</text>
+  <rect class="bx" x="40" y="92" width="84" height="40" rx="4"/><text x="82" y="112" text-anchor="middle" class="sub mn">KV head</text><text x="82" y="126" text-anchor="middle" class="sub">in HBM</text>
+  <rect class="bx-r" x="214" y="56" width="76" height="22" rx="3"/><text x="252" y="71" text-anchor="middle" class="sub">Qhead 0</text>
+  <rect class="bx-r" x="214" y="86" width="76" height="22" rx="3"/><text x="252" y="101" text-anchor="middle" class="sub">Qhead 1</text>
+  <rect class="bx-r" x="214" y="116" width="76" height="22" rx="3"/><text x="252" y="131" text-anchor="middle" class="sub">Qhead 2</text>
+  <rect class="bx-r" x="214" y="146" width="76" height="22" rx="3"/><text x="252" y="161" text-anchor="middle" class="sub">Qhead 3</text>
+  <path d="M124,108 L214,67" fill="none" stroke="#cf6b66" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#arrR)"/>
+  <path d="M124,110 L214,97" fill="none" stroke="#cf6b66" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#arrR)"/>
+  <path d="M124,114 L214,127" fill="none" stroke="#cf6b66" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#arrR)"/>
+  <path d="M124,116 L214,157" fill="none" stroke="#cf6b66" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#arrR)"/>
+  <text x="40" y="200" class="rd">group× HBM re-reads</text>
+  <line class="lnd" x1="346" y1="40" x2="346" y2="200"/>
+  <text x="380" y="48" class="sub">group-resident</text>
+  <rect class="bx" x="380" y="92" width="64" height="40" rx="4"/><text x="412" y="112" text-anchor="middle" class="sub mn">KV head</text><text x="412" y="126" text-anchor="middle" class="sub">in HBM</text>
+  <path d="M444,112 L484,112" fill="none" stroke="#3a9a63" stroke-width="1.6" marker-end="url(#arrG)"/>
+  <rect class="bx-g" x="486" y="92" width="64" height="40" rx="4"/><text x="518" y="112" text-anchor="middle" class="sub gr mn">smem</text><text x="518" y="126" text-anchor="middle" class="sub">tile</text>
+  <rect class="bx-g" x="600" y="56" width="62" height="22" rx="3"/><text x="631" y="71" text-anchor="middle" class="sub">warp 0</text>
+  <rect class="bx-g" x="600" y="86" width="62" height="22" rx="3"/><text x="631" y="101" text-anchor="middle" class="sub">warp 1</text>
+  <rect class="bx-g" x="600" y="116" width="62" height="22" rx="3"/><text x="631" y="131" text-anchor="middle" class="sub">warp 2</text>
+  <rect class="bx-g" x="600" y="146" width="62" height="22" rx="3"/><text x="631" y="161" text-anchor="middle" class="sub">warp 3</text>
+  <path d="M550,110 L600,67" fill="none" stroke="#3a9a63" stroke-width="1.3" marker-end="url(#arrG)"/>
+  <path d="M550,111 L600,97" fill="none" stroke="#3a9a63" stroke-width="1.3" marker-end="url(#arrG)"/>
+  <path d="M550,113 L600,127" fill="none" stroke="#3a9a63" stroke-width="1.3" marker-end="url(#arrG)"/>
+  <path d="M550,114 L600,157" fill="none" stroke="#3a9a63" stroke-width="1.3" marker-end="url(#arrG)"/>
+  <text x="380" y="200" class="gr">1 HBM read, reused by the group</text>
+</svg><figcaption>Per-q-head runs one CTA per query head, each re-reading the shared KV head — <code>group</code>× redundant bus traffic. Group-resident loads each K/V tile once into shared memory and fans it out to one warp per query head, so each KV byte crosses the bus exactly once and no cross-warp combine is needed. This — not wider loads — is what reaches the roofline.</figcaption></figure>
+
+<h2><span class="no">6</span>The dispatcher: only when it fills the GPU</h2>
+<p>
+Group residency isn't free. Collapsing <code>group</code> query heads into one CTA means
+<code>group</code>× <em>fewer</em> CTAs — which at small batch and short context
+<em>under-fills</em> the SMs, exactly the regime where the per-q-head kernel (more CTAs)
+wins. So the launch planner computes both split plans and chooses group-resident only when
+its grid <code>(num_splits · H_kv · B)</code> reaches roughly the SM count; otherwise it
+falls back to per-q-head. MQA (group = 1) and very wide groups (&gt; 32) always use
+per-q-head. The decision is deterministic integer math, so scratch-sizing and launch never
+disagree.
+</p>
+
+<h2><span class="no">7</span>Performance</h2>
+<p>
+Measured on the RTX 5080 (~960 GB/s), as percent of HBM peak — the only roofline that means
+anything for a bandwidth-bound kernel:
+</p>
+<figure class="fig"><svg viewBox="0 0 700 212" role="img" aria-label="achieved HBM bandwidth by configuration">
+  <text x="22" y="22" class="cap">achieved HBM bandwidth · group-resident GQA decode</text>
+  <line class="lnd" x1="650" y1="34" x2="650" y2="184"/><text x="646" y="200" text-anchor="end" class="sub">100% = ~960 GB/s</text>
+  <text x="20" y="58" class="sub">B=1 S=2048</text>
+  <rect class="bx" x="150" y="44" width="235" height="22" rx="2"/><text x="393" y="61" class="sub mn">47%</text>
+  <text x="430" y="61" class="sub">launch-bound (~18 µs)</text>
+  <text x="20" y="92" class="sub">B=1 S=4096</text>
+  <rect class="bx" x="150" y="78" width="305" height="22" rx="2"/><text x="463" y="95" class="sub mn">61%</text>
+  <text x="20" y="126" class="sub">B=8 S=4096</text>
+  <rect class="bx-a" x="150" y="112" width="400" height="22" rx="2"/><text x="558" y="129" class="acc mn">80%</text>
+  <text x="20" y="160" class="sub">B=1 S=16384</text>
+  <rect class="bx-d" x="150" y="146" width="260" height="22" rx="2"/>
+  <rect class="bx-a" x="150" y="146" width="495" height="22" rx="2" fill-opacity="0.85"/><text x="600" y="163" class="acc mn">99%</text>
+  <text x="414" y="186" class="sub">dashed = 42–61% before group residency</text>
+</svg><figcaption>Long-context, batched GQA decode reaches ~99% of the bus; the same config sat at 42–61% before group residency. Short, small-batch configs sit lower — but there the kernel is ~18 µs and launch/latency-bound, not bandwidth-bound: there simply isn't enough KV traffic to saturate the bus, and you can't beat the speed of light on a kernel that short.</figcaption></figure>
+<table>
+  <thead><tr><th>Config (D=128, GQA)</th><th class="num">% HBM peak</th><th>Regime</th></tr></thead>
+  <tbody>
+    <tr><td>B=1 S=2048</td><td class="num">47%</td><td>launch / latency-bound (tiny kernel)</td></tr>
+    <tr><td>B=1 S=4096</td><td class="num">61%</td><td>filling up</td></tr>
+    <tr><td>B=8 S=4096</td><td class="num">80%</td><td>near roofline</td></tr>
+    <tr class="hi"><td>B=1 S=16384</td><td class="num">99%</td><td>at the roofline (was 42–61%)</td></tr>
+  </tbody>
+  <caption>Group residency is the lever: it took long-context decode from 42–61% to ~99% of peak. Vectorized loads alone were +1–4% (D=64 regressed) — the limiter was group re-reads, not load width.</caption>
+</table>
+
+<h2><span class="no">8</span>GQA and BF16</h2>
+<p>
+Grouped-query attention isn't a bolt-on here — the group-resident kernel is <em>organized</em>
+around KV heads, so GQA is the common case and MHA is just group = 1. The mapping is the same
+one the prefill kernel uses: <code>h_kv = h_q / (H_q / H_kv)</code>.
+</p>
+<p>
+<strong>BF16</strong> is a one-type templating. A <code>Vec2&lt;T&gt;</code> trait picks
+<code>__half2</code> or <code>__nv_bfloat162</code> for the vectorized loads, <code>to_elem&lt;T&gt;</code>
+handles the float→element store, and the <code>uint4</code> shared-memory tile copy is
+byte-agnostic. <code>params.dtype</code> selects it (FP16 by default, so existing callers are
+unchanged). Validated against an FP64 reference across MHA, MQA, and GQA (groups 3 / 4 / 5),
+D = 64 / 128, S = 1 … 16384, B = 1 / 3, plus empty-split and adversarial-logit edges —
+<strong>FP16 nrmse ≈ 2e-4, BF16 ≈ 2e-3</strong>. 40 registers, 0 spills, compiles sm_80 → sm_120.
+</p>
+
+<h2><span class="no">9</span>What's left</h2>
+<ul>
+  <li><strong>A measured occupancy for the split heuristic.</strong> The split count currently
+      assumes 8 resident blocks/SM at D = 64 and 6 at D = 128; replacing that guess with a
+      measured <code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code> would tighten the plan
+      at the margins.</li>
+  <li><strong>cp.async double-buffering over the smem KV tile.</strong> Worth trying only if a
+      config is shown to be latency-bound on the shared-memory load — none currently are, so it
+      stays on the shelf.</li>
+  <li><strong>Short / MQA / D = 64 configs stay launch-bound.</strong> That's expected and fine:
+      those kernels are microseconds long and contribute negligibly to real decode, which lives
+      at long context and batched serving — the roofline regime.</li>
+</ul>
+
+<footer>
+  Hand-written CUDA for consumer NVIDIA GPUs · MIT.
+  Measured on an RTX 5080 (84 SMs, ~960 GB/s HBM). Decode is bandwidth-bound, so throughput is
+  reported as % of HBM peak, not % of FLOPS.
+  Validation against an FP64 CPU reference. Companion to the <a href="flash_attention_story.html">prefill story</a>.
+</footer>
+
+</div>
+</body>
+</html>
