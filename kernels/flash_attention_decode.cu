@@ -81,6 +81,22 @@ inline size_t align256(size_t x) { return (x + 255) & ~size_t(255); }
 // online softmax over a round-robin slice of the split's KV positions; the per-
 // warp partials are merged in smem at the end (log-sum-exp rescale).
 // ============================================================================
+// Vectorized load of CH (2 or 4) contiguous halfs → float[CH]. One wide coalesced
+// load per lane: uint2 (64-bit) for D=128, half2 (32-bit) for D=64.
+template <int CH>
+__device__ __forceinline__ void dec_loadv(const half* p, float (&o)[CH]) {
+    if constexpr (CH == 2) {
+        __half2 h = *reinterpret_cast<const __half2*>(p);
+        o[0] = __low2float(h); o[1] = __high2float(h);
+    } else { // CH == 4
+        uint2 u = *reinterpret_cast<const uint2*>(p);
+        __half2 a = *reinterpret_cast<__half2*>(&u.x);
+        __half2 b = *reinterpret_cast<__half2*>(&u.y);
+        o[0] = __low2float(a); o[1] = __high2float(a);
+        o[2] = __low2float(b); o[3] = __high2float(b);
+    }
+}
+
 template <int D>
 __global__ void decode_partial(
     const half* __restrict__ Q, const half* __restrict__ K, const half* __restrict__ V,
@@ -114,8 +130,7 @@ __global__ void decode_partial(
     for (int i = tid; i < D; i += THREADS) smem_q[i] = Q[q_off + i];
     __syncthreads();
     float qreg[CH];
-    #pragma unroll
-    for (int c = 0; c < CH; c++) qreg[c] = __half2float(smem_q[lane + c * 32]);
+    dec_loadv<CH>(smem_q + lane * CH, qreg);   // contiguous: lane owns [lane*CH, +CH)
 
     const int base = s * chunk;
     const int next = min(base + chunk, S_kv);
@@ -128,9 +143,10 @@ __global__ void decode_partial(
 
     for (int j = base + warp; j < next; j += NWARPS) {
         const half* kj = Kh + (size_t)j * D;
+        float kf[CH]; dec_loadv<CH>(kj + lane * CH, kf);
         float part = 0.0f;
         #pragma unroll
-        for (int c = 0; c < CH; c++) part += qreg[c] * __half2float(kj[lane + c * 32]);
+        for (int c = 0; c < CH; c++) part += qreg[c] * kf[c];
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1) part += __shfl_xor_sync(0xffffffffu, part, off);
         float s_j   = part * scale;
@@ -138,15 +154,16 @@ __global__ void decode_partial(
         float corr  = __expf(m_w - m_new);
         float p     = __expf(s_j - m_new);
         const half* vj = Vh + (size_t)j * D;
+        float vf[CH]; dec_loadv<CH>(vj + lane * CH, vf);
         #pragma unroll
-        for (int c = 0; c < CH; c++) acc[c] = acc[c] * corr + p * __half2float(vj[lane + c * 32]);
+        for (int c = 0; c < CH; c++) acc[c] = acc[c] * corr + p * vf[c];
         l_w = l_w * corr + p;
         m_w = m_new;
     }
 
     if (lane == 0) { red_m[warp] = m_w; red_l[warp] = l_w; }
     #pragma unroll
-    for (int c = 0; c < CH; c++) red_acc[warp][lane + c * 32] = acc[c];
+    for (int c = 0; c < CH; c++) red_acc[warp][lane * CH + c] = acc[c];
     __syncthreads();
 
     // cross-warp merge: global block max, then rescale each warp's (l, acc)
