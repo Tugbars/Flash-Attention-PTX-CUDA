@@ -22,6 +22,7 @@
 #include "../include/flash_attention.h"
 #include <cfloat>
 #include <cmath>
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -93,18 +94,34 @@ inline size_t align256(size_t x) { return (x + 255) & ~size_t(255); }
 // warp runs an INDEPENDENT online softmax over a round-robin slice of the
 // split's KV positions; the per-warp partials are merged in smem (log-sum-exp).
 // ============================================================================
-// Vectorized load of CH (2 or 4) contiguous halfs → float[CH]. One wide
-// coalesced load per lane: uint2 (64-bit) for D=128, half2 (32-bit) for D=64.
-template <int CH>
-__device__ __forceinline__ void dec_loadv(const half *p, float (&o)[CH]) {
+// Element-type plumbing: BF16 reuses the FP16 paths (both 16-bit); only the
+// packed-pair type and the float<->element conversion differ.
+template <class T> struct Vec2;
+template <> struct Vec2<half> { using type = __half2; };
+template <> struct Vec2<__nv_bfloat16> { using type = __nv_bfloat162; };
+
+template <class T> __device__ __forceinline__ T to_elem(float x);
+template <> __device__ __forceinline__ half to_elem<half>(float x) {
+  return __float2half(x);
+}
+template <>
+__device__ __forceinline__ __nv_bfloat16 to_elem<__nv_bfloat16>(float x) {
+  return __float2bfloat16(x);
+}
+
+// Vectorized load of CH (2 or 4) contiguous elements → float[CH]. One wide
+// coalesced load per lane: uint2 (64-bit) for D=128, 32-bit pair for D=64.
+template <class T, int CH>
+__device__ __forceinline__ void dec_loadv(const T *p, float (&o)[CH]) {
+  using V2 = typename Vec2<T>::type;
   if constexpr (CH == 2) {
-    __half2 h = *reinterpret_cast<const __half2 *>(p);
+    V2 h = *reinterpret_cast<const V2 *>(p);
     o[0] = __low2float(h);
     o[1] = __high2float(h);
   } else { // CH == 4
     uint2 u = *reinterpret_cast<const uint2 *>(p);
-    __half2 a = *reinterpret_cast<__half2 *>(&u.x);
-    __half2 b = *reinterpret_cast<__half2 *>(&u.y);
+    V2 a = *reinterpret_cast<V2 *>(&u.x);
+    V2 b = *reinterpret_cast<V2 *>(&u.y);
     o[0] = __low2float(a);
     o[1] = __high2float(a);
     o[2] = __low2float(b);
@@ -112,10 +129,10 @@ __device__ __forceinline__ void dec_loadv(const half *p, float (&o)[CH]) {
   }
 }
 
-template <int D>
+template <int D, class T>
 __global__ void
-decode_partial(const half *__restrict__ Q, const half *__restrict__ K,
-               const half *__restrict__ V, half *__restrict__ O,
+decode_partial(const T *__restrict__ Q, const T *__restrict__ K,
+               const T *__restrict__ V, T *__restrict__ O,
                float *__restrict__ LSE, float *__restrict__ Op,
                float *__restrict__ mp, float *__restrict__ lp, int H_q,
                int H_kv, int S_kv, int chunk, int num_splits, float scale) {
@@ -134,10 +151,10 @@ decode_partial(const half *__restrict__ Q, const half *__restrict__ K,
   const int h_kv = h_q / group; // block grouping (verified)
 
   const size_t q_off = (size_t)(b * H_q + h_q) * D;
-  const half *Kh = K + (size_t)(b * H_kv + h_kv) * S_kv * D;
-  const half *Vh = V + (size_t)(b * H_kv + h_kv) * S_kv * D;
+  const T *Kh = K + (size_t)(b * H_kv + h_kv) * S_kv * D;
+  const T *Vh = V + (size_t)(b * H_kv + h_kv) * S_kv * D;
 
-  __shared__ half smem_q[D];
+  __shared__ T smem_q[D];
   __shared__ float red_m[NWARPS];
   __shared__ float red_l[NWARPS];
   __shared__ float red_acc[NWARPS][D];
@@ -146,7 +163,7 @@ decode_partial(const half *__restrict__ Q, const half *__restrict__ K,
     smem_q[i] = Q[q_off + i];
   __syncthreads();
   float qreg[CH];
-  dec_loadv<CH>(smem_q + lane * CH,
+  dec_loadv<T, CH>(smem_q + lane * CH,
                 qreg); // contiguous: lane owns [lane*CH, +CH)
 
   const int base = s * chunk;
@@ -160,9 +177,9 @@ decode_partial(const half *__restrict__ Q, const half *__restrict__ K,
     acc[c] = 0.0f;
 
   for (int j = base + warp; j < next; j += NWARPS) {
-    const half *kj = Kh + (size_t)j * D;
+    const T *kj = Kh + (size_t)j * D;
     float kf[CH];
-    dec_loadv<CH>(kj + lane * CH, kf);
+    dec_loadv<T, CH>(kj + lane * CH, kf);
     float part = 0.0f;
 #pragma unroll
     for (int c = 0; c < CH; c++)
@@ -174,9 +191,9 @@ decode_partial(const half *__restrict__ Q, const half *__restrict__ K,
     float m_new = fmaxf(m_w, s_j);
     float corr = __expf(m_w - m_new);
     float p = __expf(s_j - m_new);
-    const half *vj = Vh + (size_t)j * D;
+    const T *vj = Vh + (size_t)j * D;
     float vf[CH];
-    dec_loadv<CH>(vj + lane * CH, vf);
+    dec_loadv<T, CH>(vj + lane * CH, vf);
 #pragma unroll
     for (int c = 0; c < CH; c++)
       acc[c] = acc[c] * corr + p * vf[c];
@@ -210,7 +227,7 @@ decode_partial(const half *__restrict__ Q, const half *__restrict__ K,
       a += alpha * red_acc[w][d];
     }
     if (num_splits == 1) {
-      O[q_off + d] = __float2half((l_blk > 0.0f) ? (a / l_blk) : 0.0f);
+      O[q_off + d] = to_elem<T>((l_blk > 0.0f) ? (a / l_blk) : 0.0f);
       if (LSE && d == 0)
         LSE[b * H_q + h_q] = (l_blk > 0.0f) ? (m_blk + logf(l_blk)) : -INFINITY;
     } else {
@@ -234,10 +251,10 @@ decode_partial(const half *__restrict__ Q, const half *__restrict__ K,
 // head (contiguous lane→channel), so there is NO cross-warp combine: it writes
 // its head's partial directly. Used when 1 < group <= 32.
 // ============================================================================
-template <int D>
+template <int D, class T>
 __global__ void
-decode_partial_gqa(const half *__restrict__ Q, const half *__restrict__ K,
-                   const half *__restrict__ V, half *__restrict__ O,
+decode_partial_gqa(const T *__restrict__ Q, const T *__restrict__ K,
+                   const T *__restrict__ V, T *__restrict__ O,
                    float *__restrict__ LSE, float *__restrict__ Op,
                    float *__restrict__ mp, float *__restrict__ lp, int H_q,
                    int H_kv, int S_kv, int chunk, int num_splits, float scale,
@@ -253,15 +270,15 @@ decode_partial_gqa(const half *__restrict__ Q, const half *__restrict__ K,
   const int nthreads = blockDim.x; // == group * 32
   const int h_q = h_kv * group + warp;
 
-  __shared__ half sK[TILE_N * D];
-  __shared__ half sV[TILE_N * D];
+  __shared__ T sK[TILE_N * D];
+  __shared__ T sV[TILE_N * D];
 
   const size_t q_off = (size_t)(b * H_q + h_q) * D;
   float qreg[CH];
-  dec_loadv<CH>(Q + q_off + lane * CH, qreg);
+  dec_loadv<T, CH>(Q + q_off + lane * CH, qreg);
 
-  const half *Kh = K + (size_t)(b * H_kv + h_kv) * S_kv * D;
-  const half *Vh = V + (size_t)(b * H_kv + h_kv) * S_kv * D;
+  const T *Kh = K + (size_t)(b * H_kv + h_kv) * S_kv * D;
+  const T *Vh = V + (size_t)(b * H_kv + h_kv) * S_kv * D;
   const int base = s * chunk;
   const int next = min(base + chunk, S_kv);
 
@@ -287,7 +304,7 @@ decode_partial_gqa(const half *__restrict__ Q, const half *__restrict__ K,
 
     for (int jj = 0; jj < tn; jj++) {
       float kf[CH];
-      dec_loadv<CH>(sK + jj * D + lane * CH, kf);
+      dec_loadv<T, CH>(sK + jj * D + lane * CH, kf);
       float part = 0.0f;
 #pragma unroll
       for (int c = 0; c < CH; c++)
@@ -300,7 +317,7 @@ decode_partial_gqa(const half *__restrict__ Q, const half *__restrict__ K,
       float corr = __expf(m_w - m_new);
       float p = __expf(s_j - m_new);
       float vf[CH];
-      dec_loadv<CH>(sV + jj * D + lane * CH, vf);
+      dec_loadv<T, CH>(sV + jj * D + lane * CH, vf);
 #pragma unroll
       for (int c = 0; c < CH; c++)
         acc[c] = acc[c] * corr + p * vf[c];
@@ -316,7 +333,7 @@ decode_partial_gqa(const half *__restrict__ Q, const half *__restrict__ K,
     float inv = (l_w > 0.0f) ? (1.0f / l_w) : 0.0f;
 #pragma unroll
     for (int c = 0; c < CH; c++)
-      O[q_off + lane * CH + c] = __float2half(acc[c] * inv);
+      O[q_off + lane * CH + c] = to_elem<T>(acc[c] * inv);
     if (LSE && lane == 0)
       LSE[b * H_q + h_q] = (l_w > 0.0f) ? (m_w + logf(l_w)) : -INFINITY;
   } else {
@@ -336,10 +353,10 @@ decode_partial_gqa(const half *__restrict__ Q, const half *__restrict__ K,
 // Combine kernel: one CTA = one (batch, query-head). D threads, thread d owns
 // output channel d. Merges num_splits partials with the log-sum-exp rescale.
 // ============================================================================
-template <int D>
+template <int D, class T>
 __global__ void
 decode_combine(const float *__restrict__ Op, const float *__restrict__ mp,
-               const float *__restrict__ lp, half *__restrict__ O,
+               const float *__restrict__ lp, T *__restrict__ O,
                float *__restrict__ LSE, int H_q, int num_splits) {
   const int h_q = blockIdx.x;
   const int b = blockIdx.y;
@@ -366,7 +383,7 @@ decode_combine(const float *__restrict__ Op, const float *__restrict__ mp,
     l += alpha * ls[i];
     acc += alpha * Op[(row * num_splits + i) * D + d];
   }
-  O[row * D + d] = __float2half((l > 0.0f) ? (acc / l) : 0.0f); // guard #2
+  O[row * D + d] = to_elem<T>((l > 0.0f) ? (acc / l) : 0.0f); // guard #2
   if (LSE && d == 0)
     LSE[row] = (l > 0.0f) ? (m + logf(l)) : -INFINITY;
 }
@@ -418,10 +435,58 @@ size_t flash_decode_scratch_bytes(const FlashDecodeParams &p) {
   return align256(bytes_O) + align256(bytes_m) + align256(bytes_l);
 }
 
+// Element-typed launch body (T = half or __nv_bfloat16). The params pointers are
+// typed half* as address carriers; reinterpret to T (no-op for half).
+template <class T>
+static void decode_dispatch(const FlashDecodeParams &p, const DecPlan &pl,
+                            float *Op, float *mp, float *lp) {
+  const int ns = pl.ns, chunk = pl.chunk;
+  const T *Q = reinterpret_cast<const T *>(p.Q);
+  const T *K = reinterpret_cast<const T *>(p.K);
+  const T *V = reinterpret_cast<const T *>(p.V);
+  T *O = reinterpret_cast<T *>(p.O);
+
+  if (pl.use_gqa) {
+    // group-resident: one CTA per (split, KV-head, batch); group warps/CTA.
+    const int group = pl.group;
+    dim3 grid(ns, p.num_kv_heads, p.batch_size);
+    dim3 block(group * 32);
+    if (p.d_head == 64)
+      decode_partial_gqa<64, T><<<grid, block, 0, p.stream>>>(
+          Q, K, V, O, p.LSE, Op, mp, lp, p.num_q_heads, p.num_kv_heads,
+          p.seq_len_kv, chunk, ns, p.scale, group);
+    else
+      decode_partial_gqa<128, T><<<grid, block, 0, p.stream>>>(
+          Q, K, V, O, p.LSE, Op, mp, lp, p.num_q_heads, p.num_kv_heads,
+          p.seq_len_kv, chunk, ns, p.scale, group);
+  } else {
+    // per-q-head (MHA / group>32): one CTA per (split, q-head, batch).
+    dim3 grid(ns, p.num_q_heads, p.batch_size);
+    if (p.d_head == 64)
+      decode_partial<64, T><<<grid, dim3(128), 0, p.stream>>>(
+          Q, K, V, O, p.LSE, Op, mp, lp, p.num_q_heads, p.num_kv_heads,
+          p.seq_len_kv, chunk, ns, p.scale);
+    else
+      decode_partial<128, T><<<grid, dim3(256), 0, p.stream>>>(
+          Q, K, V, O, p.LSE, Op, mp, lp, p.num_q_heads, p.num_kv_heads,
+          p.seq_len_kv, chunk, ns, p.scale);
+  }
+
+  if (ns > 1) {
+    dim3 cgrid(p.num_q_heads, p.batch_size);
+    size_t csmem = sizeof(float) * 2 * ns;
+    if (p.d_head == 64)
+      decode_combine<64, T><<<cgrid, dim3(64), csmem, p.stream>>>(
+          Op, mp, lp, O, p.LSE, p.num_q_heads, ns);
+    else
+      decode_combine<128, T><<<cgrid, dim3(128), csmem, p.stream>>>(
+          Op, mp, lp, O, p.LSE, p.num_q_heads, ns);
+  }
+}
+
 void launch_flash_attention_decode(const FlashDecodeParams &p) {
   DecPlan pl = dec_plan(p);
-  int ns = pl.ns, chunk = pl.chunk;
-
+  int ns = pl.ns;
   size_t rows = (size_t)p.batch_size * p.num_q_heads;
   float *Op = reinterpret_cast<float *>(p.scratch);
   float *mp =
@@ -436,43 +501,10 @@ void launch_flash_attention_decode(const FlashDecodeParams &p) {
     abort();
   }
 
-  if (pl.use_gqa) {
-    // group-resident: one CTA per (split, KV-head, batch); group warps/CTA.
-    const int group = pl.group;
-    dim3 grid(ns, p.num_kv_heads, p.batch_size);
-    dim3 block(group * 32);
-    if (p.d_head == 64)
-      decode_partial_gqa<64><<<grid, block, 0, p.stream>>>(
-          p.Q, p.K, p.V, p.O, p.LSE, Op, mp, lp, p.num_q_heads, p.num_kv_heads,
-          p.seq_len_kv, chunk, ns, p.scale, group);
-    else
-      decode_partial_gqa<128><<<grid, block, 0, p.stream>>>(
-          p.Q, p.K, p.V, p.O, p.LSE, Op, mp, lp, p.num_q_heads, p.num_kv_heads,
-          p.seq_len_kv, chunk, ns, p.scale, group);
-  } else {
-    // per-q-head (MHA / group>32): one CTA per (split, q-head, batch).
-    dim3 grid(ns, p.num_q_heads, p.batch_size);
-    if (p.d_head == 64)
-      decode_partial<64><<<grid, dim3(128), 0, p.stream>>>(
-          p.Q, p.K, p.V, p.O, p.LSE, Op, mp, lp, p.num_q_heads, p.num_kv_heads,
-          p.seq_len_kv, chunk, ns, p.scale);
-    else
-      decode_partial<128><<<grid, dim3(256), 0, p.stream>>>(
-          p.Q, p.K, p.V, p.O, p.LSE, Op, mp, lp, p.num_q_heads, p.num_kv_heads,
-          p.seq_len_kv, chunk, ns, p.scale);
-  }
-
-  if (ns > 1) {
-    dim3 cgrid(p.num_q_heads, p.batch_size);
-    size_t csmem = sizeof(float) * 2 * ns;
-    if (p.d_head == 64) {
-      decode_combine<64><<<cgrid, dim3(64), csmem, p.stream>>>(
-          Op, mp, lp, p.O, p.LSE, p.num_q_heads, ns);
-    } else {
-      decode_combine<128><<<cgrid, dim3(128), csmem, p.stream>>>(
-          Op, mp, lp, p.O, p.LSE, p.num_q_heads, ns);
-    }
-  }
+  if (p.dtype == DType::BF16)
+    decode_dispatch<__nv_bfloat16>(p, pl, Op, mp, lp);
+  else
+    decode_dispatch<half>(p, pl, Op, mp, lp);
   CUDA_CHECK(cudaGetLastError());
 }
 

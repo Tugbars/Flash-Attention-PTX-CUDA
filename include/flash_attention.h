@@ -101,6 +101,7 @@ struct FlashDecodeParams {
     int         d_head;       // D in {64, 128}
     float       scale;        // 1/sqrt(D)
     int         num_splits;   // 0 = auto-pick (recommended)
+    DType       dtype;        // FP16 (default) or BF16; Q/K/V/O carry that type
     cudaStream_t stream;
 };
 
