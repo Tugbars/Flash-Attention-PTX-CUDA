@@ -168,8 +168,11 @@ the running softmax, and accumulate <code>pⱼ·vⱼ</code> into the output. Sta
 <p>
 The cost is dominated by reading K and V <em>once</em>: <code>4·B·H_kv·S·D</code> bytes in
 FP16 (Q and O are a single row each — negligible). The best the kernel can do is
-<code>bytes / bandwidth</code>, and only if it (a) keeps every SM busy and (b) reads each
-KV byte exactly once. Those are the two fights, and the rest of this is them.
+<code>bytes / bandwidth</code> — but only if it (a) keeps every SM busy and (b) reads each
+KV byte exactly once. The second is subtler than it sounds: with grouped-query attention the
+naïve path reads each KV head once <em>per query head</em> (<code>4·B·H_q·S·D</code>), and
+reaching the <code>H_kv</code> ideal above takes the group-resident trick of §5. Those are the
+two fights, and the rest of this is them.
 </p>
 
 <h2><span class="no">3</span>Split-KV: filling 84 SMs with one query row</h2>
@@ -218,11 +221,11 @@ scale; merging them is a log-sum-exp rescale to a common max. Two guards make it
 and an all-empty row must never divide by zero.
 </p>
 <pre><code><span class="c">// merge num_splits partials onto a common max</span>
-float m = max_i  m[i];
+float m_glob = max_i  m[i];          <span class="c">// global max over splits</span>
 float l = 0, acc = 0;
 for each split i:
   <span class="c">// guard 1: an empty split contributes nothing</span>
-  float a = (m[i] &gt; <span class="k">-FLT_MAX/2</span>) ? expf(m[i] - m) : 0;
+  float a = (m[i] &gt; <span class="k">-FLT_MAX/2</span>) ? expf(m[i] - m_glob) : 0;
   l   += a * l[i];
   acc += a * O_unnorm[i];
 O = (l &gt; 0) ? acc / l : 0;            <span class="c">// guard 2: no divide-by-zero</span></code></pre>
@@ -239,8 +242,8 @@ Inside a CTA the thread count is <code>2·D</code> (so <code>D/16</code> warps),
 channels are split <em>contiguously</em> across a warp's 32 lanes: lane <em>l</em> owns
 channels <code>[l·CH, l·CH+CH)</code> with <code>CH = D/32</code> (2 at D = 64, 4 at
 D = 128). That mapping is the whole trick. Each K or V row is read with exactly one
-vectorized, fully coalesced load per lane — a <code>half2</code> at D = 64, a
-<code>uint2</code> at D = 128. The <code>Q·K</code> dot is a per-lane partial followed by a
+vectorized, fully coalesced load per lane — a 32-bit packed pair
+(<code>half2</code> / <code>bfloat162</code>) at D = 64, a <code>uint2</code> at D = 128. The <code>Q·K</code> dot is a per-lane partial followed by a
 five-step <code>__shfl_xor</code> reduction across the warp; the <code>P·V</code> accumulate
 reuses the same per-lane mapping with no shuffle at all.
 </p>
@@ -259,14 +262,14 @@ for (off = 16; off &gt; 0; off &gt;&gt;= 1)       <span class="c">// reduce acro
   <rect class="bx" x="274" y="42" width="74" height="30" rx="3"/><text x="311" y="61" text-anchor="middle" class="sub mn">L3</text>
   <text x="372" y="61" class="sub">…</text>
   <rect class="bx" x="392" y="42" width="74" height="30" rx="3"/><text x="429" y="61" text-anchor="middle" class="sub mn">L31</text>
-  <text x="490" y="56" class="sub">each lane: one</text><text x="490" y="70" class="sub">half2 / uint2 load</text>
+  <text x="490" y="56" class="sub">each lane: one</text><text x="490" y="70" class="sub">wide packed load</text>
   <text x="40" y="98" class="sub">CH contiguous channels per lane (lane l owns [l·CH, +CH))</text>
   <line class="ln" x1="253" y1="108" x2="253" y2="130" marker-end="url(#arr)"/>
   <rect class="bx-a" x="150" y="132" width="206" height="28" rx="4"/><text x="253" y="150" text-anchor="middle">__shfl_xor reduce · 5 steps</text>
   <line class="ln" x1="356" y1="146" x2="400" y2="146" marker-end="url(#arr)"/>
   <rect class="bx-g" x="402" y="132" width="150" height="28" rx="4"/><text x="477" y="150" text-anchor="middle" class="gr">score sⱼ (scalar)</text>
   <text x="40" y="184" class="sub">P·V accumulates per-lane with the same mapping — no shuffle. Softmax state (m, ℓ, acc) stays in registers; there is no score matrix to spill.</text>
-</svg><figcaption>The contiguous lane→channel map turns each KV-row read into one coalesced wide load per lane. The dot product reduces across the warp with shuffles; the value accumulate needs none. Because M = 1, the scores are scalars — the shared-memory round-trip that dominates prefill simply has nothing to round-trip.</figcaption></figure>
+</svg><figcaption>The contiguous lane→channel map turns each KV-row read into one coalesced wide load per lane. The dot product reduces across the warp with shuffles; the value accumulate needs none. Because M = 1 the scores are scalars: there is no score <em>matrix</em> to stage through shared memory the way prefill must. (The per-q-head kernel still does a small cross-warp merge in smem; what's gone is the big score-matrix round-trip.)</figcaption></figure>
 
 <h2><span class="no">5</span>Group-resident KV: the real lever</h2>
 <p>
@@ -283,7 +286,8 @@ The fix is to make the KV head <strong>resident</strong>. The group-resident ker
 grid <code>(num_splits, H_kv, B)</code> and assigns one warp per query head in the group. Each
 K/V tile (<code>TILE_N = 32</code> rows) is loaded <em>once</em> into shared memory with a
 <code>uint4</code>-coalesced copy and then reused by all <code>group</code> warps. HBM traffic
-collapses to the ideal <code>B·H_kv·S·D</code> — each KV byte crosses the bus exactly once.
+collapses to the ideal <code>4·B·H_kv·S·D</code> bytes — K and V each read once, every KV
+byte crossing the bus exactly once.
 And since each warp owns a complete query head, there is no cross-warp combine: every warp
 writes its own partial directly.
 </p>
@@ -347,7 +351,7 @@ anything for a bandwidth-bound kernel:
   <rect class="bx-d" x="150" y="146" width="260" height="22" rx="2"/>
   <rect class="bx-a" x="150" y="146" width="495" height="22" rx="2" fill-opacity="0.85"/><text x="600" y="163" class="acc mn">99%</text>
   <text x="414" y="186" class="sub">dashed = 42–61% before group residency</text>
-</svg><figcaption>Long-context, batched GQA decode reaches ~99% of the bus; the same config sat at 42–61% before group residency. Short, small-batch configs sit lower — but there the kernel is ~18 µs and launch/latency-bound, not bandwidth-bound: there simply isn't enough KV traffic to saturate the bus, and you can't beat the speed of light on a kernel that short.</figcaption></figure>
+</svg><figcaption>Long-context, batched GQA decode reaches ~99% of the bus; the same config sat at 42–61% before group residency. Short, small-batch configs sit lower — but there the kernel is ~18 µs and launch/latency-bound, not bandwidth-bound: a kernel that runs only ~18 µs is dominated by fixed launch and memory-latency overhead, so there isn't enough KV traffic to approach the bandwidth limit.</figcaption></figure>
 <table>
   <thead><tr><th>Config (D=128, GQA)</th><th class="num">% HBM peak</th><th>Regime</th></tr></thead>
   <tbody>
@@ -372,7 +376,7 @@ handles the float→element store, and the <code>uint4</code> shared-memory tile
 byte-agnostic. <code>params.dtype</code> selects it (FP16 by default, so existing callers are
 unchanged). Validated against an FP64 reference across MHA, MQA, and GQA (groups 3 / 4 / 5),
 D = 64 / 128, S = 1 … 16384, B = 1 / 3, plus empty-split and adversarial-logit edges —
-<strong>FP16 nrmse ≈ 2e-4, BF16 ≈ 2e-3</strong>. 40 registers, 0 spills, compiles sm_80 → sm_120.
+<strong>FP16 nrmse ≈ 2e-4, BF16 ≈ 2e-3</strong>. ~40 registers in the partial kernel, 0 spills, compiles sm_80 → sm_120.
 </p>
 
 <h2><span class="no">9</span>What's left</h2>
