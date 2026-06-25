@@ -636,9 +636,13 @@ inline void dispatch_by_saturation(const FlashAttentionParams& params) {
     const int sm_count = get_sm_count();
 
     if (num_blocks_big < 2 * sm_count) {
-        launch_variant<32, BLOCK_N, D_HEAD, 4>(params);
+        launch_variant<C::BM_SMALL, C::BN, D_HEAD, C::W_SMALL>(params);
     } else {
-        launch_variant<64, BLOCK_N, D_HEAD, 8>(params);
+        launch_variant<C::BM_BIG, C::BN, D_HEAD, C::W_BIG>(params);
+    }
+}
+
+} // anonymous namespace
 
 // Runtime head-dim -> compile-time instantiation. d_head must be a multiple of
 // 16 (the MMA k-tile); 64 and 128 are the tuned paths (GLM, Llama, DeepSeek-LLM,
