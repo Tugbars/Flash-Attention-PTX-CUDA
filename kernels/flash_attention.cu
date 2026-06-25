@@ -1,14 +1,12 @@
 // ============================================================================
-// Flash Attention v9 — PTX MMA + In-Register Softmax
-//
-// Peak: 156.9 TFLOPS on RTX 5080 (58% of theoretical FP16 peak)
+// Flash Attention v11 — PTX MMA + In-Register Softmax
 //
 // Architecture:
 //   - 8 warps (256 threads) per block, organized as 4 warp pairs
 //   - Each warp pair handles a 16×64 output tile (m16n8k16 MMA)
 //   - Within a pair, warp_half=0 covers N-columns 0-31, warp_half=1 covers 32-63
 //   - Q*K^T results stay in registers — softmax via shuffle + 1KB smem exchange
-//   - P written to smem_p only for the P*V MMA step
+//   - P written to smem_p (which aliases smem_k) only for the P*V MMA step
 //
 // Per KV tile:
 //   Step A: S = Q * K^T          (PTX MMA, result in s_acc registers)
@@ -17,7 +15,15 @@
 //   Step D: O += P * V           (PTX MMA, P from smem_p, V from smem_v)
 //
 // Tile sizes: BLOCK_M=64, BLOCK_N=64, D_HEAD=64
-// Shared memory: ~37 KB (smem_q + smem_k + smem_v + smem_p + 1KB exchange)
+// Shared memory: ~28 KB (smem_q + smem_k/p + smem_v + 1KB exchange) → 3 blocks/SM
+//
+// v11 occupancy work (measured on RTX 5080, interleaved A/B vs v10):
+//   - Alias smem_p onto smem_k: 37→28 KB lifts 2→3 blocks/SM (33%→50% occ).
+//   - Staged cp.async: K and V committed as separate groups; wait only for K
+//     before QK, drain V right before P*V — hides V's load behind QK+softmax.
+//   Combined: +5% to +15% over v10 across saturated configs (peak ~183 TFLOPS
+//   at B=4,S=4096). The kernel is occupancy/latency-bound, NOT compute-bound:
+//   cutting math (exp2f fold, mask elision) measured neutral-to-negative.
 // ============================================================================
 
 #include <cuda_fp16.h>
@@ -134,14 +140,23 @@ __global__ void flash_attention_ptx_kernel(
 
     // -- Shared memory layout ------------------------------------------------
     // Padding by 8 halfs avoids bank conflicts on 16-byte aligned ldmatrix.
+    // (Removing the pad to save smem instead triggers 8-way bank conflicts on
+    //  ldmatrix and costs ~2.5×; the pad is load-bearing, not slack.)
+    //
+    // smem_p ALIASES smem_k: K is dead the moment Step A (Q·Kᵀ) finishes reading
+    // it, and the phase-3 __syncthreads (after the max exchange) separates the
+    // last K read from the first P write — so P can safely reuse K's 9 KB. This
+    // drops the tile from 37 KB → 28 KB, which lifts occupancy from 2 → 3
+    // blocks/SM (33% → 50%) and is the single biggest win in this kernel.
+    // P_STRIDE == KV_STRIDE (==72) and BLOCK_M == BLOCK_N (==64), so the regions
+    // are exactly the same size; the small tile (BLOCK_M=32) fits within K too.
     //
     //   smem_q:            [BLOCK_M × (D_HEAD+8)] half     Q tile (9 KB)
-    //   smem_k:            [BLOCK_N × (D_HEAD+8)] half     K tile (9 KB)
+    //   smem_k:            [BLOCK_N × (D_HEAD+8)] half     K tile (9 KB)  ← also holds P
     //   smem_v:            [BLOCK_N × (D_HEAD+8)] half     V tile (9 KB)
-    //   smem_p:            [BLOCK_M × (BLOCK_N+8)] half    P = softmax(S) (9 KB)
     //   smem_partial_max:  [2 × BLOCK_M] float             cross-warp max (0.5 KB)
     //   smem_partial_sum:  [2 × BLOCK_M] float             cross-warp sum (0.5 KB)
-    //                                                      Total: ~37 KB
+    //                                                      Total: ~28 KB
     constexpr int SMEM_PAD  = 8;
     constexpr int Q_STRIDE  = D_HEAD + SMEM_PAD;
     constexpr int KV_STRIDE = D_HEAD + SMEM_PAD;
@@ -151,8 +166,8 @@ __global__ void flash_attention_ptx_kernel(
     half*  smem_q = reinterpret_cast<half*>(smem_raw);
     half*  smem_k = smem_q + BLOCK_M * Q_STRIDE;
     half*  smem_v = smem_k + BLOCK_N * KV_STRIDE;
-    half*  smem_p = smem_v + BLOCK_N * KV_STRIDE;
-    float* smem_partial_max = reinterpret_cast<float*>(smem_p + BLOCK_M * P_STRIDE);
+    half*  smem_p = smem_k;  // alias onto K (see note above): saves 9 KB, +1 block/SM
+    float* smem_partial_max = reinterpret_cast<float*>(smem_v + BLOCK_N * KV_STRIDE);
     float* smem_partial_sum = smem_partial_max + 2 * BLOCK_M;
 
     const size_t head_offset = static_cast<size_t>(bh_idx) * seq_len * D_HEAD;
@@ -233,6 +248,7 @@ __global__ void flash_attention_ptx_kernel(
                     reinterpret_cast<const uint4*>(K_head + g * D_HEAD) + col,
                     valid);
             }
+            cp_async_commit_group();   // commit K as its own group
             for (int idx = tid; idx < BLOCK_N * VEC_COLS; idx += THREADS) {
                 int row = idx / VEC_COLS, col = idx % VEC_COLS;
                 int g = kv_start + row;
@@ -242,8 +258,11 @@ __global__ void flash_attention_ptx_kernel(
                     reinterpret_cast<const uint4*>(V_head + g * D_HEAD) + col,
                     valid);
             }
-            cp_async_commit_group();
-            cp_async_wait_group<0>();
+            cp_async_commit_group();   // commit V as a separate group
+            // Wait only for K (group 1-of-2). V keeps streaming gmem→smem behind
+            // the entire QK MMA + softmax window and is drained just before Step D
+            // (see phase 5). Hides V's load latency for free — no extra smem.
+            cp_async_wait_group<1>();
         }
         __syncthreads();
 
@@ -389,6 +408,11 @@ __global__ void flash_attention_ptx_kernel(
         }
 
         // Phase 5: Exchange partial sums between warp halves
+        // Drain the V load here: it was issued as a separate cp.async group and has
+        // been streaming behind the whole QK + softmax window. The phase-5
+        // __syncthreads below doubles as the cross-warp visibility barrier for V,
+        // so Step D sees a fully-resident smem_v with no added barrier.
+        cp_async_wait_group<0>();
         if (lane_id % 4 == 0) {
             smem_partial_sum[warp_half * BLOCK_M + global_row0] = partial_sum0;
             smem_partial_sum[warp_half * BLOCK_M + global_row1] = partial_sum1;
@@ -536,7 +560,6 @@ inline void launch_variant(const FlashAttentionParams& params) {
     constexpr int SMEM_PAD  = 8;
     constexpr int Q_STRIDE  = D_HEAD + SMEM_PAD;
     constexpr int KV_STRIDE = D_HEAD + SMEM_PAD;
-    constexpr int P_STRIDE  = BLOCK_N + SMEM_PAD;
 
     const int grid_x = (params.seq_len + BLOCK_M - 1) / BLOCK_M;
     const int grid_y = params.batch_size * params.num_heads;
@@ -545,9 +568,9 @@ inline void launch_variant(const FlashAttentionParams& params) {
 
     size_t smem_bytes = 0;
     smem_bytes += BLOCK_M * Q_STRIDE * sizeof(half);   // smem_q
-    smem_bytes += BLOCK_N * KV_STRIDE * sizeof(half);  // smem_k
+    smem_bytes += BLOCK_N * KV_STRIDE * sizeof(half);  // smem_k (also holds P, aliased)
     smem_bytes += BLOCK_N * KV_STRIDE * sizeof(half);  // smem_v
-    smem_bytes += BLOCK_M * P_STRIDE * sizeof(half);   // smem_p
+    // smem_p is aliased onto smem_k (see kernel) — no separate allocation.
     smem_bytes += 4 * BLOCK_M * sizeof(float);         // partial_max + partial_sum
 
     if (smem_bytes > 48 * 1024) {
