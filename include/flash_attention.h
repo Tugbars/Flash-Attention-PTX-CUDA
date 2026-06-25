@@ -45,6 +45,10 @@
 
 namespace transformer {
 
+// Input/output element type. FP16==0 so a zero-initialized params struct ({})
+// defaults to FP16 (back-compat). BF16 for Llama-3/Mistral/Qwen/GLM (bf16 weights).
+enum class DType { FP16 = 0, BF16 = 1 };
+
 // ============================================================================
 // Launch Parameters
 // ============================================================================
@@ -62,6 +66,8 @@ struct FlashAttentionParams {
     int         d_head;      // 64 or 128
     float       scale;       // Typically 1.0f / sqrtf(d_head)
     bool        causal;      // true = causal mask (upper triangle masked)
+    DType       dtype;       // FP16 (default) or BF16. Q/K/V/O carry that type;
+                             // the pointers are typed half* as address carriers.
     cudaStream_t stream;
 };
 

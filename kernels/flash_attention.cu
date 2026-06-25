@@ -31,8 +31,10 @@
 #include "../include/flash_attention.h"
 #include <cfloat>
 #include <cmath>
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <type_traits>
 
 
 namespace transformer {
@@ -54,16 +56,40 @@ static constexpr int WARP_SIZE_FA = 32;
 // d3=C[row1,col1]
 //   where row0 = (lane_id/4)%8, row1 = row0+8, col0 = (lane_id%4)*2, col1 =
 //   col0+1
+// float -> element conversion (FP16 or BF16). ldmatrix/cp.async/uint4 are all
+// 16-bit/byte-agnostic, so the element type only shows up here and in the MMA.
+template <class T> __device__ __forceinline__ T to_elem(float x);
+template <> __device__ __forceinline__ half to_elem<half>(float x) {
+  return __float2half(x);
+}
+template <>
+__device__ __forceinline__ __nv_bfloat16 to_elem<__nv_bfloat16>(float x) {
+  return __float2bfloat16(x);
+}
+
+// m16n8k16 MMA, templated on the input element type. Only the PTX opcode differs
+// (.f16.f16 vs .bf16.bf16) — operands are the same uint32 register pairs loaded
+// by ldmatrix, accumulation is always FP32.
+template <class T>
 __device__ __forceinline__ void
 ptx_mma_m16n8k16(float &d0, float &d1, float &d2, float &d3, uint32_t a0,
                  uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                  uint32_t b1, float c0, float c1, float c2, float c3) {
-  asm volatile(
-      "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-      "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};"
-      : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(c0), "f"(c1),
-        "f"(c2), "f"(c3));
+  if constexpr (::std::is_same<T, __nv_bfloat16>::value) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};"
+        : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(c0),
+          "f"(c1), "f"(c2), "f"(c3));
+  } else {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};"
+        : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(c0),
+          "f"(c1), "f"(c2), "f"(c3));
+  }
 }
 
 // Load four 8×8 FP16 matrices from shared memory into registers (A operand).
@@ -116,12 +142,12 @@ template <int N> __device__ __forceinline__ void cp_async_wait_group() {
 // ============================================================================
 // Kernel
 // ============================================================================
-template <int BLOCK_M, int BLOCK_N, int D_HEAD, int NUM_WARPS, bool CAUSAL>
+template <int BLOCK_M, int BLOCK_N, int D_HEAD, int NUM_WARPS, bool CAUSAL,
+          class T>
 __global__ void flash_attention_ptx_kernel(
-    const half *__restrict__ Q, const half *__restrict__ K,
-    const half *__restrict__ V, half *__restrict__ O, float *__restrict__ LSE,
-    const int seq_len, const int num_q_heads, const int num_kv_heads,
-    const float scale) {
+    const T *__restrict__ Q, const T *__restrict__ K, const T *__restrict__ V,
+    T *__restrict__ O, float *__restrict__ LSE, const int seq_len,
+    const int num_q_heads, const int num_kv_heads, const float scale) {
   const int bh_idx = blockIdx.y;            // batch * head index
   const int q_start = blockIdx.x * BLOCK_M; // first query row for this block
   const int tid = threadIdx.x + threadIdx.y * WARP_SIZE_FA;
@@ -158,10 +184,10 @@ __global__ void flash_attention_ptx_kernel(
   constexpr int P_STRIDE = BLOCK_N + SMEM_PAD;
 
   extern __shared__ char smem_raw[];
-  half *smem_q = reinterpret_cast<half *>(smem_raw);
-  half *smem_k = smem_q + BLOCK_M * Q_STRIDE;
-  half *smem_v = smem_k + BLOCK_N * KV_STRIDE;
-  half *smem_p =
+  T *smem_q = reinterpret_cast<T *>(smem_raw);
+  T *smem_k = smem_q + BLOCK_M * Q_STRIDE;
+  T *smem_v = smem_k + BLOCK_N * KV_STRIDE;
+  T *smem_p =
       smem_k; // alias onto K (see note above): saves 9 KB, +1 block/SM
   float *smem_partial_max =
       reinterpret_cast<float *>(smem_v + BLOCK_N * KV_STRIDE);
@@ -177,10 +203,10 @@ __global__ void flash_attention_ptx_kernel(
   const size_t q_off = static_cast<size_t>(bh_idx) * seq_len * D_HEAD;
   const size_t kv_off =
       static_cast<size_t>(b * num_kv_heads + h_kv) * seq_len * D_HEAD;
-  const half *Q_head = Q + q_off;
-  const half *K_head = K + kv_off;
-  const half *V_head = V + kv_off;
-  half *O_head = O + q_off;
+  const T *Q_head = Q + q_off;
+  const T *K_head = K + kv_off;
+  const T *V_head = V + kv_off;
+  T *O_head = O + q_off;
 
   // -- Load Q tile (stays in smem for all KV iterations) -------------------
   // 128-bit vectorized loads: each uint4 moves 8 half values.
@@ -316,7 +342,7 @@ __global__ void flash_attention_ptx_kernel(
                                   mat * 8);
           }
 
-          ptx_mma_m16n8k16(s_acc[ni_local][0], s_acc[ni_local][1],
+          ptx_mma_m16n8k16<T>(s_acc[ni_local][0], s_acc[ni_local][1],
                            s_acc[ni_local][2], s_acc[ni_local][3], a0, a1, a2,
                            a3, b0, b1, s_acc[ni_local][0], s_acc[ni_local][1],
                            s_acc[ni_local][2], s_acc[ni_local][3]);
@@ -423,10 +449,10 @@ __global__ void flash_attention_ptx_kernel(
       int ni_global = warp_half * QK_TILES_PER_WARP + ni;
       int p_col0 = ni_global * 8 + (lane_id % 4) * 2;
       int p_col1 = p_col0 + 1;
-      smem_p[global_row0 * P_STRIDE + p_col0] = __float2half(e0);
-      smem_p[global_row0 * P_STRIDE + p_col1] = __float2half(e1);
-      smem_p[global_row1 * P_STRIDE + p_col0] = __float2half(e2);
-      smem_p[global_row1 * P_STRIDE + p_col1] = __float2half(e3);
+      smem_p[global_row0 * P_STRIDE + p_col0] = to_elem<T>(e0);
+      smem_p[global_row0 * P_STRIDE + p_col1] = to_elem<T>(e1);
+      smem_p[global_row1 * P_STRIDE + p_col0] = to_elem<T>(e2);
+      smem_p[global_row1 * P_STRIDE + p_col1] = to_elem<T>(e3);
     }
 
 // Reduce partial sum across 4 threads sharing each row
@@ -513,7 +539,7 @@ __global__ void flash_attention_ptx_kernel(
                               smem_v + (ki * 16 + v_row) * KV_STRIDE + di * 8);
           }
 
-          ptx_mma_m16n8k16(o_acc[di_local][0], o_acc[di_local][1],
+          ptx_mma_m16n8k16<T>(o_acc[di_local][0], o_acc[di_local][1],
                            o_acc[di_local][2], o_acc[di_local][3], a0, a1, a2,
                            a3, b0, b1, o_acc[di_local][0], o_acc[di_local][1],
                            o_acc[di_local][2], o_acc[di_local][3]);
@@ -538,16 +564,12 @@ __global__ void flash_attention_ptx_kernel(
       int gq1 = q_start + global_row1;
 
       if (gq0 < seq_len) {
-        O_head[gq0 * D_HEAD + col0] =
-            __float2half(o_acc[di_local][0] * inv_sum0);
-        O_head[gq0 * D_HEAD + col1] =
-            __float2half(o_acc[di_local][1] * inv_sum0);
+        O_head[gq0 * D_HEAD + col0] = to_elem<T>(o_acc[di_local][0] * inv_sum0);
+        O_head[gq0 * D_HEAD + col1] = to_elem<T>(o_acc[di_local][1] * inv_sum0);
       }
       if (gq1 < seq_len) {
-        O_head[gq1 * D_HEAD + col0] =
-            __float2half(o_acc[di_local][2] * inv_sum1);
-        O_head[gq1 * D_HEAD + col1] =
-            __float2half(o_acc[di_local][3] * inv_sum1);
+        O_head[gq1 * D_HEAD + col0] = to_elem<T>(o_acc[di_local][2] * inv_sum1);
+        O_head[gq1 * D_HEAD + col1] = to_elem<T>(o_acc[di_local][3] * inv_sum1);
       }
     }
 
@@ -589,7 +611,7 @@ namespace {
 
 // Common launch path templated on tile geometry. Computes smem, opts in if
 // needed, dispatches on the causal flag.
-template <int BLOCK_M, int BLOCK_N, int D_HEAD, int NUM_WARPS>
+template <int BLOCK_M, int BLOCK_N, int D_HEAD, int NUM_WARPS, class T>
 inline void launch_variant(const FlashAttentionParams &params) {
   constexpr int SMEM_PAD = 8;
   constexpr int Q_STRIDE = D_HEAD + SMEM_PAD;
@@ -601,23 +623,24 @@ inline void launch_variant(const FlashAttentionParams &params) {
   dim3 block(WARP_SIZE_FA, NUM_WARPS);
 
   size_t smem_bytes = 0;
-  smem_bytes += BLOCK_M * Q_STRIDE * sizeof(half); // smem_q
+  smem_bytes += BLOCK_M * Q_STRIDE * sizeof(T); // smem_q
   smem_bytes +=
-      BLOCK_N * KV_STRIDE * sizeof(half); // smem_k (also holds P, aliased)
-  smem_bytes += BLOCK_N * KV_STRIDE * sizeof(half); // smem_v
+      BLOCK_N * KV_STRIDE * sizeof(T); // smem_k (also holds P, aliased)
+  smem_bytes += BLOCK_N * KV_STRIDE * sizeof(T); // smem_v
   // smem_p is aliased onto smem_k (see kernel) — no separate allocation.
   smem_bytes += 4 * BLOCK_M * sizeof(float); // partial_max + partial_sum
 
   if (smem_bytes > 48 * 1024) {
     if (params.causal) {
       CUDA_CHECK(cudaFuncSetAttribute(
-          flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, D_HEAD, NUM_WARPS, true>,
+          flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, D_HEAD, NUM_WARPS, true,
+                                     T>,
           cudaFuncAttributeMaxDynamicSharedMemorySize,
           static_cast<int>(smem_bytes)));
     } else {
       CUDA_CHECK(cudaFuncSetAttribute(
-          flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, D_HEAD, NUM_WARPS,
-                                     false>,
+          flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, D_HEAD, NUM_WARPS, false,
+                                     T>,
           cudaFuncAttributeMaxDynamicSharedMemorySize,
           static_cast<int>(smem_bytes)));
     }
@@ -628,16 +651,21 @@ inline void launch_variant(const FlashAttentionParams &params) {
   const int H_kv =
       (params.num_kv_heads > 0) ? params.num_kv_heads : params.num_heads;
 
+  // params pointers are typed half* but carry T data (T==half is a no-op cast;
+  // T==bf16 reinterprets the address — both are 16-bit, same alignment).
+  const T *Qp = reinterpret_cast<const T *>(params.Q);
+  const T *Kp = reinterpret_cast<const T *>(params.K);
+  const T *Vp = reinterpret_cast<const T *>(params.V);
+  T *Op = reinterpret_cast<T *>(params.O);
+
   if (params.causal) {
-    flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, D_HEAD, NUM_WARPS, true>
+    flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, D_HEAD, NUM_WARPS, true, T>
         <<<grid, block, smem_bytes, params.stream>>>(
-            params.Q, params.K, params.V, params.O, params.L, params.seq_len,
-            H_q, H_kv, params.scale);
+            Qp, Kp, Vp, Op, params.L, params.seq_len, H_q, H_kv, params.scale);
   } else {
-    flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, D_HEAD, NUM_WARPS, false>
+    flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, D_HEAD, NUM_WARPS, false, T>
         <<<grid, block, smem_bytes, params.stream>>>(
-            params.Q, params.K, params.V, params.O, params.L, params.seq_len,
-            H_q, H_kv, params.scale);
+            Qp, Kp, Vp, Op, params.L, params.seq_len, H_q, H_kv, params.scale);
   }
   CUDA_CHECK(cudaGetLastError());
 }
@@ -682,7 +710,7 @@ template <> struct FaConfig<128> {
 // Pick the small/big tile by GPU saturation, for a compile-time head dim. If we
 // don't have ~SAT_MULT waves of big-tile blocks across the SMs, the GPU is
 // under-saturated and the small tile (half BLOCK_M, double the grid) wins.
-template <int D_HEAD>
+template <class T, int D_HEAD>
 inline void dispatch_by_saturation(const FlashAttentionParams &params) {
   using C = FaConfig<D_HEAD>;
   const int num_blocks_big = params.batch_size * params.num_heads *
@@ -690,25 +718,28 @@ inline void dispatch_by_saturation(const FlashAttentionParams &params) {
   const int sm_count = get_sm_count();
 
   if (num_blocks_big < C::SAT_MULT * sm_count) {
-    launch_variant<C::BM_SMALL, C::BN, D_HEAD, C::W_SMALL>(params);
+    launch_variant<C::BM_SMALL, C::BN, D_HEAD, C::W_SMALL, T>(params);
   } else {
-    launch_variant<C::BM_BIG, C::BN, D_HEAD, C::W_BIG>(params);
+    launch_variant<C::BM_BIG, C::BN, D_HEAD, C::W_BIG, T>(params);
   }
 }
 
 } // anonymous namespace
 
-// Runtime head-dim -> compile-time instantiation. d_head must be a multiple of
-// 16 (the MMA k-tile); 64 and 128 are the tuned paths (GLM, Llama,
-// DeepSeek-LLM, most decoders). 80/96 are reachable by adding cases — the
-// kernel is generic.
+// Runtime (dtype, head-dim) -> compile-time instantiation. d_head must be a
+// multiple of 16 (the MMA k-tile); 64 and 128 are the tuned paths (GLM, Llama,
+// DeepSeek-LLM, most decoders). dtype FP16 or BF16 (BF16 for Llama-3/Mistral/
+// Qwen/GLM, which ship bf16 weights). 80/96 are reachable by adding cases.
 void launch_flash_attention(const FlashAttentionParams &params) {
+  const bool bf16 = (params.dtype == DType::BF16);
   switch (params.d_head) {
   case 64:
-    dispatch_by_saturation<64>(params);
+    if (bf16) dispatch_by_saturation<__nv_bfloat16, 64>(params);
+    else      dispatch_by_saturation<half, 64>(params);
     break;
   case 128:
-    dispatch_by_saturation<128>(params);
+    if (bf16) dispatch_by_saturation<__nv_bfloat16, 128>(params);
+    else      dispatch_by_saturation<half, 128>(params);
     break;
   default:
     fprintf(stderr, "flash_attention: unsupported d_head=%d (tuned: 64, 128)\n",
