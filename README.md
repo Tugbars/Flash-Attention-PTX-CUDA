@@ -31,7 +31,7 @@ Consumer Blackwell (sm_120) lacks the datacenter features that make H100/B200 at
 ## Performance
 
 <p align="center">
-<img width="1783" height="734" alt="performance" src="https://github.com/user-attachments/assets/547dfcc4-e5e4-4f27-b38f-8c3cf14751ca" />
+  <img width="1937" height="845" alt="performance" src="https://github.com/user-attachments/assets/7a73c97a-e378-4256-8f7d-96f166ba67ab" />
 </p>
 
 **Peak: ~183 TFLOPS** at B=4, H=12, S=4096, D=64 (causal attention); ~170 at the B=8, S=2048 sweet spot.
