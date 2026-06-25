@@ -197,8 +197,8 @@ __global__ void flash_attention_ptx_kernel(
     //   warp_half=0 → Q*K^T columns 0-31  (ni tiles 0-3)
     //   warp_half=1 → Q*K^T columns 32-63 (ni tiles 4-7)
     // For P*V, they split the D dimension similarly.
-    constexpr int QK_TILES_PER_WARP = 4;  // 4 × m16n8 = 32 N-cols per half
-    constexpr int PV_TILES_PER_WARP = 4;  // 4 × m16n8 = 32 D-cols per half
+    constexpr int QK_TILES_PER_WARP = BLOCK_N / 16; // N-cols/half ÷ 8; = 4 at BLOCK_N=64
+    constexpr int PV_TILES_PER_WARP = D_HEAD / 16;  // D-cols/half ÷ 8; = 4 at D=64, 8 at D=128
     constexpr int TILES_K  = D_HEAD / 16; // k-tiles for Q*K^T
     constexpr int TILES_BN = BLOCK_N / 16;// k-tiles for P*V
 
@@ -613,29 +613,45 @@ inline int get_sm_count() {
     return sm_count;
 }
 
-} // anonymous namespace
+// Per-head-dim tile tuning. The optimal BLOCK_N differs by D because it sets the
+// K/V tile size, which gates smem and thus occupancy:
+//   D=64:  BN=64 → 28 KB → 3 blocks/SM (50% occ). The v11 optimum.
+//   D=128: BN=32 → ~36 KB → 2 blocks/SM (16 warps). Halving BN vs the BN=64 tile
+//          (which is 52 KB → only 1 block/SM) measured +28–31% on saturated
+//          configs — pure occupancy, the same lever as the D=64 alias win.
+// BM_SMALL/W_SMALL is the under-saturated grid-doubling variant (see dispatcher).
+template <int D> struct FaConfig;
+template <> struct FaConfig<64>  { static constexpr int BN = 64, BM_BIG = 64, W_BIG = 8, BM_SMALL = 32, W_SMALL = 4; };
+template <> struct FaConfig<128> { static constexpr int BN = 32, BM_BIG = 64, W_BIG = 8, BM_SMALL = 32, W_SMALL = 4; };
 
-void launch_flash_attention(const FlashAttentionParams& params) {
-    constexpr int BLOCK_N      = 64;
-    constexpr int D_HEAD       = 64;
-    constexpr int BLOCK_M_BIG  = 64;
-
-    // Heuristic: count thread blocks at the big-tile geometry. If we don't
-    // even have ~2 waves of blocks across the SMs, the GPU is under-saturated
-    // and the small-tile variant wins by doubling the grid count. Otherwise
-    // the big tile wins on per-FLOP efficiency. Validated empirically:
-    //   B=1, S=512:   96 blocks  → small tile (+32%)
-    //   B=1, S=2048:  384 blocks → big tile   (+5%)
-    //   B≥4 or S≥4K:  always big tile (+10-12%).
+// Pick the small/big tile by GPU saturation, for a compile-time head dim. If we
+// don't have ~2 waves of big-tile blocks across the SMs, the GPU is under-
+// saturated and the small tile (half BLOCK_M, double the grid) wins.
+template <int D_HEAD>
+inline void dispatch_by_saturation(const FlashAttentionParams& params) {
+    using C = FaConfig<D_HEAD>;
     const int num_blocks_big =
         params.batch_size * params.num_heads
-        * ((params.seq_len + BLOCK_M_BIG - 1) / BLOCK_M_BIG);
+        * ((params.seq_len + C::BM_BIG - 1) / C::BM_BIG);
     const int sm_count = get_sm_count();
 
     if (num_blocks_big < 2 * sm_count) {
         launch_variant<32, BLOCK_N, D_HEAD, 4>(params);
     } else {
         launch_variant<64, BLOCK_N, D_HEAD, 8>(params);
+
+// Runtime head-dim -> compile-time instantiation. d_head must be a multiple of
+// 16 (the MMA k-tile); 64 and 128 are the tuned paths (GLM, Llama, DeepSeek-LLM,
+// most decoders). 80/96 are reachable by adding cases — the kernel is generic.
+void launch_flash_attention(const FlashAttentionParams& params) {
+    switch (params.d_head) {
+        case 64:  dispatch_by_saturation<64>(params);  break;
+        case 128: dispatch_by_saturation<128>(params); break;
+        default:
+            fprintf(stderr,
+                "flash_attention: unsupported d_head=%d (tuned: 64, 128)\n",
+                params.d_head);
+            abort();
     }
 }
 

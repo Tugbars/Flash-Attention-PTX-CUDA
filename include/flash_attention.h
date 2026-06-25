@@ -17,7 +17,7 @@
 //   transformer::launch_flash_attention(params);
 //
 // Constraints:
-//   - d_head must be 64
+//   - d_head must be 64 or 128 (tuned paths; must be a multiple of 16)
 //   - Q, K, V, O are [batch_size * num_heads, seq_len, d_head] in FP16
 //   - L (optional) is [batch_size * num_heads, seq_len] in FP32
 //   - Minimum compute capability: sm_80 (Ampere)
