@@ -55,9 +55,11 @@ struct FlashAttentionParams {
     half*       O;           // [B*H, S, D] output matrix (FP16)
     float*      L;           // [B*H, S]    log-sum-exp (FP32, optional — can be nullptr)
     int         batch_size;
-    int         num_heads;
+    int         num_heads;     // query heads (H_q)
+    int         num_kv_heads;  // KV heads for GQA/MQA; 0 (or == num_heads) means MHA.
+                               // K/V are [B, num_kv_heads, S, D]; num_heads % num_kv_heads == 0.
     int         seq_len;
-    int         d_head;      // Must be 64
+    int         d_head;      // 64 or 128
     float       scale;       // Typically 1.0f / sqrtf(d_head)
     bool        causal;      // true = causal mask (upper triangle masked)
     cudaStream_t stream;

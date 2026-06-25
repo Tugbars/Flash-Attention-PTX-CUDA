@@ -127,6 +127,8 @@ __global__ void flash_attention_ptx_kernel(
     half*       __restrict__ O,
     float*      __restrict__ LSE,
     const int   seq_len,
+    const int   num_q_heads,
+    const int   num_kv_heads,
     const float scale)
 {
     const int bh_idx  = blockIdx.y;       // batch * head index
@@ -170,11 +172,18 @@ __global__ void flash_attention_ptx_kernel(
     float* smem_partial_max = reinterpret_cast<float*>(smem_v + BLOCK_N * KV_STRIDE);
     float* smem_partial_sum = smem_partial_max + 2 * BLOCK_M;
 
-    const size_t head_offset = static_cast<size_t>(bh_idx) * seq_len * D_HEAD;
-    const half* Q_head = Q + head_offset;
-    const half* K_head = K + head_offset;
-    const half* V_head = V + head_offset;
-    half*       O_head = O + head_offset;
+    // GQA: bh_idx enumerates (batch, query-head). Q/O have num_q_heads heads;
+    // K/V have num_kv_heads. Query head h_q reads KV head h_q/(num_q_heads/num_kv_heads).
+    // (MHA is the special case num_kv_heads == num_q_heads → kv_off == q_off.)
+    const int    b      = bh_idx / num_q_heads;
+    const int    h_q    = bh_idx - b * num_q_heads;
+    const int    h_kv   = h_q / (num_q_heads / num_kv_heads);
+    const size_t q_off  = static_cast<size_t>(bh_idx) * seq_len * D_HEAD;
+    const size_t kv_off = static_cast<size_t>(b * num_kv_heads + h_kv) * seq_len * D_HEAD;
+    const half* Q_head = Q + q_off;
+    const half* K_head = K + kv_off;
+    const half* V_head = V + kv_off;
+    half*       O_head = O + q_off;
 
     // -- Load Q tile (stays in smem for all KV iterations) -------------------
     // 128-bit vectorized loads: each uint4 moves 8 half values.
@@ -587,16 +596,20 @@ inline void launch_variant(const FlashAttentionParams& params) {
         }
     }
 
+    // GQA: num_kv_heads==0 means MHA (KV head count == query head count).
+    const int H_q  = params.num_heads;
+    const int H_kv = (params.num_kv_heads > 0) ? params.num_kv_heads : params.num_heads;
+
     if (params.causal) {
         flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, D_HEAD, NUM_WARPS, true>
             <<<grid, block, smem_bytes, params.stream>>>(
                 params.Q, params.K, params.V, params.O, params.L,
-                params.seq_len, params.scale);
+                params.seq_len, H_q, H_kv, params.scale);
     } else {
         flash_attention_ptx_kernel<BLOCK_M, BLOCK_N, D_HEAD, NUM_WARPS, false>
             <<<grid, block, smem_bytes, params.stream>>>(
                 params.Q, params.K, params.V, params.O, params.L,
-                params.seq_len, params.scale);
+                params.seq_len, H_q, H_kv, params.scale);
     }
     CUDA_CHECK(cudaGetLastError());
 }
