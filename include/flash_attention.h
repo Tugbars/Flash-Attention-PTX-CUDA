@@ -71,6 +71,10 @@ struct FlashAttentionParams {
   bool causal; // true = causal mask (upper triangle masked)
   DType dtype; // FP16 (default) or BF16. Q/K/V/O carry that type;
                // the pointers are typed half* as address carriers.
+  bool autotune; // false (default): fixed hand-tuned dispatch. true: benchmark a
+                 // curated list of tile configs on the first launch of each
+                 // (shape,dtype) and cache the fastest (Triton-style).
+                 // FA_AUTOTUNE_VERBOSE=1 prints the search.
   cudaStream_t stream;
 };
 

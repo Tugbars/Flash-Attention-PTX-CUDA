@@ -1,0 +1,12 @@
+{
+  // The original problem was CMake Tools defaulting to the Ninja generator (not on
+  // PATH) plus the auto-selected Intel oneAPI kit (broken setvars.bat). Selecting a
+  // working kit (GCC 15.2 / MinGW, which brings its own generator + g++) fixes both,
+  // so we do NOT pin a generator here — let the selected kit choose its own.
+
+  // Build only for this GPU (sm_120 = RTX 5080) for fast local builds; the
+  // CMakeLists default targets five architectures (80;86;89;90;120), which is slow.
+  "cmake.configureSettings": {
+    "CMAKE_CUDA_ARCHITECTURES": "120"
+  }
+}

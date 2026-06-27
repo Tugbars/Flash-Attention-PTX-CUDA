@@ -31,9 +31,15 @@
 #include "../include/flash_attention.h"
 #include <cfloat>
 #include <cmath>
+#include <cstdlib>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <fstream>
+#include <map>
+#include <mutex>
+#include <string>
+#include <tuple>
 #include <type_traits>
 
 namespace transformer {
@@ -723,6 +729,272 @@ inline void dispatch_by_saturation(const FlashAttentionParams &params) {
   }
 }
 
+// ============================================================================
+// Autotuner (Triton-style). Mirrors triton.autotune: a curated config list, a
+// do_bench (timed launches), argmin over the timings, and a per-shape cache.
+// Opt-in via params.autotune; the default path keeps dispatch_by_saturation
+// above. Configs are template instantiations (tile geometry is compile-time),
+// so the candidate set is fixed and pre-compiled — the same shape CUTLASS's
+// profiler has: search over pre-built kernels, not JIT like Triton.
+// ============================================================================
+
+// One benchmarkable candidate: a tile geometry + its compiled launcher + the
+// smem it needs (for the smem-fit prune, like Triton's config filter).
+struct FaCandidate {
+  int bm, bn, nw;
+  void (*launch)(const FlashAttentionParams &);
+  size_t smem;
+};
+
+template <int BM, int BN, int D, class T> constexpr size_t fa_cfg_smem() {
+  constexpr int PAD = 8; // matches launch_variant's SMEM_PAD
+  return (size_t)BM * (D + PAD) * sizeof(T)       // smem_q
+         + (size_t)BN * (D + PAD) * sizeof(T)     // smem_k (P aliased)
+         + (size_t)BN * (D + PAD) * sizeof(T)     // smem_v
+         + 4 * (size_t)BM * sizeof(float);        // partials
+}
+
+// Curated grid. The warp partition requires BM == 8*NW (NW/2 m-tiles of 16
+// rows); BN is any multiple of 16. We sweep the cells that plausibly win.
+template <class T> const FaCandidate *fa_configs_64(int &n) {
+  static const FaCandidate c[] = {
+      {64, 64, 8, &launch_variant<64, 64, 64, 8, T>, fa_cfg_smem<64, 64, 64, T>()},
+      {32, 64, 4, &launch_variant<32, 64, 64, 4, T>, fa_cfg_smem<32, 64, 64, T>()},
+      {64, 32, 8, &launch_variant<64, 32, 64, 8, T>, fa_cfg_smem<64, 32, 64, T>()},
+      {32, 32, 4, &launch_variant<32, 32, 64, 4, T>, fa_cfg_smem<32, 32, 64, T>()},
+  };
+  n = 4;
+  return c;
+}
+template <class T> const FaCandidate *fa_configs_128(int &n) {
+  static const FaCandidate c[] = {
+      {64, 32, 8, &launch_variant<64, 32, 128, 8, T>, fa_cfg_smem<64, 32, 128, T>()},
+      {32, 32, 4, &launch_variant<32, 32, 128, 4, T>, fa_cfg_smem<32, 32, 128, T>()},
+      {32, 64, 4, &launch_variant<32, 64, 128, 4, T>, fa_cfg_smem<32, 64, 128, T>()},
+      {64, 64, 8, &launch_variant<64, 64, 128, 8, T>, fa_cfg_smem<64, 64, 128, T>()},
+  };
+  n = 4;
+  return c;
+}
+
+// do_bench: time `launch` on throwaway buffers of the real problem shape.
+// Returns mean ms (cudaEvent) — the measurement our A/B harness uses.
+inline float fa_do_bench(void (*launch)(const FlashAttentionParams &),
+                         const FlashAttentionParams &base) {
+  const int B = base.batch_size, Hq = base.num_heads, S = base.seq_len,
+            D = base.d_head;
+  const int Hkv = (base.num_kv_heads > 0) ? base.num_kv_heads : base.num_heads;
+  const size_t nq = (size_t)B * Hq * S * D, nkv = (size_t)B * Hkv * S * D;
+  half *Q = nullptr, *K = nullptr, *V = nullptr, *O = nullptr;
+  float *L = nullptr;
+  if (cudaMalloc(&Q, nq * 2) != cudaSuccess ||
+      cudaMalloc(&K, nkv * 2) != cudaSuccess ||
+      cudaMalloc(&V, nkv * 2) != cudaSuccess ||
+      cudaMalloc(&O, nq * 2) != cudaSuccess ||
+      cudaMalloc(&L, (size_t)B * Hq * S * sizeof(float)) != cudaSuccess) {
+    cudaFree(Q); cudaFree(K); cudaFree(V); cudaFree(O); cudaFree(L);
+    return 1e30f; // OOM → treat as infinitely slow
+  }
+  cudaMemset(Q, 0x3c, nq * 2);
+  cudaMemset(K, 0x3c, nkv * 2);
+  cudaMemset(V, 0x3c, nkv * 2);
+  FlashAttentionParams p = base;
+  p.Q = Q; p.K = K; p.V = V; p.O = O; p.L = L;
+  p.autotune = false;
+  p.stream = 0;
+  // Warm up to steady clocks (25 iters) so a cold GPU doesn't bias the first
+  // configs slow — the classic autotuning measurement trap.
+  for (int i = 0; i < 25; i++)
+    launch(p);
+  cudaDeviceSynchronize();
+  cudaEvent_t a, b;
+  cudaEventCreate(&a);
+  cudaEventCreate(&b);
+  cudaEventRecord(a);
+  for (int i = 0; i < 30; i++)
+    launch(p);
+  cudaEventRecord(b);
+  cudaEventSynchronize(b);
+  float ms = 0;
+  cudaEventElapsedTime(&ms, a, b);
+  cudaEventDestroy(a);
+  cudaEventDestroy(b);
+  cudaFree(Q); cudaFree(K); cudaFree(V); cudaFree(O); cudaFree(L);
+  return ms / 30.0f;
+}
+
+// Per-shape cache: (B, Hq, Hkv, S, D, causal, dtype) -> winning candidate index.
+inline std::map<std::tuple<int, int, int, int, int, int, int>, int> &fa_cache() {
+  static std::map<std::tuple<int, int, int, int, int, int, int>, int> c;
+  return c;
+}
+inline std::mutex &fa_cache_mu() {
+  static std::mutex m;
+  return m;
+}
+inline int fa_smem_optin() {
+  static int v = -1;
+  if (v < 0) {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+  }
+  return v;
+}
+
+// ---- Wisdom file (FFTW-style): persist the autotune cache across runs. ------
+// Path from the FA_WISDOM env var; unset → in-memory only. Format: a device-tag
+// header line, then one line per tuned shape: "B H Hkv S D causal dtype BM BN NW".
+// Loaded once; lines whose geometry is no longer a candidate are skipped (so a
+// changed config list just re-searches those shapes). Tagged with device + arch
+// so wisdom from a different GPU is ignored, not mis-applied.
+inline const char *fa_wisdom_path() {
+  static const char *p = std::getenv("FA_WISDOM");
+  return (p && p[0]) ? p : nullptr;
+}
+inline const std::string &fa_device_tag() {
+  static std::string tag = [] {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, dev);
+    std::string name = prop.name;
+    for (char &c : name)
+      if (c == ' ')
+        c = '_';
+    return "#FA_WISDOM sm" + std::to_string(prop.major * 10 + prop.minor) + " " +
+           name;
+  }();
+  return tag;
+}
+// Resolve a stored geometry to a candidate index (geometry order is identical
+// across dtypes, so the half list suffices). -1 if no longer a candidate.
+inline int fa_geom_to_index(int D, int bm, int bn, int nw) {
+  int n = 0;
+  const FaCandidate *c =
+      (D == 64) ? fa_configs_64<half>(n) : fa_configs_128<half>(n);
+  for (int i = 0; i < n; i++)
+    if (c[i].bm == bm && c[i].bn == bn && c[i].nw == nw)
+      return i;
+  return -1;
+}
+// 0 = uninitialized; 1 = append to an existing matching file (or no path);
+// 2 = file missing/mismatched → the first save rewrites it fresh with our header.
+inline int &fa_wisdom_mode() {
+  static int m = 0;
+  return m;
+}
+// Load wisdom into the cache once (caller holds fa_cache_mu()).
+inline void fa_wisdom_load_once() {
+  if (fa_wisdom_mode() != 0)
+    return;
+  const char *path = fa_wisdom_path();
+  if (!path) {
+    fa_wisdom_mode() = 1;
+    return;
+  }
+  const bool verbose = (std::getenv("FA_AUTOTUNE_VERBOSE") != nullptr);
+  std::ifstream in(path);
+  std::string header;
+  if (in && std::getline(in, header) && header == fa_device_tag()) {
+    int B, H, Hkv, S, D, ca, dt, bm, bn, nw, cnt = 0;
+    while (in >> B >> H >> Hkv >> S >> D >> ca >> dt >> bm >> bn >> nw) {
+      int idx = fa_geom_to_index(D, bm, bn, nw);
+      if (idx >= 0) {
+        fa_cache()[std::make_tuple(B, H, Hkv, S, D, ca, dt)] = idx;
+        cnt++;
+      }
+    }
+    fa_wisdom_mode() = 1; // matching file → append new results
+    if (verbose)
+      printf("[fa-autotune] loaded %d wisdom entries from %s\n", cnt, path);
+  } else {
+    fa_wisdom_mode() = 2; // missing or different GPU → rewrite on first save
+    if (verbose && in.is_open())
+      printf("[fa-autotune] wisdom %s is for a different device — ignoring\n",
+             path);
+  }
+}
+// Append one tuned result to the wisdom file (caller holds fa_cache_mu()).
+inline void fa_wisdom_save(int B, int H, int Hkv, int S, int D, int ca, int dt,
+                           int bm, int bn, int nw) {
+  const char *path = fa_wisdom_path();
+  if (!path)
+    return;
+  std::ofstream out;
+  if (fa_wisdom_mode() == 2) {
+    out.open(path, std::ios::trunc);
+    if (out)
+      out << fa_device_tag() << "\n";
+    fa_wisdom_mode() = 1;
+  } else {
+    out.open(path, std::ios::app);
+  }
+  if (out)
+    out << B << " " << H << " " << Hkv << " " << S << " " << D << " " << ca
+        << " " << dt << " " << bm << " " << bn << " " << nw << "\n";
+}
+
+template <class T, int D>
+inline void launch_autotuned(const FlashAttentionParams &p) {
+  int n = 0;
+  const FaCandidate *cands;
+  if constexpr (D == 64)
+    cands = fa_configs_64<T>(n);
+  else
+    cands = fa_configs_128<T>(n);
+
+  const int Hkv = (p.num_kv_heads > 0) ? p.num_kv_heads : p.num_heads;
+  const auto key = std::make_tuple(p.batch_size, p.num_heads, Hkv, p.seq_len,
+                                   p.d_head, (int)p.causal, (int)p.dtype);
+  const bool verbose = (std::getenv("FA_AUTOTUNE_VERBOSE") != nullptr);
+  int idx;
+  {
+    std::lock_guard<std::mutex> lk(fa_cache_mu());
+    auto &cache = fa_cache();
+    fa_wisdom_load_once(); // populate the cache from the wisdom file on first call
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+      idx = it->second;
+    } else {
+      float best = 1e30f;
+      int best_i = 0;
+      const int optin = fa_smem_optin();
+      constexpr int PAD = 8;
+      for (int i = 0; i < n; i++) {
+        if ((long long)cands[i].smem > optin)
+          continue; // smem-fit prune (Triton's config filter)
+        // Validity prune: smem_p aliases smem_k, so P (BM×(BN+PAD)) must fit in
+        // the K buffer (BN×(D+PAD)). Configs that overflow it corrupt output.
+        if ((long long)cands[i].bm * (cands[i].bn + PAD) >
+            (long long)cands[i].bn * (p.d_head + PAD))
+          continue;
+        float ms = fa_do_bench(cands[i].launch, p);
+        if (verbose)
+          printf("[fa-autotune] B=%d H=%d S=%-5d D=%d  BM=%-2d BN=%-2d W=%d  "
+                 "%.4f ms\n",
+                 p.batch_size, p.num_heads, p.seq_len, p.d_head, cands[i].bm,
+                 cands[i].bn, cands[i].nw, ms);
+        if (ms < best) {
+          best = ms;
+          best_i = i;
+        }
+      }
+      idx = best_i;
+      cache[key] = best_i;
+      fa_wisdom_save(p.batch_size, p.num_heads, Hkv, p.seq_len, p.d_head,
+                     (int)p.causal, (int)p.dtype, cands[best_i].bm,
+                     cands[best_i].bn, cands[best_i].nw);
+      if (verbose)
+        printf("[fa-autotune] -> B=%d H=%d S=%-5d D=%d  chose BM=%d BN=%d W=%d "
+               "(%.4f ms)\n",
+               p.batch_size, p.num_heads, p.seq_len, p.d_head, cands[idx].bm,
+               cands[idx].bn, cands[idx].nw, best);
+    }
+  }
+  cands[idx].launch(p); // launch the winner on the real buffers
+}
+
 } // anonymous namespace
 
 // Runtime (dtype, head-dim) -> compile-time instantiation. d_head must be a
@@ -731,6 +1003,22 @@ inline void dispatch_by_saturation(const FlashAttentionParams &params) {
 // Qwen/GLM, which ship bf16 weights). 80/96 are reachable by adding cases.
 void launch_flash_attention(const FlashAttentionParams &params) {
   const bool bf16 = (params.dtype == DType::BF16);
+  // Opt-in autotuner: benchmark candidate tile configs once per (shape,dtype),
+  // cache the fastest. Default (autotune==false) uses the heuristic below.
+  if (params.autotune && (params.d_head == 64 || params.d_head == 128)) {
+    if (params.d_head == 64) {
+      if (bf16)
+        launch_autotuned<__nv_bfloat16, 64>(params);
+      else
+        launch_autotuned<half, 64>(params);
+    } else {
+      if (bf16)
+        launch_autotuned<__nv_bfloat16, 128>(params);
+      else
+        launch_autotuned<half, 128>(params);
+    }
+    return;
+  }
   switch (params.d_head) {
   case 64:
     if (bf16)

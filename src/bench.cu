@@ -400,6 +400,10 @@ int main() {
     benchmark_flash_attention(8, 12, 2048, 64);
     benchmark_flash_attention(1, 12, 4096, 64);
 
+    // D=128 (GLM/Llama/Qwen head dim) — for the vLLM FA2 comparison
+    benchmark_flash_attention(8, 12, 2048, 128);
+    benchmark_flash_attention(4, 12, 4096, 128);
+
     printf("============================================================\n");
     printf("  All tests passed. Benchmarks complete.\n");
     printf("============================================================\n");
