@@ -27,6 +27,7 @@ find_package(CUDAToolkit REQUIRED)
 # ============================================================================
 add_library(flash_attention STATIC
     kernels/flash_attention.cu
+    kernels/fa_autotune.cu
 )
 
 target_include_directories(flash_attention PUBLIC

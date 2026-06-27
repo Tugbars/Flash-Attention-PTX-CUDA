@@ -83,7 +83,12 @@ int &fa_wisdom_mode() {
   static int m = 0;
   return m;
 }
-bool fa_verbose() { return std::getenv("FA_AUTOTUNE_VERBOSE") != nullptr; }
+// Cached: read once. (Called on every launch; getenv is O(environment) and
+// would add ~20us/launch — enough to wreck a 30us kernel in a tight loop.)
+bool fa_verbose() {
+  static bool v = std::getenv("FA_AUTOTUNE_VERBOSE") != nullptr;
+  return v;
+}
 
 // Load the wisdom file into the cache once (caller holds fa_cache_mu()).
 void fa_wisdom_load_once() {
