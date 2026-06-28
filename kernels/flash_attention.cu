@@ -758,9 +758,14 @@ template <class T> const FaCandidate *fa_configs_128(int &n) {
       {64, 32, 8, &launch_variant<64, 32, 128, 8, T>, fa_cfg_smem<64, 32, 128, T>()},
       {32, 32, 4, &launch_variant<32, 32, 128, 4, T>, fa_cfg_smem<32, 32, 128, T>()},
       {32, 64, 4, &launch_variant<32, 64, 128, 4, T>, fa_cfg_smem<32, 64, 128, T>()},
+      // BN=48 fits 2 blocks/SM with the existing pad (44.5 KB) — the swizzle-free
+      // test of "does a bigger KV tile at equal occupancy beat BN=32?" If this
+      // wins, the FA2-style BN=64 (which needs a swizzle to reach 2 blocks) is
+      // worth building. BN=64 below is 1 block/SM (52 KB) — kept as a reference.
+      {64, 48, 8, &launch_variant<64, 48, 128, 8, T>, fa_cfg_smem<64, 48, 128, T>()},
       {64, 64, 8, &launch_variant<64, 64, 128, 8, T>, fa_cfg_smem<64, 64, 128, T>()},
   };
-  n = 4;
+  n = 5;
   return c;
 }
 
