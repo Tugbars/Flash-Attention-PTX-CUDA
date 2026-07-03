@@ -1,31 +1,57 @@
 // ============================================================================
-// Flash Attention v11 — PTX MMA + In-Register Softmax
+// Flash Attention prefill — PTX MMA + in-register softmax, two-tier dispatch
 //
-// Architecture:
-//   - 8 warps (256 threads) per block, organized as 4 warp pairs
-//   - Each warp pair handles a 16×64 output tile (m16n8k16 MMA)
-//   - Within a pair, warp_half=0 covers N-columns 0-31, warp_half=1 covers
-//   32-63
-//   - Q*K^T results stay in registers — softmax via shuffle + 1KB smem exchange
-//   - P written to smem_p (which aliases smem_k) only for the P*V MMA step
+// This file contains TWO prefill kernels plus the dispatcher and autotuner
+// candidate lists (the decode kernel for q_len=1 lives in
+// flash_attention_decode.cu):
 //
-// Per KV tile:
-//   Step A: S = Q * K^T          (PTX MMA, result in s_acc registers)
-//   Step B: softmax(S)           (shuffle reduce + cross-warp smem exchange)
+//   flash_attention_fat_kernel  (64x64 tile, 4 warps)  -- SATURATED tier
+//     Split-Q: each warp owns one m16 row-tile and the FULL row width, so
+//     softmax is intra-warp shuffles only. Q lives in registers; P never
+//     touches shared memory (the QK C-fragment layout equals the PV
+//     A-fragment layout, packed fp32->fp16 in registers); V(i) streams behind
+//     QK+softmax and K(i+1) behind PV. ~vLLM-FA2 parity at most D=128 shapes.
+//
+//   flash_attention_ptx_kernel  (32xBN tile, 4 warps)  -- UNDER-SATURATED tier
+//     Split-N: warp pairs share a row-tile and exchange softmax partials via
+//     smem. Instantiated only in the small geometry, where doubling the block
+//     count fills otherwise-idle SMs (+42% over vLLM FA2 at B=1 S=512).
+//
+// Routing rule (dispatch_by_saturation):
+//     blocks = B * H * ceil(S/64)
+//     blocks <  SAT_MULT * SM_COUNT  -> small split-N tile
+//     blocks >= SAT_MULT * SM_COUNT  -> fat-warp kernel
+//   with SAT_MULT = 3 (D=64) / 2 (D=128), measured crossovers.
+//
+// Concrete crossovers on an 84-SM GPU (RTX 5080); thresholds scale with the
+// runtime SM count. Fat kernel takes over from about:
+//
+//   H=12 (GPT-2 class)          |   H=32 (Llama class)
+//   B   D=64 from   D=128 from  |   B   D=64 from   D=128 from
+//   1   S ~1344     S ~896      |   1   S ~504      S ~336
+//   2   S ~672      S ~448      |   2   S ~252      S ~168
+//   4   S ~336      S ~224      |   4   S ~126      S ~84
+//   8   S ~168      S ~112      |   8   any S       any S
+//
+//   (Boundaries round to the next multiple of 64 via ceil(S/64). The
+//   crossover is per-launch TOTAL work, not per-sequence: batching moves a
+//   workload toward the fat kernel exactly like longer sequences do. Any
+//   realistic LLM prefill lands on the fat kernel.)
+//
+// Overrides: params.autotune benchmarks the candidate list for the exact
+// shape once and caches the winner (fa_autotune.cu; FFTW-style wisdom file).
+// D_HEAD must be 64 or 128 -- other head dims are not instantiated.
+//
+// Per KV tile (both kernels):
+//   Step A: S = Q * K^T          (PTX MMA m16n8k16, fp32 accumulate)
+//   Step B: softmax(S)           (in-register, online max/sum)
 //   Step C: online rescale O     (exp correction for running max)
-//   Step D: O += P * V           (PTX MMA, P from smem_p, V from smem_v)
+//   Step D: O += P * V           (PTX MMA)
 //
-// Tile sizes: BLOCK_M=64, BLOCK_N=64, D_HEAD=64
-// Shared memory: ~28 KB (smem_q + smem_k/p + smem_v + 1KB exchange) → 3
-// blocks/SM
-//
-// v11 occupancy work (measured on RTX 5080, interleaved A/B vs v10):
-//   - Alias smem_p onto smem_k: 37→28 KB lifts 2→3 blocks/SM (33%→50% occ).
-//   - Staged cp.async: K and V committed as separate groups; wait only for K
-//     before QK, drain V right before P*V — hides V's load behind QK+softmax.
-//   Combined: +5% to +15% over v10 across saturated configs (peak ~183 TFLOPS
-//   at B=4,S=4096). The kernel is occupancy/latency-bound, NOT compute-bound:
-//   cutting math (exp2f fold, mask elision) measured neutral-to-negative.
+// Accuracy gate: tests/fa_validate.cu -- random std=1 inputs vs a double CPU
+// reference, nrmse < 1e-3 (fp16) / 6e-3 (bf16). Loose thresholds with small
+// inputs hid a K-fragment addressing bug for the kernel's entire history;
+// do not weaken the gate.
 // ============================================================================
 
 #include "../include/flash_attention.h"
@@ -692,6 +718,11 @@ __global__ void flash_attention_fat_kernel(
   const int global_row0 = mi * 16 + local_row0;
   const int global_row1 = global_row0 + 8;
 
+  // exp2 fold: scores are scaled by scale*log2(e) once, and every exp becomes
+  // a raw exp2 (EX2, no hidden FMUL). All softmax state (max/sum) then lives
+  // in the base-2 domain; only the LSE epilogue converts back (ln2 factor).
+  const float scale2 = scale * 1.4426950408889634f;
+
   // -- Q prologue: stage through smem_k, ldmatrix into q_frag, free smem_k ---
   uint32_t q_frag[TILES_K][4];
   {
@@ -781,7 +812,7 @@ __global__ void flash_attention_fat_kernel(
       int s_col1 = s_col0 + 1;
 #pragma unroll
       for (int i = 0; i < 4; i++)
-        s_acc[ni][i] *= scale;
+        s_acc[ni][i] *= scale2;
       if (CAUSAL) {
         if (kv_start + s_col0 > q_start + global_row0) s_acc[ni][0] = -FLT_MAX;
         if (kv_start + s_col1 > q_start + global_row0) s_acc[ni][1] = -FLT_MAX;
@@ -811,10 +842,10 @@ __global__ void flash_attention_fat_kernel(
     float psum0 = 0.0f, psum1 = 0.0f;
 #pragma unroll
     for (int ni = 0; ni < QK_N8; ni++) {
-      float e0 = (s_acc[ni][0] > -FLT_MAX * 0.5f) ? __expf(s_acc[ni][0] - new_max0) : 0.0f;
-      float e1 = (s_acc[ni][1] > -FLT_MAX * 0.5f) ? __expf(s_acc[ni][1] - new_max0) : 0.0f;
-      float e2 = (s_acc[ni][2] > -FLT_MAX * 0.5f) ? __expf(s_acc[ni][2] - new_max1) : 0.0f;
-      float e3 = (s_acc[ni][3] > -FLT_MAX * 0.5f) ? __expf(s_acc[ni][3] - new_max1) : 0.0f;
+      float e0 = (s_acc[ni][0] > -FLT_MAX * 0.5f) ? exp2f(s_acc[ni][0] - new_max0) : 0.0f;
+      float e1 = (s_acc[ni][1] > -FLT_MAX * 0.5f) ? exp2f(s_acc[ni][1] - new_max0) : 0.0f;
+      float e2 = (s_acc[ni][2] > -FLT_MAX * 0.5f) ? exp2f(s_acc[ni][2] - new_max1) : 0.0f;
+      float e3 = (s_acc[ni][3] > -FLT_MAX * 0.5f) ? exp2f(s_acc[ni][3] - new_max1) : 0.0f;
       psum0 += e0 + e1;
       psum1 += e2 + e3;
       s_acc[ni][0] = e0; s_acc[ni][1] = e1; s_acc[ni][2] = e2; s_acc[ni][3] = e3;
@@ -826,8 +857,8 @@ __global__ void flash_attention_fat_kernel(
     }
 
     // -- Step C: online correction -------------------------------------------
-    float corr0 = (kv_tile == 0) ? 0.0f : __expf(prev_max0 - new_max0);
-    float corr1 = (kv_tile == 0) ? 0.0f : __expf(prev_max1 - new_max1);
+    float corr0 = (kv_tile == 0) ? 0.0f : exp2f(prev_max0 - new_max0);
+    float corr1 = (kv_tile == 0) ? 0.0f : exp2f(prev_max1 - new_max1);
     row_max0 = new_max0;
     row_max1 = new_max1;
     row_sum0 = row_sum0 * corr0 + psum0;
@@ -895,10 +926,14 @@ __global__ void flash_attention_fat_kernel(
     if (lane_id % 4 == 0 && LSE != nullptr) {
       int gq0 = q_start + global_row0;
       int gq1 = q_start + global_row1;
+      // max/sum are in the base-2 domain (see scale2): LSE_e = ln2*(m2+log2 s2)
+      constexpr float LN2 = 0.6931471805599453f;
       if (gq0 < seq_len)
-        LSE[bh_idx * seq_len + gq0] = row_max0 + logf(fmaxf(row_sum0, 1e-10f));
+        LSE[bh_idx * seq_len + gq0] =
+            LN2 * (row_max0 + log2f(fmaxf(row_sum0, 1e-10f)));
       if (gq1 < seq_len)
-        LSE[bh_idx * seq_len + gq1] = row_max1 + logf(fmaxf(row_sum1, 1e-10f));
+        LSE[bh_idx * seq_len + gq1] =
+            LN2 * (row_max1 + log2f(fmaxf(row_sum1, 1e-10f)));
     }
   }
 }
