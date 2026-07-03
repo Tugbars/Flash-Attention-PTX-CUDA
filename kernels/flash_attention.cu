@@ -906,23 +906,25 @@ __global__ void flash_attention_fat_kernel(
 // ============================================================================
 // Host Launch
 //
-// Dispatcher that selects between two tile geometries:
+// Two-tier dispatcher:
 //
-//   Big tile (64×64, 8 warps, ~37 KB smem):
-//     Wins when the GPU is saturated — amortizes per-block overhead and keeps
-//     the MMA pipeline full. This is the production case for B≥2 or B=1 with
-//     S≥1024 (i.e. essentially all real LLM inference / training workloads).
+//   Fat-warp kernel (64×64, 4 warps, ~35 KB smem) — the SATURATED tier:
+//     Few fat warps, giant register tiles, near-zero coordination (see the
+//     kernel comment). Dominates every measured saturated shape; parity with
+//     vLLM FA2 at most D=128 shapes. This is the production case for real
+//     LLM prefill workloads.
 //
-//   Small tile (32×64, 4 warps, ~28 KB smem):
-//     Wins when the workload is so small that the big-tile grid doesn't
-//     saturate the GPU. Halving BLOCK_M doubles the grid count, which fills
-//     the SMs and unlocks ~+32% on configs like B=1, S=512. Pure throughput
-//     loss on saturated configs.
+//   Small split-N tile (32×BN, 4 warps) — the UNDER-SATURATED tier:
+//     When the grid can't fill the SMs, block count beats per-warp width:
+//     halving BLOCK_M doubles the grid, unlocking ~+32% on configs like
+//     B=1, S=512 (where it also beats the fat kernel and vLLM). Instantiated
+//     from the split-N template (warp_pair = warp_id/2 = mi, warp_half =
+//     warp_id%2 → NUM_WARPS=4 gives 2 warp pairs → 2 m-tiles of 16 rows).
 //
-// Both kernels are the same template — only BLOCK_M and NUM_WARPS differ. The
-// kernel's warp partitioning (warp_pair = warp_id/2 = mi, warp_half =
-// warp_id%2) generalizes correctly to NUM_WARPS=4 → 2 warp pairs → 2 m-tiles of
-// 16 rows.
+// The 8-warp big split-N tile — the former saturated tier — was retired when
+// the fat kernel dominated it at every measured shape; accuracy baselining is
+// the strict fp64 gate in tests/fa_validate.cu (plus vLLM cross-checks in the
+// WSL sweep harness).
 // ============================================================================
 
 namespace {
@@ -1032,17 +1034,12 @@ inline int get_sm_count() {
   return sm_count;
 }
 
-// Per-head-dim tile tuning. The optimal BLOCK_N differs by D because it sets
-// the K/V tile size, which gates smem and thus occupancy:
-//   D=64:  BN=64 → 28 KB → 3 blocks/SM (50% occ). The v11 optimum.
-//   D=128: BN=32 → ~36 KB → 2 blocks/SM (16 warps). Halving BN vs the BN=64
-//   tile
-//          (which is 52 KB → only 1 block/SM) measured +28–31% on saturated
-//          configs — pure occupancy, the same lever as the D=64 alias win.
-// BM_SMALL/W_SMALL is the under-saturated grid-doubling variant (see
-// dispatcher). SAT_MULT is the small→fat crossover, in units of SM count: use
-// the small tile while (BM=64-geometry blocks < SAT_MULT * sm_count).
-// Re-measured against the fat-warp tier (same-process 3-way sweep):
+// Per-head-dim dispatch tuning. BN/BM_SMALL/W_SMALL describe the small
+// split-N tile (the under-saturated tier); the saturated tier is always the
+// fat-warp kernel (fixed 64x64x4). SAT_MULT is the small→fat crossover, in
+// units of SM count: use the small tile while
+// (BM=64-geometry blocks < SAT_MULT * sm_count).
+// Measured against the fat-warp tier (same-process 3-way sweep vs vLLM FA2):
 //   D=128: fat ties the small tile already at ~190 blocks and wins at 384
 //          (B=1 S=2048: fat 127.4 TF vs small 121.2) → ×2.
 //   D=64:  the small tile is stronger here (B=1 S=1024, 192 blocks: small
@@ -1051,12 +1048,10 @@ inline int get_sm_count() {
 //          old ×2 misroute the autotuner kept catching at B=1 S=1024.
 template <int D> struct FaConfig;
 template <> struct FaConfig<64> {
-  static constexpr int BN = 64, BM_BIG = 64, W_BIG = 8, BM_SMALL = 32,
-                       W_SMALL = 4, SAT_MULT = 3;
+  static constexpr int BN = 64, BM_SMALL = 32, W_SMALL = 4, SAT_MULT = 3;
 };
 template <> struct FaConfig<128> {
-  static constexpr int BN = 32, BM_BIG = 64, W_BIG = 8, BM_SMALL = 32,
-                       W_SMALL = 4, SAT_MULT = 2;
+  static constexpr int BN = 32, BM_SMALL = 32, W_SMALL = 4, SAT_MULT = 2;
 };
 
 // Pick the tile by GPU saturation, for a compile-time head dim. If we don't
@@ -1069,11 +1064,12 @@ template <> struct FaConfig<128> {
 template <class T, int D_HEAD>
 inline void dispatch_by_saturation(const FlashAttentionParams &params) {
   using C = FaConfig<D_HEAD>;
-  const int num_blocks_big = params.batch_size * params.num_heads *
-                             ((params.seq_len + C::BM_BIG - 1) / C::BM_BIG);
+  constexpr int FAT_BM = 64; // fat-warp kernel row-tile height
+  const int num_blocks_fat = params.batch_size * params.num_heads *
+                             ((params.seq_len + FAT_BM - 1) / FAT_BM);
   const int sm_count = get_sm_count();
 
-  if (num_blocks_big < C::SAT_MULT * sm_count) {
+  if (num_blocks_fat < C::SAT_MULT * sm_count) {
     launch_variant<C::BM_SMALL, C::BN, D_HEAD, C::W_SMALL, T>(params);
   } else {
     launch_fat_variant<D_HEAD, T>(params);
@@ -1101,30 +1097,28 @@ template <int D, class T> constexpr size_t fa_fat_smem() {
   return 2 * (size_t)64 * (D + 8) * sizeof(T);
 }
 
-// Curated grid. The split-N warp partition requires BM == 8*NW (NW/2 m-tiles
-// of 16 rows); BN is any multiple of 16. The (64,64,4) row is the fat-warp
-// kernel — a different template with its own launcher; its geometry triple is
-// unique in each list, which is what the wisdom cache keys on.
+// Curated grid: the fat-warp kernel (64,64,4 — its own template/launcher) plus
+// the two small split-N tiles for under-saturated grids. The 8-warp big
+// split-N tiles were removed once the fat kernel dominated them at every
+// measured saturated shape (same-process 3-way sweep vs vLLM FA2); the
+// geometry triple is what the wisdom cache keys on, and stale wisdom entries
+// for removed geometries are re-benched automatically.
 template <class T> const FaCandidate *fa_configs_64(int &n) {
   static const FaCandidate c[] = {
       {64, 64, 4, &launch_fat_variant<64, T>, fa_fat_smem<64, T>()},
-      {64, 64, 8, &launch_variant<64, 64, 64, 8, T>, fa_cfg_smem<64, 64, 64, T>()},
       {32, 64, 4, &launch_variant<32, 64, 64, 4, T>, fa_cfg_smem<32, 64, 64, T>()},
-      {64, 32, 8, &launch_variant<64, 32, 64, 8, T>, fa_cfg_smem<64, 32, 64, T>()},
       {32, 32, 4, &launch_variant<32, 32, 64, 4, T>, fa_cfg_smem<32, 32, 64, T>()},
   };
-  n = 5;
+  n = 3;
   return c;
 }
 template <class T> const FaCandidate *fa_configs_128(int &n) {
   static const FaCandidate c[] = {
       {64, 64, 4, &launch_fat_variant<128, T>, fa_fat_smem<128, T>()},
-      {64, 32, 8, &launch_variant<64, 32, 128, 8, T>, fa_cfg_smem<64, 32, 128, T>()},
       {32, 32, 4, &launch_variant<32, 32, 128, 4, T>, fa_cfg_smem<32, 32, 128, T>()},
       {32, 64, 4, &launch_variant<32, 64, 128, 4, T>, fa_cfg_smem<32, 64, 128, T>()},
-      {64, 48, 8, &launch_variant<64, 48, 128, 8, T>, fa_cfg_smem<64, 48, 128, T>()},
   };
-  n = 5;
+  n = 3;
   return c;
 }
 
