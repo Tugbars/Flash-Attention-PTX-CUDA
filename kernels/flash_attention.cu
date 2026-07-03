@@ -110,10 +110,27 @@ __device__ __forceinline__ void ldmatrix_x4(uint32_t &r0, uint32_t &r1,
 // The second group MUST offset by +8 cols (K load) or +8 rows (V load)
 // to cover the full 16-element k-dimension. Getting this wrong loads only
 // half the data — the bug that took longest to find.
+//
+// trans-vs-plain: for mma.row.col, the B fragment consumes lane i as
+// B[k=(i%4)*2][n=i/4]. A row-major K tile (rows = KV positions = n) needs the
+// PLAIN x2 — its fragment (lane i <- M[i/4][(i%4)*2]) lines up with n from
+// rows and k from columns. A row-major V tile (rows = KV positions = k of the
+// second GEMM) needs .trans. Using .trans for K feeds the MMA a within-8x8
+// feature-shuffled K — scores wrong by O(|s|), invisible at small test
+// amplitudes where softmax is near-flat (found by an S=1 LSE basis probe).
 __device__ __forceinline__ void ldmatrix_x2_trans(uint32_t &r0, uint32_t &r1,
                                                   const void *smem_ptr) {
   uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];"
+               : "=r"(r0), "=r"(r1)
+               : "r"(addr));
+}
+
+// Plain (non-transposed) x2 variant — required for the K (B-operand) load.
+__device__ __forceinline__ void ldmatrix_x2(uint32_t &r0, uint32_t &r1,
+                                            const void *smem_ptr) {
+  uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
                : "=r"(r0), "=r"(r1)
                : "r"(addr));
 }
@@ -330,16 +347,18 @@ __global__ void flash_attention_ptx_kernel(
                         smem_q + (mi * 16 + row) * Q_STRIDE + ki * 16 + col);
           }
 
-          // Load K tile: B operand (col-major via transpose, n8k16)
-          // mat = 0 for threads 0-7, 1 for threads 8-15
-          // Threads 8-15 offset by +8 columns to load the second 8×8 block
+          // Load K tile: B operand (n8k16). K rows are the n-dimension and K
+          // columns the k-dimension, so the row-major tile needs the PLAIN
+          // ldmatrix — .trans here hands the MMA a feature-shuffled K (see
+          // helper comment). mat = 0 for threads 0-7, 1 for threads 8-15;
+          // threads 8-15 offset by +8 columns to load the second 8×8 block.
           uint32_t b0, b1;
           {
             int k_row = lane_id % 8;
             int mat = (lane_id / 8) % 2;
-            ldmatrix_x2_trans(b0, b1,
-                              smem_k + (ni * 8 + k_row) * KV_STRIDE + ki * 16 +
-                                  mat * 8);
+            ldmatrix_x2(b0, b1,
+                        smem_k + (ni * 8 + k_row) * KV_STRIDE + ki * 16 +
+                            mat * 8);
           }
 
           ptx_mma_m16n8k16<T>(
