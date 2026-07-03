@@ -77,23 +77,28 @@ class QwenFA:
         self.norm_f = wd["model.norm.weight"]
         self.lm_head = (self.embed if cfg.get("tie_word_embeddings")
                         else wd["lm_head.weight"])
+        # merge QKV and gate+up into single GEMMs (vLLM-style): at B=1 the
+        # decode step is launch/latency-bound, so 2 fat GEMMs beat 5 thin ones
+        self.qs = self.nq * self.hd            # q rows in the merged output
+        self.ks = self.nkv * self.hd
         self.layers = []
         for i in range(self.nl):
             p = f"model.layers.{i}."
             self.layers.append({
                 "ln1": wd[p + "input_layernorm.weight"],
-                "wq": wd[p + "self_attn.q_proj.weight"],
-                "bq": wd[p + "self_attn.q_proj.bias"],
-                "wk": wd[p + "self_attn.k_proj.weight"],
-                "bk": wd[p + "self_attn.k_proj.bias"],
-                "wv": wd[p + "self_attn.v_proj.weight"],
-                "bv": wd[p + "self_attn.v_proj.bias"],
+                "wqkv": torch.cat([wd[p + "self_attn.q_proj.weight"],
+                                   wd[p + "self_attn.k_proj.weight"],
+                                   wd[p + "self_attn.v_proj.weight"]]),
+                "bqkv": torch.cat([wd[p + "self_attn.q_proj.bias"],
+                                   wd[p + "self_attn.k_proj.bias"],
+                                   wd[p + "self_attn.v_proj.bias"]]),
                 "wo": wd[p + "self_attn.o_proj.weight"],
                 "ln2": wd[p + "post_attention_layernorm.weight"],
-                "wg": wd[p + "mlp.gate_proj.weight"],
-                "wu": wd[p + "mlp.up_proj.weight"],
+                "wgu": torch.cat([wd[p + "mlp.gate_proj.weight"],
+                                  wd[p + "mlp.up_proj.weight"]]),
                 "wd": wd[p + "mlp.down_proj.weight"],
             })
+        del wd
         self.graph = None
 
     # -- cache ------------------------------------------------------------
@@ -146,9 +151,11 @@ class QwenFA:
         h = self.embed[flat]                                   # [B*L, H]
         for li, w in enumerate(self.layers):
             x = rmsnorm(h, w["ln1"], self.eps)
-            q = F.linear(x, w["wq"], w["bq"]).view(-1, self.nq, self.hd)
-            k = F.linear(x, w["wk"], w["bk"]).view(-1, self.nkv, self.hd)
-            v = F.linear(x, w["wv"], w["bv"]).view(-1, self.nkv, self.hd)
+            qkv = F.linear(x, w["wqkv"], w["bqkv"])
+            q, k, v = qkv.split([self.qs, self.ks, self.ks], dim=-1)
+            q = q.reshape(-1, self.nq, self.hd)
+            k = k.reshape(-1, self.nkv, self.hd)
+            v = v.reshape(-1, self.nkv, self.hd).contiguous()
             q = rope_rotate(q, self.cos, self.sin, pos)
             k = rope_rotate(k, self.cos, self.sin, pos)
             c = self.caches[li]
@@ -161,8 +168,8 @@ class QwenFA:
                                  causal=True)
             h = h + F.linear(o.reshape(-1, self.H), w["wo"])
             x = rmsnorm(h, w["ln2"], self.eps)
-            h = h + F.linear(F.silu(F.linear(x, w["wg"]))
-                             * F.linear(x, w["wu"]), w["wd"])
+            g, u = F.linear(x, w["wgu"]).chunk(2, dim=-1)
+            h = h + F.linear(F.silu(g) * u, w["wd"])
         self.seq_lens += L
         last = h.view(B, L, self.H)[:, -1]
         return F.linear(rmsnorm(last, self.norm_f, self.eps), self.lm_head)
@@ -172,9 +179,11 @@ class QwenFA:
         h = self.embed[ids]                                    # [B, H]
         for li, w in enumerate(self.layers):
             x = rmsnorm(h, w["ln1"], self.eps)
-            q = F.linear(x, w["wq"], w["bq"]).view(-1, self.nq, self.hd)
-            k = F.linear(x, w["wk"], w["bk"]).view(-1, self.nkv, self.hd)
-            v = F.linear(x, w["wv"], w["bv"]).view(-1, self.nkv, self.hd)
+            qkv = F.linear(x, w["wqkv"], w["bqkv"])
+            q, k, v = qkv.split([self.qs, self.ks, self.ks], dim=-1)
+            q = q.reshape(-1, self.nq, self.hd)
+            k = k.reshape(-1, self.nkv, self.hd).contiguous()
+            v = v.reshape(-1, self.nkv, self.hd).contiguous()
             q = rope_rotate(q, self.cos, self.sin, pos_s.long())
             # raw K in: rotation is fused into the quantizing scatter
             self.caches[li].write(k, v, slots_s, rope_cos=self.cos,
@@ -182,8 +191,8 @@ class QwenFA:
             o = self.caches[li].attend(q)                      # [B, nq, hd]
             h = h + F.linear(o.reshape(-1, self.H), w["wo"])
             x = rmsnorm(h, w["ln2"], self.eps)
-            h = h + F.linear(F.silu(F.linear(x, w["wg"]))
-                             * F.linear(x, w["wu"]), w["wd"])
+            g, u = F.linear(x, w["wgu"]).chunk(2, dim=-1)
+            h = h + F.linear(F.silu(g) * u, w["wd"])
         return F.linear(rmsnorm(h, self.norm_f, self.eps), self.lm_head)
 
     @torch.inference_mode()
@@ -196,31 +205,42 @@ class QwenFA:
 
     # -- whole-step CUDA graph -------------------------------------------------
     @torch.inference_mode()
-    def capture(self, first_ids):
-        """Capture one full decode step. The warmup pass EXECUTES one real
-        step (producing one token into ids_s); the capture pass only
-        records, so device state advances by exactly one token here."""
+    def capture(self, first_ids, compile_step=False):
+        """Capture one full decode step. Warmup passes EXECUTE real steps
+        (each producing one token into ids_s); the capture pass only
+        records. With compile_step, Inductor fuses the elementwise chains
+        (rmsnorm/rope/silu) into a few kernels first, and the CUDA graph
+        then captures the compiled step — the two compose."""
         self.ids_s = first_ids.clone()
         self.pos_s = torch.zeros(self.B, dtype=torch.int32,
                                  device=self.device)
         self.slots_s = torch.zeros(self.B, dtype=torch.int32,
                                    device=self.device)
+        step_fn = [self._step]
 
         def body():
             self.pos_s.copy_(self.seq_lens)
             self.slots_s.copy_(self.slot_base + self.seq_lens)
             self.seq_lens += 1
-            logits = self._step(self.ids_s, self.pos_s, self.slots_s)
+            logits = step_fn[0](self.ids_s, self.pos_s, self.slots_s)
             self.ids_s.copy_(logits.argmax(-1))
 
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
-            body()                       # warmup: builds scratches, runs
+            body()          # eager warmup: allocates every attend scratch
+            if compile_step:
+                # compile AFTER scratches exist: attend()'s lazy sizing
+                # branch (returns a python int) then never runs under dynamo
+                step_fn[0] = torch.compile(self._step, fullgraph=True,
+                                           dynamic=False)
+                body()      # compiling pass
+                body()      # settled pass, no compile machinery
         torch.cuda.current_stream().wait_stream(s)
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
             body()                       # recorded, not executed
+        self.warmup_tokens = 3 if compile_step else 1
 
     @torch.inference_mode()
     def generate(self, prompt_ids, n_tokens):
@@ -284,17 +304,19 @@ def cmd_verify(args):
     top1 = ours_logits.argmax().item() == ref_logits.argmax().item()
     print(f"prefill logits:                nrmse={nr:.5f} top1={top1}")
 
-    # gate 2: teacher-forced argmax agreement along the ref trajectory
+    # gate 2: teacher-forced argmax agreement along the ref trajectory.
+    # Prefill the FULL prompt (fp8 scales calibrate from the whole prompt,
+    # same as every other gate), then teacher-force the generated region.
     full = torch.cat([ids[0], ref_gen]).unsqueeze(0)
     n = full.shape[1]
     m.setup_cache(1, n + 8, args.kv)
-    m.prefill(full[:, :1])
-    agree = total = 0
-    for t in range(1, n - 1):
+    first = m.prefill(full[:, :L]).argmax(-1)
+    agree = int(first.item() == full[0, L].item())
+    total = 1
+    for t in range(L, n - 1):
         pred = m.decode_eager(full[:, t])
-        if t + 1 >= L:                    # score only the generated region
-            agree += int(pred.item() == full[0, t + 1].item())
-            total += 1
+        agree += int(pred.item() == full[0, t + 1].item())
+        total += 1
     print(f"teacher-forced argmax agreement: {agree}/{total}")
 
     # gate 3: free-running greedy prefix match, full-step graph decode
@@ -326,10 +348,11 @@ def cmd_bench(args):
     torch.cuda.synchronize()
     tpre = time.perf_counter() - t0
 
-    m.capture(logits.argmax(-1))
+    m.capture(logits.argmax(-1), compile_step=args.compile)
     ms = m.bench_decode(args.gen) * 1e3
     print(f"model=Qwen2.5-1.5B bf16  kv={args.kv}  B={args.batch}  "
-          f"prompt={args.prompt_len}  gen={args.gen}")
+          f"prompt={args.prompt_len}  gen={args.gen}  "
+          f"compile={args.compile}")
     print(f"prefill: {tpre * 1e3:8.1f} ms   "
           f"{args.batch * args.prompt_len / tpre:8.0f} tok/s")
     print(f"decode (full-step CUDA graph): {ms:7.3f} ms/step  "
@@ -353,6 +376,8 @@ if __name__ == "__main__":
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--bench", action="store_true")
     ap.add_argument("--kv", default="auto", choices=["auto", "fp8", "int4"])
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile the decode step before graph capture")
     ap.add_argument("--batch", type=int, default=1)
     ap.add_argument("--prompt-len", type=int, default=128)
     ap.add_argument("--gen", type=int, default=64)
