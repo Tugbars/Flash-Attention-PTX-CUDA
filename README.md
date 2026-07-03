@@ -22,7 +22,7 @@
 
 ## What is this?
 
-A from-scratch flash attention implementation in raw CUDA/PTX targeting consumer NVIDIA GPUs (RTX 5080, Blackwell sm_120). No libraries, no CUTLASS attention wrappers, no cuDNN — just hand-written kernels optimized step by step from 2.7 TFLOPS to 170+ TFLOPS.
+A from-scratch flash attention implementation in raw CUDA/PTX targeting consumer NVIDIA GPUs (RTX 5080, Blackwell sm_120). No libraries, no CUTLASS attention wrappers, no cuDNN — just hand-written kernels optimized step by step from 2.7 TFLOPS to 200+ TFLOPS, to the point of beating vLLM's FlashAttention-2 on the majority of measured shapes.
 
 The kernel uses PTX inline assembly for `mma.sync.aligned.m16n8k16` tensor core operations with `ldmatrix` for optimal shared memory → register transfers, and performs the full softmax **in registers** using warp shuffle intrinsics, eliminating the largest shared memory bottleneck in standard flash attention implementations.
 
@@ -38,19 +38,19 @@ Consumer Blackwell (sm_120) lacks the datacenter features that make H100/B200 at
 
 | Config | TFLOPS | % Peak | Notes |
 |--------|-------:|-------:|-------|
-| B=1, S=512 | 48.6 | 20.7% | Small-tile variant (auto-dispatched) |
-| B=1, S=2048 | 120.3 | 51.2% | |
-| B=4, S=2048 | 163.8 | 69.8% | |
-| **B=8, S=2048** | **170.5** | **72.6%** | **Sweet spot** |
-| B=1, S=4096 | 145.9 | 62.1% | |
-| **B=4, S=4096** | **182.7** | **77.8%** | **Peak** |
+| B=1, S=512, D=64 | 48.4 | 20.6% | Small-tile tier (auto-dispatched) |
+| B=1, S=2048, D=64 | 141.3 | 60.2% | |
+| B=4, S=2048, D=64 | 177.0 | 75.4% | |
+| B=8, S=2048, D=128 | 180.1 | 76.7% | |
+| **B=8, S=4096, D=64** | **200.8** | **85.5%** | **Peak, D=64** |
+| **B=8, S=8192, D=128** | **202.4** | **86.2%** | **Peak, D=128** |
 
-Measured on RTX 5080 (84 SMs, 234.8 TFLOPS FP16 theoretical peak), interleaved A/B, median of 9 rounds.
-The v11 occupancy work below is **+5% to +15% over v10** across every saturated config.
+Measured on RTX 5080 (84 SMs, 234.8 TFLOPS FP16 theoretical peak) through the production dispatcher with random fp16 inputs, causal attention, interleaved rounds.
+The fat-warp tier (v12) is **+9–10% over v11** at every saturated shape; the exp2 fold (v13) adds up to +3.5% on top.
 
-Under-saturated workloads (small batch × short sequence, e.g. B=1, S<1024) are auto-dispatched to a 32×64 / 4-warp tile variant that doubles the grid count and fills the SMs — same kernel template, smaller M-tile. See [Architecture](#architecture).
+Under-saturated workloads (small grids, e.g. B=1 with short sequences) are auto-dispatched to a 32×BN / 4-warp split-N tile that doubles the grid count and fills the SMs; everything saturated runs the fat-warp kernel. See [Architecture](#architecture).
 
-For context, Flash Attention 2 on the A100 (datacenter Ampere) achieves approximately 60% tensor core utilization. This consumer Blackwell kernel reaches up to ~78% of theoretical FP16 peak without WGMMA, TMA, or warp specialization, using only tools available on consumer silicon.
+For context, Flash Attention 2 on the A100 (datacenter Ampere) achieves approximately 60% tensor core utilization. This consumer Blackwell kernel reaches up to ~86% of theoretical FP16 peak without WGMMA, TMA, or warp specialization, using only tools available on consumer silicon — the same tensor-pipe utilization Nsight Compute measures for vLLM's FlashAttention-2 on this GPU.
 
 ### Optimization progression
 
