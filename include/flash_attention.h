@@ -82,6 +82,43 @@ struct FlashAttentionParams {
 void launch_flash_attention(const FlashAttentionParams &params);
 
 // ============================================================================
+// Varlen (ragged-batch) prefill — the serving-engine API.
+//
+// Sequences are PACKED with no padding, vLLM/FA2-style:
+//   Q, O : [total_q, H_q,  D]   (token-major: head stride D, token stride H_q*D)
+//   K, V : [total_k, H_kv, D]
+//   cu_seqlens_q/k : [B+1] exclusive prefix sums; sequence b's tokens are
+//                    rows [cu[b], cu[b+1]).
+//
+// Causal masking is BOTTOM-RIGHT aligned: query i of a sequence attends to
+// kv j where j <= i + (seqlen_k - seqlen_q). With seqlen_k == seqlen_q this
+// is ordinary causal attention; with seqlen_k > seqlen_q it is chunked /
+// append prefill (new queries attending to an existing KV prefix plus
+// themselves). Queries with no attendable keys write O = 0.
+// ============================================================================
+struct FlashAttentionVarlenParams {
+  const half *Q; // [total_q, H_q, D]  (address carrier; dtype below)
+  const half *K; // [total_k, H_kv, D]
+  const half *V; // [total_k, H_kv, D]
+  half *O;       // [total_q, H_q, D]
+  float *L;      // [total_q, H_q] log-sum-exp (natural log), optional/nullptr
+  const int *cu_seqlens_q; // [batch_size + 1], device memory
+  const int *cu_seqlens_k; // [batch_size + 1], device memory
+  int batch_size;
+  int num_heads;    // H_q
+  int num_kv_heads; // H_kv for GQA/MQA; 0 (or == num_heads) means MHA
+  int max_seqlen_q; // max over sequences of seqlen_q (grid sizing)
+  int d_head;       // 64 or 128
+  float scale;
+  bool causal;
+  DType dtype;
+  cudaStream_t stream;
+};
+
+// Implemented in kernels/flash_attention.cu
+void launch_flash_attention_varlen(const FlashAttentionVarlenParams &params);
+
+// ============================================================================
 // Decode (single-query) attention — a SEPARATE, memory-bound kernel.
 //
 // The prefill kernel above is compute/tensor-core bound (big Q tiles). DECODE

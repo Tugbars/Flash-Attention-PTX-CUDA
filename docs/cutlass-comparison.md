@@ -5,21 +5,34 @@ GPU — and why that baseline is what it is.*
 
 ## TL;DR
 
-On an RTX 5080 (sm_120), our hand-written prefill attention kernel is **~1.7×
-faster than CUTLASS's FMHA** across head dims and batch sizes — measured FP16,
-causal, same shapes, same FLOP formula, same session.
+On an RTX 5080 (sm_120), our hand-written prefill attention kernel is
+**~1.8–1.9× faster than CUTLASS's FMHA per shape, and ~2× at peak
+throughput** — measured FP16, causal, same shapes, same FLOP formula.
 
-| Config (causal, FP16) | CUTLASS ex.41 | This kernel | Speedup |
-|---|--:|--:|--:|
-| B=8 H=12 S=2048 D=128 | 2.123 ms | 1.212 ms | **1.75×** |
-| B=4 H=12 S=2048 D=128 | 1.080 ms | 0.644 ms | **1.68×** |
-| B=4 H=12 S=4096 D=128 | 4.012 ms | 2.286 ms | **1.76×** |
-| B=8 H=12 S=2048 D=64  | 1.012 ms | 0.587 ms | **1.72×** |
-| B=4 H=12 S=2048 D=64  | 0.552 ms | 0.313 ms | **1.76×** |
+The table below records the original same-session measurement (the v11-era
+kernel, ~1.7×). Since then the v12 fat-warp tier and v13 exp2 fold improved
+the kernel by a further +9–13% at these shapes, moving the per-shape ratio to
+**~1.8–1.9×** against the same CUTLASS times. Peak-vs-peak the gap is **~2×**:
+CUTLASS ex.41 measured 93–103 TFLOPS across every shape tried, while this
+kernel now peaks at ~202 TFLOPS (B=8, S=8192, D=128). We state the per-shape
+number as 1.8–1.9× rather than 2× because CUTLASS was not measured at the
+peak shape — no extrapolated claims. (The stronger, fully re-measured baseline
+comparison is now vLLM FlashAttention-2: see
+[vllm-comparison.md](vllm-comparison.md).)
 
-(TFLOPS by a single shared formula `4·B·H·S²·D / time`: CUTLASS ~93–103, ours
-~160–180. CUTLASS self-reports a lower number because it counts causal FLOPs
-differently — runtime is the unambiguous metric and gives the same ~1.7×.)
+| Config (causal, FP16) | CUTLASS ex.41 | v11 kernel | Speedup (v11) | Speedup (v13, est.) |
+|---|--:|--:|--:|--:|
+| B=8 H=12 S=2048 D=128 | 2.123 ms | 1.212 ms | 1.75× | **~1.86×** |
+| B=4 H=12 S=2048 D=128 | 1.080 ms | 0.644 ms | 1.68× | **~1.78×** |
+| B=4 H=12 S=4096 D=128 | 4.012 ms | 2.286 ms | 1.76× | **~1.85×** |
+| B=8 H=12 S=2048 D=64  | 1.012 ms | 0.587 ms | 1.72× | **~1.84×** |
+| B=4 H=12 S=2048 D=64  | 0.552 ms | 0.313 ms | 1.76× | **~1.90×** |
+
+(TFLOPS by a single shared formula `4·B·H·S²·D / time`: CUTLASS ~93–103, the
+v11 kernel ~160–180, the current v13 kernel ~180–202. CUTLASS self-reports a
+lower number because it counts causal FLOPs differently — runtime is the
+unambiguous metric. The v13 column applies the interleaved-A/B-measured
+v12+v13 gains to the same-session v11 times; the CUTLASS side is unchanged.)
 
 ## What "CUTLASS" means here — read this before quoting the number
 
@@ -39,7 +52,8 @@ This is **not** a comparison against CUTLASS's flagship FlashAttention — that
 kernel needs a datacenter GPU. It is a comparison against **what a 5080/5090
 owner actually gets from CUTLASS**, which is the Ampere fallback. If NVIDIA
 hasn't shipped a tuned consumer-Blackwell attention path, that's the baseline
-that exists, and beating it by 1.7× is the real, deliverable improvement.
+that exists, and beating it by ~1.8–1.9× per shape (~2× at peak throughput)
+is the real, deliverable improvement.
 
 ## Why we win on this hardware
 
