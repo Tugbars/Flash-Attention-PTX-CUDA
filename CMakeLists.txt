@@ -27,7 +27,9 @@ find_package(CUDAToolkit REQUIRED)
 # ============================================================================
 add_library(flash_attention STATIC
     kernels/flash_attention.cu
+    kernels/flash_attention_decode.cu
     kernels/fa_autotune.cu
+    kernels/fa_api.cu
 )
 
 target_include_directories(flash_attention PUBLIC
@@ -70,10 +72,7 @@ target_include_directories(flash_bench PRIVATE
 # thresholds. Compiles the decode kernel directly (it is not part of the
 # flash_attention library). Run after any kernel change; exit code 0 = pass.
 # ============================================================================
-add_executable(fa_validate
-    tests/fa_validate.cu
-    kernels/flash_attention_decode.cu
-)
+add_executable(fa_validate tests/fa_validate.cu)
 target_link_libraries(fa_validate PRIVATE flash_attention)
 target_include_directories(fa_validate PRIVATE
     ${CMAKE_SOURCE_DIR}/include
@@ -90,42 +89,38 @@ target_include_directories(fa_varlen_validate PRIVATE
 )
 
 # Paged-KV decode gate (shuffled pages, poisoned pool).
-add_executable(fa_paged_validate
-    tests/fa_paged_validate.cu
-    kernels/flash_attention_decode.cu
-)
+add_executable(fa_paged_validate tests/fa_paged_validate.cu)
 target_link_libraries(fa_paged_validate PRIVATE flash_attention)
 target_include_directories(fa_paged_validate PRIVATE
     ${CMAKE_SOURCE_DIR}/include
 )
 
 # FP8 KV-cache gate (writer bit-check + quantization-aware reference).
-add_executable(fa_fp8_validate
-    tests/fa_fp8_validate.cu
-    kernels/flash_attention_decode.cu
-)
+add_executable(fa_fp8_validate tests/fa_fp8_validate.cu)
 target_link_libraries(fa_fp8_validate PRIVATE flash_attention)
 target_include_directories(fa_fp8_validate PRIVATE
     ${CMAKE_SOURCE_DIR}/include
 )
 
 # INT4_G32 KV-cache gate (group-wise scales, writer bit-check).
-add_executable(fa_int4_validate
-    tests/fa_int4_validate.cu
-    kernels/flash_attention_decode.cu
-)
+add_executable(fa_int4_validate tests/fa_int4_validate.cu)
 target_link_libraries(fa_int4_validate PRIVATE flash_attention)
 target_include_directories(fa_int4_validate PRIVATE
     ${CMAKE_SOURCE_DIR}/include
 )
 
 # Paged-prefill gate (chunked prefill over a writer-populated paged cache).
-add_executable(fa_paged_prefill_validate
-    tests/fa_paged_prefill_validate.cu
-    kernels/flash_attention_decode.cu
-)
+add_executable(fa_paged_prefill_validate tests/fa_paged_prefill_validate.cu)
 target_link_libraries(fa_paged_prefill_validate PRIVATE flash_attention)
 target_include_directories(fa_paged_prefill_validate PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+# Unified-API equivalence gate: the fa_* facade must produce BIT-IDENTICAL
+# outputs to the underlying launch_* entry points.
+add_executable(fa_api_validate tests/fa_api_validate.cu)
+target_link_libraries(fa_api_validate PRIVATE flash_attention)
+target_include_directories(fa_api_validate PRIVATE
     ${CMAKE_SOURCE_DIR}/include
 )
 

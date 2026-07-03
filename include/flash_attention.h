@@ -253,6 +253,119 @@ size_t flash_decode_paged_scratch_bytes(const FlashDecodePagedParams &params);
 void launch_flash_attention_decode_paged(const FlashDecodePagedParams &params);
 
 // ============================================================================
+// ======================  UNIFIED API (recommended)  =========================
+//
+// Everything below is a thin, validated facade over the launchers above.
+// Three callables cover the whole feature set:
+//
+//   fa_attention        attention over tensors (batch or ragged/varlen)
+//   fa_cache_attention  queries against a paged KV cache (decode OR chunked
+//                       prefill — routed automatically by query length)
+//   fa_cache_write      append new K/V into the cache (quantizing on write)
+//
+// plus one descriptor, KvCache, that owns all cache state. The older
+// launch_* entry points remain supported; new code should use these.
+//
+// A full continuous-batching step, end to end:
+//   fa_attention(varlen)          -> prompt attention (no cache yet)
+//   fa_cache_write                -> scatter prompt K/V into pages
+//   loop: fa_cache_attention(q=1) -> decode steps
+//   fa_cache_write                -> append generated K/V each step
+//   fa_cache_attention(q>1)      -> chunked re-prefill on a follow-up turn
+// ============================================================================
+
+// All state of one paged KV cache. Pools are
+//   payload : [num_pages, page_size, num_kv_heads, d_head]  (elem: kv_dtype)
+//   scales  : [num_pages, page_size, num_kv_heads, d_head/32] half2
+//             (INT4_G32 only; nullptr otherwise)
+struct KvCache {
+  void *K, *V;                // payload pools
+  void *K_scales, *V_scales;  // INT4_G32 group scales, else nullptr
+  const int *block_table;     // [batch, max_blocks_per_seq], device
+  const int *seq_lens;        // [batch] current KV length per seq, device
+  int max_blocks_per_seq;     // block_table row stride
+  int page_size;              // tokens per page
+  int num_kv_heads;
+  int d_head;                 // 64 or 128
+  int max_seq_len_kv;         // host-known upper bound of seq_lens
+  KvDType kv_dtype;           // AUTO (= compute dtype) / FP8_E4M3 / INT4_G32
+  float k_scale, v_scale;     // FP8_E4M3 per-tensor scales (> 0)
+};
+
+// --- 1) fa_attention: self-contained attention over tensors -----------------
+// Batch mode  (cu_seqlens_q == nullptr): Q/K/V/O are [B, H, S, D]; uses the
+//   tile dispatcher + optional autotuner. lse layout: [B*H, S].
+// Varlen mode (cu_seqlens_q != nullptr): Q/O are packed [total_q, H_q, D],
+//   K/V packed [total_k, H_kv, D] with cu_seqlens_k; causal is bottom-right
+//   aligned (seqlen_k > seqlen_q == chunked/append). lse: [total_q, H_q].
+struct FaAttentionArgs {
+  const half *Q;
+  const half *K;
+  const half *V;
+  half *O;
+  float *lse;              // optional (nullptr to skip)
+  const int *cu_seqlens_q; // nullptr => batch mode
+  const int *cu_seqlens_k; // varlen mode only
+  int batch_size;
+  int num_heads;
+  int num_kv_heads; // 0 = MHA
+  int seq_len;      // batch mode
+  int max_seqlen_q; // varlen mode
+  int d_head;       // 64 or 128
+  float scale;      // 0 = 1/sqrt(d_head)
+  bool causal;
+  DType dtype;   // FP16 (zero-init default) or BF16
+  bool autotune; // batch mode only
+  cudaStream_t stream;
+};
+void fa_attention(const FaAttentionArgs &args);
+
+// --- 2) fa_cache_attention: queries against a KvCache -----------------------
+// Q/O are packed [total_q, H_q, D].
+//   Decode        : cu_seqlens_q == nullptr (or max_seqlen_q == 1) — one query
+//                   token per sequence (total_q == batch). Split-KV kernels;
+//                   supports fp16/bf16/FP8/INT4 caches; num_splits 0 = auto;
+//                   needs `scratch` (size via fa_cache_attention_scratch_bytes).
+//   Chunked prefill: cu_seqlens_q set, max_seqlen_q > 1 — new chunks attend
+//                   the full cache, bottom-right causal. AUTO caches only (for
+//                   now). New tokens' K/V must already be written to the cache.
+// lse: [total_q, H_q] in both modes.
+struct FaCacheAttentionArgs {
+  const half *Q;
+  half *O;
+  float *lse;              // optional
+  const int *cu_seqlens_q; // nullptr => decode
+  int max_seqlen_q;        // 1 => decode
+  KvCache cache;
+  void *scratch; // decode only
+  int batch_size;
+  int num_heads; // H_q; H_q % cache.num_kv_heads == 0
+  float scale;   // 0 = 1/sqrt(cache.d_head)
+  bool causal;   // prefill mode only (decode attends the whole cache)
+  DType dtype;
+  int num_splits; // decode: 0 = auto
+  cudaStream_t stream;
+};
+size_t fa_cache_attention_scratch_bytes(const FaCacheAttentionArgs &args);
+void fa_cache_attention(const FaCacheAttentionArgs &args);
+
+// --- 3) fa_cache_write: append packed K/V into the cache --------------------
+// K_new/V_new: [num_tokens, num_kv_heads, d_head] (compute dtype).
+// slot_mapping[t] = page_id * page_size + slot (negative skips token t).
+// Quantizes to cache.kv_dtype on the way (FP8 uses cache.k_scale/v_scale;
+// INT4_G32 computes group scales into cache.K_scales/V_scales).
+struct FaCacheWriteArgs {
+  const half *K_new;
+  const half *V_new;
+  const int *slot_mapping; // [num_tokens], device
+  int num_tokens;
+  KvCache cache;
+  DType dtype;
+  cudaStream_t stream;
+};
+void fa_cache_write(const FaCacheWriteArgs &args);
+
+// ============================================================================
 // KV-cache writer (vLLM's "reshape_and_cache"): scatter freshly-computed K/V
 // (packed [num_tokens, H_kv, D], the layout a QKV projection produces) into
 // the paged pools, optionally quantizing to FP8 on the way. slot_mapping[t] is
