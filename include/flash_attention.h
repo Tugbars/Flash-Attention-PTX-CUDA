@@ -156,4 +156,80 @@ struct FlashDecodeParams {
 size_t flash_decode_scratch_bytes(const FlashDecodeParams &params);
 void launch_flash_attention_decode(const FlashDecodeParams &params);
 
+// ============================================================================
+// Paged decode — PagedAttention-style KV cache for continuous batching.
+//
+// The KV cache is a pool of fixed-size pages; each sequence's logically
+// contiguous KV positions are scattered across physical pages via a per-
+// sequence block table (flash-attn / vLLM layout):
+//
+//   K_cache, V_cache : [num_pages, page_size, H_kv, D]
+//   block_table      : [B, max_blocks_per_seq]   (int32 physical page ids)
+//   seq_lens         : [B]                       (current KV length per seq)
+//
+// Logical token j of sequence b lives at page block_table[b][j / page_size],
+// slot j % page_size. Per-sequence lengths are ragged; splits are planned on
+// max_seq_len_kv and out-of-range splits write empty partials (safe combine).
+// ============================================================================
+// KV-cache element type. AUTO (0, the zero-init default) stores the cache in
+// the compute dtype (fp16/bf16). FP8_E4M3 halves cache bytes; values are
+// stored as fp8(x / scale) with caller-provided per-tensor k_scale / v_scale
+// (typical calibration: scale = max|X| / 448). Dequantization is folded
+// outside the hot loop (k_scale into the softmax scale, v_scale into the
+// output write), so FP8 reads cost no extra per-token arithmetic.
+enum class KvDType { AUTO = 0, FP8_E4M3 = 1 };
+
+struct FlashDecodePagedParams {
+  const half *Q;       // [B, H_q, D]
+  const half *K_cache; // [num_pages, page_size, H_kv, D] (elem type: kv_dtype)
+  const half *V_cache; // [num_pages, page_size, H_kv, D] (elem type: kv_dtype)
+  half *O;             // [B, H_q, D]
+  float *LSE;          // [B*H_q], optional (nullptr to skip)
+  const int *block_table; // [B, max_blocks_per_seq], device memory
+  const int *seq_lens;    // [B], device memory
+  void *scratch;          // size via flash_decode_paged_scratch_bytes
+  int batch_size;
+  int num_q_heads;
+  int num_kv_heads;       // H_q % H_kv == 0
+  int max_seq_len_kv;     // max over seq_lens (split planning + scratch)
+  int max_blocks_per_seq; // block_table row stride
+  int page_size;          // tokens per page (e.g. 16 or 32)
+  int d_head;             // 64 or 128
+  float scale;
+  int num_splits;         // 0 = auto
+  DType dtype;
+  KvDType kv_dtype;       // AUTO (= dtype) or FP8_E4M3
+  float k_scale;          // required (> 0) when kv_dtype == FP8_E4M3
+  float v_scale;          // required (> 0) when kv_dtype == FP8_E4M3
+  cudaStream_t stream;
+};
+
+size_t flash_decode_paged_scratch_bytes(const FlashDecodePagedParams &params);
+void launch_flash_attention_decode_paged(const FlashDecodePagedParams &params);
+
+// ============================================================================
+// KV-cache writer (vLLM's "reshape_and_cache"): scatter freshly-computed K/V
+// (packed [num_tokens, H_kv, D], the layout a QKV projection produces) into
+// the paged pools, optionally quantizing to FP8 on the way. slot_mapping[t] is
+// the FLAT destination slot for token t: page_id * page_size + slot_in_page
+// (a negative slot skips that token — vLLM padding convention).
+// ============================================================================
+struct KvCacheWriteParams {
+  const half *K_new; // [num_tokens, H_kv, D] (compute dtype)
+  const half *V_new; // [num_tokens, H_kv, D]
+  void *K_cache;     // paged pool (elem type: kv_dtype)
+  void *V_cache;     // paged pool
+  const int *slot_mapping; // [num_tokens], device memory
+  int num_tokens;
+  int num_kv_heads;
+  int d_head;
+  DType dtype;      // dtype of K_new / V_new
+  KvDType kv_dtype; // cache element type (AUTO = same as dtype)
+  float k_scale;    // required (> 0) when kv_dtype == FP8_E4M3
+  float v_scale;
+  cudaStream_t stream;
+};
+
+void launch_kv_cache_write(const KvCacheWriteParams &params);
+
 } // namespace transformer

@@ -82,6 +82,33 @@ target_compile_options(fa_validate PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
 )
 
+# Varlen (ragged-batch / chunked prefill) gate.
+add_executable(fa_varlen_validate tests/fa_varlen_validate.cu)
+target_link_libraries(fa_varlen_validate PRIVATE flash_attention)
+target_include_directories(fa_varlen_validate PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+# Paged-KV decode gate (shuffled pages, poisoned pool).
+add_executable(fa_paged_validate
+    tests/fa_paged_validate.cu
+    kernels/flash_attention_decode.cu
+)
+target_link_libraries(fa_paged_validate PRIVATE flash_attention)
+target_include_directories(fa_paged_validate PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+# FP8 KV-cache gate (writer bit-check + quantization-aware reference).
+add_executable(fa_fp8_validate
+    tests/fa_fp8_validate.cu
+    kernels/flash_attention_decode.cu
+)
+target_link_libraries(fa_fp8_validate PRIVATE flash_attention)
+target_include_directories(fa_fp8_validate PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
 # ============================================================================
 # Info
 # ============================================================================

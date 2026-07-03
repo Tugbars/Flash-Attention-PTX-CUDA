@@ -24,7 +24,9 @@
 #include <cmath>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <type_traits>
 
 namespace transformer {
 
@@ -127,6 +129,60 @@ __device__ __forceinline__ void dec_loadv(const T *p, float (&o)[CH]) {
     o[2] = __low2float(b);
     o[3] = __high2float(b);
   }
+}
+
+// Unified KV loader: fp16/bf16 use the vectorized path above; FP8 (e4m3)
+// loads CH raw bytes (half the traffic) and converts via the hardware cvt —
+// no scale here: k_scale is folded into the softmax scale on the host and
+// v_scale into the output/partial write, so the hot loop sees raw values.
+template <class TKV, int CH>
+__device__ __forceinline__ void dec_load_kv(const TKV *p, float (&o)[CH]) {
+  if constexpr (std::is_same<TKV, __nv_fp8_e4m3>::value) {
+    const __nv_fp8_storage_t *b =
+        reinterpret_cast<const __nv_fp8_storage_t *>(p);
+    if constexpr (CH == 2) {
+      uint16_t u = *reinterpret_cast<const uint16_t *>(b);
+      __half2_raw h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)u,
+                                                 __NV_E4M3);
+      __half2 h2 = *reinterpret_cast<__half2 *>(&h);
+      o[0] = __low2float(h2);
+      o[1] = __high2float(h2);
+    } else { // CH == 4
+      uint32_t u = *reinterpret_cast<const uint32_t *>(b);
+      __half2_raw ra = __nv_cvt_fp8x2_to_halfraw2(
+          (__nv_fp8x2_storage_t)(u & 0xffffu), __NV_E4M3);
+      __half2_raw rb = __nv_cvt_fp8x2_to_halfraw2(
+          (__nv_fp8x2_storage_t)(u >> 16), __NV_E4M3);
+      __half2 a = *reinterpret_cast<__half2 *>(&ra);
+      __half2 c = *reinterpret_cast<__half2 *>(&rb);
+      o[0] = __low2float(a);
+      o[1] = __high2float(a);
+      o[2] = __low2float(c);
+      o[3] = __high2float(c);
+    }
+  } else {
+    dec_loadv<TKV, CH>(p, o);
+  }
+}
+
+// Element -> float and float -> cache-element conversions for the KV writer.
+__device__ __forceinline__ float elem_to_float(half x) {
+  return __half2float(x);
+}
+__device__ __forceinline__ float elem_to_float(__nv_bfloat16 x) {
+  return __bfloat162float(x);
+}
+template <class TKV> __device__ __forceinline__ TKV float_to_kv(float x);
+template <> __device__ __forceinline__ half float_to_kv<half>(float x) {
+  return __float2half(x);
+}
+template <>
+__device__ __forceinline__ __nv_bfloat16 float_to_kv<__nv_bfloat16>(float x) {
+  return __float2bfloat16(x);
+}
+template <>
+__device__ __forceinline__ __nv_fp8_e4m3 float_to_kv<__nv_fp8_e4m3>(float x) {
+  return __nv_fp8_e4m3(x); // SATFINITE conversion
 }
 
 template <int D, class T>
@@ -350,6 +406,244 @@ decode_partial_gqa(const T *__restrict__ Q, const T *__restrict__ K,
 }
 
 // ============================================================================
+// PAGED partial kernels — PagedAttention-style KV cache.
+//
+// Same compute as the contiguous partials above; the deltas are addressing
+// and lengths:
+//   - KV pool [num_pages, page_size, H_kv, D]; logical token j of sequence b
+//     lives at page block_table[b][j / page_size], slot j % page_size. A row
+//     of one (token, kv-head) is still D contiguous elements -> the same
+//     vectorized loads apply; only the row base needs translation.
+//   - Per-sequence lengths (seq_lens[b]) are ragged. Splits are planned on
+//     max_seq_len_kv, so splits past a short sequence's end have an empty
+//     range: they still write a (m=-FLT_MAX, l=0, O=0) partial, which the
+//     combine kernel's alpha guard treats as a no-op (never reads garbage).
+// ============================================================================
+template <class T>
+__device__ __forceinline__ const T *
+paged_row(const T *cache, const int *bt, int token, int page_size, int H_kv,
+          int h_kv, int D) {
+  int blk = token / page_size;
+  int slot = token - blk * page_size;
+  size_t row = (size_t)bt[blk] * page_size + slot;
+  return cache + (row * H_kv + h_kv) * D;
+}
+
+template <int D, class T, class TKV>
+__global__ void decode_partial_paged(
+    const T *__restrict__ Q, const TKV *__restrict__ Kc,
+    const TKV *__restrict__ Vc, T *__restrict__ O, float *__restrict__ LSE,
+    float *__restrict__ Op, float *__restrict__ mp, float *__restrict__ lp,
+    const int *__restrict__ block_table, const int *__restrict__ seq_lens,
+    int H_q, int H_kv, int max_blocks, int page_size, int chunk,
+    int num_splits, float scale, float v_scale) {
+  constexpr int THREADS = 2 * D;
+  constexpr int NWARPS = THREADS / 32;
+  constexpr int CH = D / 32;
+
+  const int s = blockIdx.x;
+  const int h_q = blockIdx.y;
+  const int b = blockIdx.z;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+
+  const int group = H_q / H_kv;
+  const int h_kv = h_q / group;
+  const int S_kv = seq_lens[b];
+  const int *bt = block_table + (size_t)b * max_blocks;
+
+  const size_t q_off = (size_t)(b * H_q + h_q) * D;
+
+  __shared__ T smem_q[D];
+  __shared__ float red_m[NWARPS];
+  __shared__ float red_l[NWARPS];
+  __shared__ float red_acc[NWARPS][D];
+
+  for (int i = tid; i < D; i += THREADS)
+    smem_q[i] = Q[q_off + i];
+  __syncthreads();
+  float qreg[CH];
+  dec_loadv<T, CH>(smem_q + lane * CH, qreg);
+
+  const int base = s * chunk;
+  const int next = min(base + chunk, S_kv);
+
+  float m_w = -FLT_MAX, l_w = 0.0f;
+  float acc[CH];
+#pragma unroll
+  for (int c = 0; c < CH; c++)
+    acc[c] = 0.0f;
+
+  for (int j = base + warp; j < next; j += NWARPS) {
+    const TKV *kj = paged_row<TKV>(Kc, bt, j, page_size, H_kv, h_kv, D);
+    float kf[CH];
+    dec_load_kv<TKV, CH>(kj + lane * CH, kf);
+    float part = 0.0f;
+#pragma unroll
+    for (int c = 0; c < CH; c++)
+      part += qreg[c] * kf[c];
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+      part += __shfl_xor_sync(0xffffffffu, part, off);
+    float s_j = part * scale;
+    float m_new = fmaxf(m_w, s_j);
+    float corr = __expf(m_w - m_new);
+    float p = __expf(s_j - m_new);
+    const TKV *vj = paged_row<TKV>(Vc, bt, j, page_size, H_kv, h_kv, D);
+    float vf[CH];
+    dec_load_kv<TKV, CH>(vj + lane * CH, vf);
+#pragma unroll
+    for (int c = 0; c < CH; c++)
+      acc[c] = acc[c] * corr + p * vf[c];
+    l_w = l_w * corr + p;
+    m_w = m_new;
+  }
+
+  if (lane == 0) {
+    red_m[warp] = m_w;
+    red_l[warp] = l_w;
+  }
+#pragma unroll
+  for (int c = 0; c < CH; c++)
+    red_acc[warp][lane * CH + c] = acc[c];
+  __syncthreads();
+
+  float m_blk = -FLT_MAX;
+#pragma unroll
+  for (int w = 0; w < NWARPS; w++)
+    m_blk = fmaxf(m_blk, red_m[w]);
+
+  if (tid < D) {
+    const int d = tid;
+    float l_blk = 0.0f, a = 0.0f;
+#pragma unroll
+    for (int w = 0; w < NWARPS; w++) {
+      float alpha =
+          (red_m[w] > -FLT_MAX * 0.5f) ? __expf(red_m[w] - m_blk) : 0.0f;
+      l_blk += alpha * red_l[w];
+      a += alpha * red_acc[w][d];
+    }
+    a *= v_scale; // FP8 dequant fold (1.0 for fp16/bf16 caches)
+    if (num_splits == 1) {
+      O[q_off + d] = to_elem<T>((l_blk > 0.0f) ? (a / l_blk) : 0.0f);
+      if (LSE && d == 0)
+        LSE[b * H_q + h_q] = (l_blk > 0.0f) ? (m_blk + logf(l_blk)) : -INFINITY;
+    } else {
+      size_t io = ((size_t)(b * H_q + h_q) * num_splits + s) * D + d;
+      Op[io] = a;
+      if (d == 0) {
+        size_t im = (size_t)(b * H_q + h_q) * num_splits + s;
+        mp[im] = m_blk;
+        lp[im] = l_blk;
+      }
+    }
+  }
+}
+
+// Group-resident GQA paged partial: identical structure to decode_partial_gqa;
+// the smem tile loader translates each ROW through the block table (rows may
+// span page boundaries), then the inner loop reads smem exactly as before.
+template <int D, class T, class TKV>
+__global__ void decode_partial_gqa_paged(
+    const T *__restrict__ Q, const TKV *__restrict__ Kc,
+    const TKV *__restrict__ Vc, T *__restrict__ O, float *__restrict__ LSE,
+    float *__restrict__ Op, float *__restrict__ mp, float *__restrict__ lp,
+    const int *__restrict__ block_table, const int *__restrict__ seq_lens,
+    int H_q, int H_kv, int max_blocks, int page_size, int chunk,
+    int num_splits, float scale, float v_scale, int group) {
+  constexpr int CH = D / 32;
+  constexpr int TILE_N = 32;
+  const int s = blockIdx.x;
+  const int h_kv = blockIdx.y;
+  const int b = blockIdx.z;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int nthreads = blockDim.x;
+  const int h_q = h_kv * group + warp;
+  const int S_kv = seq_lens[b];
+  const int *bt = block_table + (size_t)b * max_blocks;
+
+  __shared__ TKV sK[TILE_N * D];
+  __shared__ TKV sV[TILE_N * D];
+
+  const size_t q_off = (size_t)(b * H_q + h_q) * D;
+  float qreg[CH];
+  dec_loadv<T, CH>(Q + q_off + lane * CH, qreg);
+
+  const int base = s * chunk;
+  const int next = min(base + chunk, S_kv);
+
+  float m_w = -FLT_MAX, l_w = 0.0f;
+  float acc[CH];
+#pragma unroll
+  for (int c = 0; c < CH; c++)
+    acc[c] = 0.0f;
+
+  for (int t0 = base; t0 < next; t0 += TILE_N) {
+    int tn = min(TILE_N, next - t0);
+    // per-row page translation; each row is still one vectorized copy
+    // (row = D elements of TKV -> D*sizeof(TKV)/16 uint4s; fp8 rows move
+    //  half the bytes of fp16 rows)
+    constexpr int VEC = (int)(D * sizeof(TKV)) / 16; // uint4 per row
+    uint4 *Kdst = reinterpret_cast<uint4 *>(sK);
+    uint4 *Vdst = reinterpret_cast<uint4 *>(sV);
+    for (int i = tid; i < tn * VEC; i += nthreads) {
+      int r = i / VEC, c = i - r * VEC;
+      const TKV *krow = paged_row<TKV>(Kc, bt, t0 + r, page_size, H_kv, h_kv, D);
+      const TKV *vrow = paged_row<TKV>(Vc, bt, t0 + r, page_size, H_kv, h_kv, D);
+      Kdst[i] = reinterpret_cast<const uint4 *>(krow)[c];
+      Vdst[i] = reinterpret_cast<const uint4 *>(vrow)[c];
+    }
+    __syncthreads();
+
+    for (int jj = 0; jj < tn; jj++) {
+      float kf[CH];
+      dec_load_kv<TKV, CH>(sK + jj * D + lane * CH, kf);
+      float part = 0.0f;
+#pragma unroll
+      for (int c = 0; c < CH; c++)
+        part += qreg[c] * kf[c];
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1)
+        part += __shfl_xor_sync(0xffffffffu, part, off);
+      float s_j = part * scale;
+      float m_new = fmaxf(m_w, s_j);
+      float corr = __expf(m_w - m_new);
+      float p = __expf(s_j - m_new);
+      float vf[CH];
+      dec_load_kv<TKV, CH>(sV + jj * D + lane * CH, vf);
+#pragma unroll
+      for (int c = 0; c < CH; c++)
+        acc[c] = acc[c] * corr + p * vf[c];
+      l_w = l_w * corr + p;
+      m_w = m_new;
+    }
+    __syncthreads();
+  }
+
+  if (num_splits == 1) {
+    float inv = (l_w > 0.0f) ? (v_scale / l_w) : 0.0f; // FP8 dequant fold
+#pragma unroll
+    for (int c = 0; c < CH; c++)
+      O[q_off + lane * CH + c] = to_elem<T>(acc[c] * inv);
+    if (LSE && lane == 0)
+      LSE[b * H_q + h_q] = (l_w > 0.0f) ? (m_w + logf(l_w)) : -INFINITY;
+  } else {
+    size_t io = ((size_t)(b * H_q + h_q) * num_splits + s) * D;
+#pragma unroll
+    for (int c = 0; c < CH; c++)
+      Op[io + lane * CH + c] = acc[c] * v_scale; // FP8 dequant fold
+    if (lane == 0) {
+      size_t im = (size_t)(b * H_q + h_q) * num_splits + s;
+      mp[im] = m_w;
+      lp[im] = l_w;
+    }
+  }
+}
+
+// ============================================================================
 // Combine kernel: one CTA = one (batch, query-head). D threads, thread d owns
 // output channel d. Merges num_splits partials with the log-sum-exp rescale.
 // ============================================================================
@@ -505,6 +799,212 @@ void launch_flash_attention_decode(const FlashDecodeParams &p) {
     decode_dispatch<__nv_bfloat16>(p, pl, Op, mp, lp);
   else
     decode_dispatch<half>(p, pl, Op, mp, lp);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+// ============================================================================
+// Paged host entries. The split plan is computed from max_seq_len_kv (the
+// per-sequence ragged lengths are resolved on-device); everything else mirrors
+// the contiguous path, including the shared combine kernel.
+// ============================================================================
+static inline DecPlan dec_plan_paged(const FlashDecodePagedParams &p) {
+  int group = p.num_q_heads / p.num_kv_heads;
+  int sm = dec_sm_count();
+  int ns_g, ch_g, ns_p, ch_p;
+  resolve_splits(p.batch_size * p.num_kv_heads, p.max_seq_len_kv, p.d_head, sm,
+                 p.num_splits, ns_g, ch_g);
+  resolve_splits(p.batch_size * p.num_q_heads, p.max_seq_len_kv, p.d_head, sm,
+                 p.num_splits, ns_p, ch_p);
+  bool gqa = (group > 1 && group <= 32) &&
+             ((long long)ns_g * p.num_kv_heads * p.batch_size >= sm);
+  DecPlan pl;
+  pl.group = group;
+  pl.use_gqa = gqa;
+  pl.ns = gqa ? ns_g : ns_p;
+  pl.chunk = gqa ? ch_g : ch_p;
+  return pl;
+}
+
+size_t flash_decode_paged_scratch_bytes(const FlashDecodePagedParams &p) {
+  DecPlan pl = dec_plan_paged(p);
+  size_t rows = (size_t)p.batch_size * p.num_q_heads;
+  size_t bytes_O = sizeof(float) * rows * pl.ns * p.d_head;
+  size_t bytes_m = sizeof(float) * rows * pl.ns;
+  size_t bytes_l = sizeof(float) * rows * pl.ns;
+  return align256(bytes_O) + align256(bytes_m) + align256(bytes_l);
+}
+
+template <class T, class TKV>
+static void decode_dispatch_paged(const FlashDecodePagedParams &p,
+                                  const DecPlan &pl, float *Op, float *mp,
+                                  float *lp, float eff_scale, float v_scale) {
+  const int ns = pl.ns, chunk = pl.chunk;
+  const T *Q = reinterpret_cast<const T *>(p.Q);
+  const TKV *K = reinterpret_cast<const TKV *>(p.K_cache);
+  const TKV *V = reinterpret_cast<const TKV *>(p.V_cache);
+  T *O = reinterpret_cast<T *>(p.O);
+
+  if (pl.use_gqa) {
+    const int group = pl.group;
+    dim3 grid(ns, p.num_kv_heads, p.batch_size);
+    dim3 block(group * 32);
+    if (p.d_head == 64)
+      decode_partial_gqa_paged<64, T, TKV><<<grid, block, 0, p.stream>>>(
+          Q, K, V, O, p.LSE, Op, mp, lp, p.block_table, p.seq_lens,
+          p.num_q_heads, p.num_kv_heads, p.max_blocks_per_seq, p.page_size,
+          chunk, ns, eff_scale, v_scale, group);
+    else
+      decode_partial_gqa_paged<128, T, TKV><<<grid, block, 0, p.stream>>>(
+          Q, K, V, O, p.LSE, Op, mp, lp, p.block_table, p.seq_lens,
+          p.num_q_heads, p.num_kv_heads, p.max_blocks_per_seq, p.page_size,
+          chunk, ns, eff_scale, v_scale, group);
+  } else {
+    dim3 grid(ns, p.num_q_heads, p.batch_size);
+    if (p.d_head == 64)
+      decode_partial_paged<64, T, TKV><<<grid, dim3(128), 0, p.stream>>>(
+          Q, K, V, O, p.LSE, Op, mp, lp, p.block_table, p.seq_lens,
+          p.num_q_heads, p.num_kv_heads, p.max_blocks_per_seq, p.page_size,
+          chunk, ns, eff_scale, v_scale);
+    else
+      decode_partial_paged<128, T, TKV><<<grid, dim3(256), 0, p.stream>>>(
+          Q, K, V, O, p.LSE, Op, mp, lp, p.block_table, p.seq_lens,
+          p.num_q_heads, p.num_kv_heads, p.max_blocks_per_seq, p.page_size,
+          chunk, ns, eff_scale, v_scale);
+  }
+
+  if (ns > 1) {
+    dim3 cgrid(p.num_q_heads, p.batch_size);
+    size_t csmem = sizeof(float) * 2 * ns;
+    if (p.d_head == 64)
+      decode_combine<64, T><<<cgrid, dim3(64), csmem, p.stream>>>(
+          Op, mp, lp, O, p.LSE, p.num_q_heads, ns);
+    else
+      decode_combine<128, T><<<cgrid, dim3(128), csmem, p.stream>>>(
+          Op, mp, lp, O, p.LSE, p.num_q_heads, ns);
+  }
+}
+
+void launch_flash_attention_decode_paged(const FlashDecodePagedParams &p) {
+  DecPlan pl = dec_plan_paged(p);
+  int ns = pl.ns;
+  size_t rows = (size_t)p.batch_size * p.num_q_heads;
+  float *Op = reinterpret_cast<float *>(p.scratch);
+  float *mp =
+      reinterpret_cast<float *>(reinterpret_cast<char *>(p.scratch) +
+                                align256(sizeof(float) * rows * ns * p.d_head));
+  float *lp = reinterpret_cast<float *>(reinterpret_cast<char *>(mp) +
+                                        align256(sizeof(float) * rows * ns));
+
+  if (p.d_head != 64 && p.d_head != 128) {
+    fprintf(stderr, "flash_decode_paged: unsupported d_head=%d (64 or 128)\n",
+            p.d_head);
+    abort();
+  }
+  if (p.page_size <= 0 || p.max_blocks_per_seq <= 0) {
+    fprintf(stderr, "flash_decode_paged: bad page geometry (page_size=%d, "
+                    "max_blocks_per_seq=%d)\n",
+            p.page_size, p.max_blocks_per_seq);
+    abort();
+  }
+
+  if (p.kv_dtype == KvDType::FP8_E4M3) {
+    if (!(p.k_scale > 0.0f) || !(p.v_scale > 0.0f)) {
+      fprintf(stderr, "flash_decode_paged: FP8 cache requires k_scale/v_scale "
+                      "> 0 (got %g, %g)\n",
+              p.k_scale, p.v_scale);
+      abort();
+    }
+    // k_scale folds into the softmax scale (scores are linear in K); v_scale
+    // is applied by the kernels at the output/partial write. The hot loop
+    // reads raw fp8 with no per-element scale arithmetic.
+    const float eff_scale = p.scale * p.k_scale;
+    if (p.dtype == DType::BF16)
+      decode_dispatch_paged<__nv_bfloat16, __nv_fp8_e4m3>(p, pl, Op, mp, lp,
+                                                          eff_scale, p.v_scale);
+    else
+      decode_dispatch_paged<half, __nv_fp8_e4m3>(p, pl, Op, mp, lp, eff_scale,
+                                                 p.v_scale);
+  } else {
+    if (p.dtype == DType::BF16)
+      decode_dispatch_paged<__nv_bfloat16, __nv_bfloat16>(p, pl, Op, mp, lp,
+                                                          p.scale, 1.0f);
+    else
+      decode_dispatch_paged<half, half>(p, pl, Op, mp, lp, p.scale, 1.0f);
+  }
+  CUDA_CHECK(cudaGetLastError());
+}
+
+// ============================================================================
+// KV-cache writer: scatter packed [num_tokens, H_kv, D] K/V into the paged
+// pools via slot_mapping (flat slot = page * page_size + offset; negative
+// skips). FP8 caches quantize on the way: fp8(x / scale), saturating.
+// ============================================================================
+template <class T, class TKV>
+__global__ void kv_cache_write_kernel(const T *__restrict__ K_new,
+                                      const T *__restrict__ V_new,
+                                      TKV *__restrict__ Kc,
+                                      TKV *__restrict__ Vc,
+                                      const int *__restrict__ slot_mapping,
+                                      int hd, float k_inv, float v_inv) {
+  const int t = blockIdx.x;
+  const int slot = slot_mapping[t];
+  if (slot < 0)
+    return;
+  const size_t src = (size_t)t * hd;
+  const size_t dst = (size_t)slot * hd;
+  for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+    Kc[dst + i] = float_to_kv<TKV>(elem_to_float(K_new[src + i]) * k_inv);
+    Vc[dst + i] = float_to_kv<TKV>(elem_to_float(V_new[src + i]) * v_inv);
+  }
+}
+
+void launch_kv_cache_write(const KvCacheWriteParams &p) {
+  if (p.num_tokens <= 0)
+    return;
+  const int hd = p.num_kv_heads * p.d_head;
+  const bool fp8 = (p.kv_dtype == KvDType::FP8_E4M3);
+  float k_inv = 1.0f, v_inv = 1.0f;
+  if (fp8) {
+    if (!(p.k_scale > 0.0f) || !(p.v_scale > 0.0f)) {
+      fprintf(stderr, "kv_cache_write: FP8 cache requires k_scale/v_scale > 0 "
+                      "(got %g, %g)\n",
+              p.k_scale, p.v_scale);
+      abort();
+    }
+    k_inv = 1.0f / p.k_scale;
+    v_inv = 1.0f / p.v_scale;
+  }
+  dim3 grid(p.num_tokens);
+  dim3 block(hd < 256 ? hd : 256);
+  if (p.dtype == DType::BF16) {
+    const __nv_bfloat16 *Kn = reinterpret_cast<const __nv_bfloat16 *>(p.K_new);
+    const __nv_bfloat16 *Vn = reinterpret_cast<const __nv_bfloat16 *>(p.V_new);
+    if (fp8)
+      kv_cache_write_kernel<__nv_bfloat16, __nv_fp8_e4m3>
+          <<<grid, block, 0, p.stream>>>(
+              Kn, Vn, reinterpret_cast<__nv_fp8_e4m3 *>(p.K_cache),
+              reinterpret_cast<__nv_fp8_e4m3 *>(p.V_cache), p.slot_mapping, hd,
+              k_inv, v_inv);
+    else
+      kv_cache_write_kernel<__nv_bfloat16, __nv_bfloat16>
+          <<<grid, block, 0, p.stream>>>(
+              Kn, Vn, reinterpret_cast<__nv_bfloat16 *>(p.K_cache),
+              reinterpret_cast<__nv_bfloat16 *>(p.V_cache), p.slot_mapping, hd,
+              k_inv, v_inv);
+  } else {
+    const half *Kn = p.K_new;
+    const half *Vn = p.V_new;
+    if (fp8)
+      kv_cache_write_kernel<half, __nv_fp8_e4m3><<<grid, block, 0, p.stream>>>(
+          Kn, Vn, reinterpret_cast<__nv_fp8_e4m3 *>(p.K_cache),
+          reinterpret_cast<__nv_fp8_e4m3 *>(p.V_cache), p.slot_mapping, hd,
+          k_inv, v_inv);
+    else
+      kv_cache_write_kernel<half, half><<<grid, block, 0, p.stream>>>(
+          Kn, Vn, reinterpret_cast<half *>(p.K_cache),
+          reinterpret_cast<half *>(p.V_cache), p.slot_mapping, hd, k_inv,
+          v_inv);
+  }
   CUDA_CHECK(cudaGetLastError());
 }
 
