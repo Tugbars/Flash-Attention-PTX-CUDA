@@ -119,6 +119,16 @@ target_include_directories(fa_int4_validate PRIVATE
     ${CMAKE_SOURCE_DIR}/include
 )
 
+# Paged-prefill gate (chunked prefill over a writer-populated paged cache).
+add_executable(fa_paged_prefill_validate
+    tests/fa_paged_prefill_validate.cu
+    kernels/flash_attention_decode.cu
+)
+target_link_libraries(fa_paged_prefill_validate PRIVATE flash_attention)
+target_include_directories(fa_paged_prefill_validate PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
 # ============================================================================
 # Info
 # ============================================================================

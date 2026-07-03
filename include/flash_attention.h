@@ -119,6 +119,41 @@ struct FlashAttentionVarlenParams {
 void launch_flash_attention_varlen(const FlashAttentionVarlenParams &params);
 
 // ============================================================================
+// Paged prefill — chunked prefill over a PAGED KV cache. New queries (packed
+// varlen, [total_q, H_q, D]) attend to each sequence's full cached KV, read
+// through the block table. Causal is BOTTOM-RIGHT aligned against the cache
+// length: query i attends kv j <= i + (seq_len_k[b] - seqlen_q[b]).
+//
+// Contract: the new tokens' K/V must already be IN the paged cache (write
+// them with launch_kv_cache_write first); this kernel reads K/V only from the
+// pools. fp16/bf16 pools only (kv_dtype quantized prefill is future work).
+// ============================================================================
+struct FlashAttentionPagedPrefillParams {
+  const half *Q; // [total_q, H_q, D] packed varlen (compute dtype)
+  half *O;       // [total_q, H_q, D]
+  float *L;      // [total_q, H_q] LSE, optional/nullptr
+  const half *K_cache;     // [num_pages, page_size, H_kv, D]
+  const half *V_cache;     // [num_pages, page_size, H_kv, D]
+  const int *cu_seqlens_q; // [batch_size + 1], device memory
+  const int *seq_lens_k;   // [batch_size] cached KV length per seq, device
+  const int *block_table;  // [batch_size, max_blocks_per_seq], device
+  int batch_size;
+  int num_heads;    // H_q
+  int num_kv_heads; // H_kv; 0 (or == num_heads) means MHA
+  int max_seqlen_q;
+  int max_blocks_per_seq;
+  int page_size;
+  int d_head; // 64 or 128
+  float scale;
+  bool causal;
+  DType dtype;
+  cudaStream_t stream;
+};
+
+void launch_flash_attention_paged_prefill(
+    const FlashAttentionPagedPrefillParams &params);
+
+// ============================================================================
 // Decode (single-query) attention — a SEPARATE, memory-bound kernel.
 //
 // The prefill kernel above is compute/tensor-core bound (big Q tiles). DECODE
