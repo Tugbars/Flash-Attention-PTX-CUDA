@@ -177,7 +177,15 @@ void launch_flash_attention_decode(const FlashDecodeParams &params);
 // (typical calibration: scale = max|X| / 448). Dequantization is folded
 // outside the hot loop (k_scale into the softmax scale, v_scale into the
 // output write), so FP8 reads cost no extra per-token arithmetic.
-enum class KvDType { AUTO = 0, FP8_E4M3 = 1 };
+//
+// INT4_G32 quarters cache bytes: asymmetric uint4 with a (scale, zero) half2
+// per GROUP of 32 head-dim channels, computed per (token, kv-head) by the
+// cache writer — no caller calibration needed. Requires the parallel scale
+// pools (K_scales / V_scales):
+//   payload : [num_pages, page_size, H_kv, D/2]  bytes (2 nibbles/byte,
+//             channel c even = low nibble of byte c/2)
+//   scales  : [num_pages, page_size, H_kv, D/32] half2 (scale, zero)
+enum class KvDType { AUTO = 0, FP8_E4M3 = 1, INT4_G32 = 2 };
 
 struct FlashDecodePagedParams {
   const half *Q;       // [B, H_q, D]
@@ -198,9 +206,11 @@ struct FlashDecodePagedParams {
   float scale;
   int num_splits;         // 0 = auto
   DType dtype;
-  KvDType kv_dtype;       // AUTO (= dtype) or FP8_E4M3
+  KvDType kv_dtype;       // AUTO (= dtype), FP8_E4M3, or INT4_G32
   float k_scale;          // required (> 0) when kv_dtype == FP8_E4M3
   float v_scale;          // required (> 0) when kv_dtype == FP8_E4M3
+  const void *K_scales;   // INT4_G32 only: [pages, ps, H_kv, D/32] half2
+  const void *V_scales;   // INT4_G32 only
   cudaStream_t stream;
 };
 
@@ -227,6 +237,8 @@ struct KvCacheWriteParams {
   KvDType kv_dtype; // cache element type (AUTO = same as dtype)
   float k_scale;    // required (> 0) when kv_dtype == FP8_E4M3
   float v_scale;
+  void *K_scales;   // INT4_G32 only: written by the kernel (group scale/zero)
+  void *V_scales;   // INT4_G32 only
   cudaStream_t stream;
 };
 

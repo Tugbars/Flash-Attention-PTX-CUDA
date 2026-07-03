@@ -644,6 +644,270 @@ __global__ void decode_partial_gqa_paged(
 }
 
 // ============================================================================
+// INT4_G32 paged partials. Payload is 2 nibbles/byte (channel c even = low
+// nibble of byte c/2); a (scale, zero) half2 per 32-channel group lives in a
+// parallel scale pool. Group-wise asymmetric dequant cannot fold out of the
+// loop (scale/zero vary per group), so x = q * scale + zero happens inline —
+// this kernel is memory-bound and the payload is 4x smaller than fp16, so the
+// extra FMAs ride free. Dedicated kernels (not the TKV template): nibble
+// addressing plus the second scale stream don't fit the element-type mold.
+// ============================================================================
+
+// Dequant CH channels for one lane. Lane l owns channels [l*CH, l*CH+CH),
+// which sit inside ONE group (32 channels = 32/CH lanes). payload: CH/2 bytes.
+template <int CH>
+__device__ __forceinline__ void dec_load_int4(const uint8_t *prow,
+                                              const __half2 *srow, int lane,
+                                              float (&o)[CH]) {
+  const int gid = (lane * CH) >> 5; // group of 32 channels
+  const __half2 sz = srow[gid];
+  const float scale = __low2float(sz), zero = __high2float(sz);
+  if constexpr (CH == 2) { // D=64: 1 byte
+    uint8_t b = prow[lane];
+    o[0] = (float)(b & 0xF) * scale + zero;
+    o[1] = (float)(b >> 4) * scale + zero;
+  } else { // CH == 4, D=128: 2 bytes
+    uint16_t u = *reinterpret_cast<const uint16_t *>(prow + lane * 2);
+    o[0] = (float)(u & 0xF) * scale + zero;
+    o[1] = (float)((u >> 4) & 0xF) * scale + zero;
+    o[2] = (float)((u >> 8) & 0xF) * scale + zero;
+    o[3] = (float)(u >> 12) * scale + zero;
+  }
+}
+
+template <int D, class T>
+__global__ void decode_partial_paged_int4(
+    const T *__restrict__ Q, const uint8_t *__restrict__ Kp,
+    const uint8_t *__restrict__ Vp, const __half2 *__restrict__ Ks,
+    const __half2 *__restrict__ Vs, T *__restrict__ O,
+    float *__restrict__ LSE, float *__restrict__ Op, float *__restrict__ mp,
+    float *__restrict__ lp, const int *__restrict__ block_table,
+    const int *__restrict__ seq_lens, int H_q, int H_kv, int max_blocks,
+    int page_size, int chunk, int num_splits, float scale) {
+  constexpr int THREADS = 2 * D;
+  constexpr int NWARPS = THREADS / 32;
+  constexpr int CH = D / 32;
+  constexpr int NG = D / 32; // groups per (token, head)
+  constexpr int PB = D / 2;  // payload bytes per (token, head)
+
+  const int s = blockIdx.x;
+  const int h_q = blockIdx.y;
+  const int b = blockIdx.z;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+
+  const int group = H_q / H_kv;
+  const int h_kv = h_q / group;
+  const int S_kv = seq_lens[b];
+  const int *bt = block_table + (size_t)b * max_blocks;
+
+  const size_t q_off = (size_t)(b * H_q + h_q) * D;
+
+  __shared__ T smem_q[D];
+  __shared__ float red_m[NWARPS];
+  __shared__ float red_l[NWARPS];
+  __shared__ float red_acc[NWARPS][D];
+
+  for (int i = tid; i < D; i += THREADS)
+    smem_q[i] = Q[q_off + i];
+  __syncthreads();
+  float qreg[CH];
+  dec_loadv<T, CH>(smem_q + lane * CH, qreg);
+
+  const int base = s * chunk;
+  const int next = min(base + chunk, S_kv);
+
+  float m_w = -FLT_MAX, l_w = 0.0f;
+  float acc[CH];
+#pragma unroll
+  for (int c = 0; c < CH; c++)
+    acc[c] = 0.0f;
+
+  for (int j = base + warp; j < next; j += NWARPS) {
+    int blk = j / page_size;
+    size_t row = (size_t)bt[blk] * page_size + (j - blk * page_size);
+    const uint8_t *kp = Kp + (row * H_kv + h_kv) * PB;
+    const __half2 *ks = Ks + (row * H_kv + h_kv) * NG;
+    float kf[CH];
+    dec_load_int4<CH>(kp, ks, lane, kf);
+    float part = 0.0f;
+#pragma unroll
+    for (int c = 0; c < CH; c++)
+      part += qreg[c] * kf[c];
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+      part += __shfl_xor_sync(0xffffffffu, part, off);
+    float s_j = part * scale;
+    float m_new = fmaxf(m_w, s_j);
+    float corr = __expf(m_w - m_new);
+    float p = __expf(s_j - m_new);
+    const uint8_t *vp = Vp + (row * H_kv + h_kv) * PB;
+    const __half2 *vs = Vs + (row * H_kv + h_kv) * NG;
+    float vf[CH];
+    dec_load_int4<CH>(vp, vs, lane, vf);
+#pragma unroll
+    for (int c = 0; c < CH; c++)
+      acc[c] = acc[c] * corr + p * vf[c];
+    l_w = l_w * corr + p;
+    m_w = m_new;
+  }
+
+  if (lane == 0) {
+    red_m[warp] = m_w;
+    red_l[warp] = l_w;
+  }
+#pragma unroll
+  for (int c = 0; c < CH; c++)
+    red_acc[warp][lane * CH + c] = acc[c];
+  __syncthreads();
+
+  float m_blk = -FLT_MAX;
+#pragma unroll
+  for (int w = 0; w < NWARPS; w++)
+    m_blk = fmaxf(m_blk, red_m[w]);
+
+  if (tid < D) {
+    const int d = tid;
+    float l_blk = 0.0f, a = 0.0f;
+#pragma unroll
+    for (int w = 0; w < NWARPS; w++) {
+      float alpha =
+          (red_m[w] > -FLT_MAX * 0.5f) ? __expf(red_m[w] - m_blk) : 0.0f;
+      l_blk += alpha * red_l[w];
+      a += alpha * red_acc[w][d];
+    }
+    if (num_splits == 1) {
+      O[q_off + d] = to_elem<T>((l_blk > 0.0f) ? (a / l_blk) : 0.0f);
+      if (LSE && d == 0)
+        LSE[b * H_q + h_q] = (l_blk > 0.0f) ? (m_blk + logf(l_blk)) : -INFINITY;
+    } else {
+      size_t io = ((size_t)(b * H_q + h_q) * num_splits + s) * D + d;
+      Op[io] = a;
+      if (d == 0) {
+        size_t im = (size_t)(b * H_q + h_q) * num_splits + s;
+        mp[im] = m_blk;
+        lp[im] = l_blk;
+      }
+    }
+  }
+}
+
+// Group-resident GQA int4 partial: smem tiles hold the packed payload plus the
+// group scales (a 32-row D=128 tile is 2 KB payload + 0.5 KB scales per K/V —
+// a quarter of the fp16 tile).
+template <int D, class T>
+__global__ void decode_partial_gqa_paged_int4(
+    const T *__restrict__ Q, const uint8_t *__restrict__ Kp,
+    const uint8_t *__restrict__ Vp, const __half2 *__restrict__ Ks,
+    const __half2 *__restrict__ Vs, T *__restrict__ O,
+    float *__restrict__ LSE, float *__restrict__ Op, float *__restrict__ mp,
+    float *__restrict__ lp, const int *__restrict__ block_table,
+    const int *__restrict__ seq_lens, int H_q, int H_kv, int max_blocks,
+    int page_size, int chunk, int num_splits, float scale, int group) {
+  constexpr int CH = D / 32;
+  constexpr int NG = D / 32;
+  constexpr int PB = D / 2;
+  constexpr int TILE_N = 32;
+  const int s = blockIdx.x;
+  const int h_kv = blockIdx.y;
+  const int b = blockIdx.z;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int nthreads = blockDim.x;
+  const int h_q = h_kv * group + warp;
+  const int S_kv = seq_lens[b];
+  const int *bt = block_table + (size_t)b * max_blocks;
+
+  __shared__ uint8_t sKp[TILE_N * PB];
+  __shared__ uint8_t sVp[TILE_N * PB];
+  __shared__ __half2 sKs[TILE_N * NG];
+  __shared__ __half2 sVs[TILE_N * NG];
+
+  const size_t q_off = (size_t)(b * H_q + h_q) * D;
+  float qreg[CH];
+  dec_loadv<T, CH>(Q + q_off + lane * CH, qreg);
+
+  const int base = s * chunk;
+  const int next = min(base + chunk, S_kv);
+
+  float m_w = -FLT_MAX, l_w = 0.0f;
+  float acc[CH];
+#pragma unroll
+  for (int c = 0; c < CH; c++)
+    acc[c] = 0.0f;
+
+  for (int t0 = base; t0 < next; t0 += TILE_N) {
+    int tn = min(TILE_N, next - t0);
+    // payload rows: PB bytes = PB/4 uint32 each; scale rows: NG half2 (uint32)
+    constexpr int PW = PB / 4;
+    for (int i = tid; i < tn * PW; i += nthreads) {
+      int r = i / PW, c = i - r * PW;
+      int tok = t0 + r;
+      int blk = tok / page_size;
+      size_t row = (size_t)bt[blk] * page_size + (tok - blk * page_size);
+      reinterpret_cast<uint32_t *>(sKp)[i] = reinterpret_cast<const uint32_t *>(
+          Kp + (row * H_kv + h_kv) * PB)[c];
+      reinterpret_cast<uint32_t *>(sVp)[i] = reinterpret_cast<const uint32_t *>(
+          Vp + (row * H_kv + h_kv) * PB)[c];
+    }
+    for (int i = tid; i < tn * NG; i += nthreads) {
+      int r = i / NG, c = i - r * NG;
+      int tok = t0 + r;
+      int blk = tok / page_size;
+      size_t row = (size_t)bt[blk] * page_size + (tok - blk * page_size);
+      sKs[i] = Ks[(row * H_kv + h_kv) * NG + c];
+      sVs[i] = Vs[(row * H_kv + h_kv) * NG + c];
+    }
+    __syncthreads();
+
+    for (int jj = 0; jj < tn; jj++) {
+      float kf[CH];
+      dec_load_int4<CH>(sKp + jj * PB, sKs + jj * NG, lane, kf);
+      float part = 0.0f;
+#pragma unroll
+      for (int c = 0; c < CH; c++)
+        part += qreg[c] * kf[c];
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1)
+        part += __shfl_xor_sync(0xffffffffu, part, off);
+      float s_j = part * scale;
+      float m_new = fmaxf(m_w, s_j);
+      float corr = __expf(m_w - m_new);
+      float p = __expf(s_j - m_new);
+      float vf[CH];
+      dec_load_int4<CH>(sVp + jj * PB, sVs + jj * NG, lane, vf);
+#pragma unroll
+      for (int c = 0; c < CH; c++)
+        acc[c] = acc[c] * corr + p * vf[c];
+      l_w = l_w * corr + p;
+      m_w = m_new;
+    }
+    __syncthreads();
+  }
+
+  if (num_splits == 1) {
+    float inv = (l_w > 0.0f) ? (1.0f / l_w) : 0.0f;
+#pragma unroll
+    for (int c = 0; c < CH; c++)
+      O[q_off + lane * CH + c] = to_elem<T>(acc[c] * inv);
+    if (LSE && lane == 0)
+      LSE[b * H_q + h_q] = (l_w > 0.0f) ? (m_w + logf(l_w)) : -INFINITY;
+  } else {
+    size_t io = ((size_t)(b * H_q + h_q) * num_splits + s) * D;
+#pragma unroll
+    for (int c = 0; c < CH; c++)
+      Op[io + lane * CH + c] = acc[c];
+    if (lane == 0) {
+      size_t im = (size_t)(b * H_q + h_q) * num_splits + s;
+      mp[im] = m_w;
+      lp[im] = l_w;
+    }
+  }
+}
+
+// ============================================================================
 // Combine kernel: one CTA = one (batch, query-head). D threads, thread d owns
 // output channel d. Merges num_splits partials with the log-sum-exp rescale.
 // ============================================================================
@@ -834,6 +1098,59 @@ size_t flash_decode_paged_scratch_bytes(const FlashDecodePagedParams &p) {
   return align256(bytes_O) + align256(bytes_m) + align256(bytes_l);
 }
 
+// INT4_G32 dispatch: dedicated kernels with the parallel scale pools.
+template <class T>
+static void decode_dispatch_paged_int4(const FlashDecodePagedParams &p,
+                                       const DecPlan &pl, float *Op, float *mp,
+                                       float *lp) {
+  const int ns = pl.ns, chunk = pl.chunk;
+  const T *Q = reinterpret_cast<const T *>(p.Q);
+  const uint8_t *Kp = reinterpret_cast<const uint8_t *>(p.K_cache);
+  const uint8_t *Vp = reinterpret_cast<const uint8_t *>(p.V_cache);
+  const __half2 *Ks = reinterpret_cast<const __half2 *>(p.K_scales);
+  const __half2 *Vs = reinterpret_cast<const __half2 *>(p.V_scales);
+  T *O = reinterpret_cast<T *>(p.O);
+
+  if (pl.use_gqa) {
+    const int group = pl.group;
+    dim3 grid(ns, p.num_kv_heads, p.batch_size);
+    dim3 block(group * 32);
+    if (p.d_head == 64)
+      decode_partial_gqa_paged_int4<64, T><<<grid, block, 0, p.stream>>>(
+          Q, Kp, Vp, Ks, Vs, O, p.LSE, Op, mp, lp, p.block_table, p.seq_lens,
+          p.num_q_heads, p.num_kv_heads, p.max_blocks_per_seq, p.page_size,
+          chunk, ns, p.scale, group);
+    else
+      decode_partial_gqa_paged_int4<128, T><<<grid, block, 0, p.stream>>>(
+          Q, Kp, Vp, Ks, Vs, O, p.LSE, Op, mp, lp, p.block_table, p.seq_lens,
+          p.num_q_heads, p.num_kv_heads, p.max_blocks_per_seq, p.page_size,
+          chunk, ns, p.scale, group);
+  } else {
+    dim3 grid(ns, p.num_q_heads, p.batch_size);
+    if (p.d_head == 64)
+      decode_partial_paged_int4<64, T><<<grid, dim3(128), 0, p.stream>>>(
+          Q, Kp, Vp, Ks, Vs, O, p.LSE, Op, mp, lp, p.block_table, p.seq_lens,
+          p.num_q_heads, p.num_kv_heads, p.max_blocks_per_seq, p.page_size,
+          chunk, ns, p.scale);
+    else
+      decode_partial_paged_int4<128, T><<<grid, dim3(256), 0, p.stream>>>(
+          Q, Kp, Vp, Ks, Vs, O, p.LSE, Op, mp, lp, p.block_table, p.seq_lens,
+          p.num_q_heads, p.num_kv_heads, p.max_blocks_per_seq, p.page_size,
+          chunk, ns, p.scale);
+  }
+
+  if (ns > 1) {
+    dim3 cgrid(p.num_q_heads, p.batch_size);
+    size_t csmem = sizeof(float) * 2 * ns;
+    if (p.d_head == 64)
+      decode_combine<64, T><<<cgrid, dim3(64), csmem, p.stream>>>(
+          Op, mp, lp, O, p.LSE, p.num_q_heads, ns);
+    else
+      decode_combine<128, T><<<cgrid, dim3(128), csmem, p.stream>>>(
+          Op, mp, lp, O, p.LSE, p.num_q_heads, ns);
+  }
+}
+
 template <class T, class TKV>
 static void decode_dispatch_paged(const FlashDecodePagedParams &p,
                                   const DecPlan &pl, float *Op, float *mp,
@@ -907,7 +1224,18 @@ void launch_flash_attention_decode_paged(const FlashDecodePagedParams &p) {
     abort();
   }
 
-  if (p.kv_dtype == KvDType::FP8_E4M3) {
+  if (p.kv_dtype == KvDType::INT4_G32) {
+    if (!p.K_scales || !p.V_scales) {
+      fprintf(stderr,
+              "flash_decode_paged: INT4_G32 cache requires K_scales/V_scales "
+              "pools\n");
+      abort();
+    }
+    if (p.dtype == DType::BF16)
+      decode_dispatch_paged_int4<__nv_bfloat16>(p, pl, Op, mp, lp);
+    else
+      decode_dispatch_paged_int4<half>(p, pl, Op, mp, lp);
+  } else if (p.kv_dtype == KvDType::FP8_E4M3) {
     if (!(p.k_scale > 0.0f) || !(p.v_scale > 0.0f)) {
       fprintf(stderr, "flash_decode_paged: FP8 cache requires k_scale/v_scale "
                       "> 0 (got %g, %g)\n",
@@ -958,9 +1286,101 @@ __global__ void kv_cache_write_kernel(const T *__restrict__ K_new,
   }
 }
 
+// INT4_G32 writer: one thread per (kv-head, group). Computes the group's
+// min/max, rounds (scale, zero) to half FIRST (dequant uses the half-rounded
+// values, so quantization must too — otherwise writer and reader disagree),
+// then packs 16 nibble-pairs.
+template <class T>
+__global__ void kv_cache_write_int4_kernel(
+    const T *__restrict__ K_new, const T *__restrict__ V_new,
+    uint8_t *__restrict__ Kp, uint8_t *__restrict__ Vp,
+    __half2 *__restrict__ Ks, __half2 *__restrict__ Vs,
+    const int *__restrict__ slot_mapping, int H_kv, int D) {
+  const int t = blockIdx.x;
+  const int slot = slot_mapping[t];
+  if (slot < 0)
+    return;
+  const int ng = D / 32;
+  const int total_groups = H_kv * ng;
+
+  for (int idx = threadIdx.x; idx < total_groups; idx += blockDim.x) {
+    const int h = idx / ng, g = idx - h * ng;
+    const T *ksrc = K_new + ((size_t)t * H_kv + h) * D + g * 32;
+    const T *vsrc = V_new + ((size_t)t * H_kv + h) * D + g * 32;
+    uint8_t *kdst = Kp + ((size_t)slot * H_kv + h) * (D / 2) + g * 16;
+    uint8_t *vdst = Vp + ((size_t)slot * H_kv + h) * (D / 2) + g * 16;
+
+    float kv0[32], vv0[32];
+    float kmn = FLT_MAX, kmx = -FLT_MAX, vmn = FLT_MAX, vmx = -FLT_MAX;
+#pragma unroll
+    for (int i = 0; i < 32; i++) {
+      kv0[i] = elem_to_float(ksrc[i]);
+      vv0[i] = elem_to_float(vsrc[i]);
+      kmn = fminf(kmn, kv0[i]);
+      kmx = fmaxf(kmx, kv0[i]);
+      vmn = fminf(vmn, vv0[i]);
+      vmx = fmaxf(vmx, vv0[i]);
+    }
+    // round (scale, zero) to half BEFORE quantizing (reader consistency).
+    // __fdiv_rn: IEEE division even under --use_fast_math — the quantizer
+    // must be bit-reproducible (host mirrors it in tests, and approximate
+    // reciprocal-multiply flips near-tie nibbles).
+    __half2 khs =
+        __floats2half2_rn(fmaxf(__fdiv_rn(kmx - kmn, 15.0f), 1e-8f), kmn);
+    __half2 vhs =
+        __floats2half2_rn(fmaxf(__fdiv_rn(vmx - vmn, 15.0f), 1e-8f), vmn);
+    float kscale = __low2float(khs), kzero = __high2float(khs);
+    float vscale = __low2float(vhs), vzero = __high2float(vhs);
+#pragma unroll
+    for (int i = 0; i < 16; i++) {
+      int q0 = min(
+          15, max(0, __float2int_rn(__fdiv_rn(kv0[2 * i] - kzero, kscale))));
+      int q1 = min(
+          15,
+          max(0, __float2int_rn(__fdiv_rn(kv0[2 * i + 1] - kzero, kscale))));
+      kdst[i] = (uint8_t)(q0 | (q1 << 4));
+      int r0 = min(
+          15, max(0, __float2int_rn(__fdiv_rn(vv0[2 * i] - vzero, vscale))));
+      int r1 = min(
+          15,
+          max(0, __float2int_rn(__fdiv_rn(vv0[2 * i + 1] - vzero, vscale))));
+      vdst[i] = (uint8_t)(r0 | (r1 << 4));
+    }
+    Ks[((size_t)slot * H_kv + h) * ng + g] = khs;
+    Vs[((size_t)slot * H_kv + h) * ng + g] = vhs;
+  }
+}
+
 void launch_kv_cache_write(const KvCacheWriteParams &p) {
   if (p.num_tokens <= 0)
     return;
+  if (p.kv_dtype == KvDType::INT4_G32) {
+    if (!p.K_scales || !p.V_scales) {
+      fprintf(stderr,
+              "kv_cache_write: INT4_G32 requires K_scales/V_scales pools\n");
+      abort();
+    }
+    dim3 grid(p.num_tokens);
+    dim3 block(128);
+    if (p.dtype == DType::BF16)
+      kv_cache_write_int4_kernel<__nv_bfloat16><<<grid, block, 0, p.stream>>>(
+          reinterpret_cast<const __nv_bfloat16 *>(p.K_new),
+          reinterpret_cast<const __nv_bfloat16 *>(p.V_new),
+          reinterpret_cast<uint8_t *>(p.K_cache),
+          reinterpret_cast<uint8_t *>(p.V_cache),
+          reinterpret_cast<__half2 *>(p.K_scales),
+          reinterpret_cast<__half2 *>(p.V_scales), p.slot_mapping,
+          p.num_kv_heads, p.d_head);
+    else
+      kv_cache_write_int4_kernel<half><<<grid, block, 0, p.stream>>>(
+          p.K_new, p.V_new, reinterpret_cast<uint8_t *>(p.K_cache),
+          reinterpret_cast<uint8_t *>(p.V_cache),
+          reinterpret_cast<__half2 *>(p.K_scales),
+          reinterpret_cast<__half2 *>(p.V_scales), p.slot_mapping,
+          p.num_kv_heads, p.d_head);
+    CUDA_CHECK(cudaGetLastError());
+    return;
+  }
   const int hd = p.num_kv_heads * p.d_head;
   const bool fp8 = (p.kv_dtype == KvDType::FP8_E4M3);
   float k_inv = 1.0f, v_inv = 1.0f;

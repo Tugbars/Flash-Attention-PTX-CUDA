@@ -109,6 +109,16 @@ target_include_directories(fa_fp8_validate PRIVATE
     ${CMAKE_SOURCE_DIR}/include
 )
 
+# INT4_G32 KV-cache gate (group-wise scales, writer bit-check).
+add_executable(fa_int4_validate
+    tests/fa_int4_validate.cu
+    kernels/flash_attention_decode.cu
+)
+target_link_libraries(fa_int4_validate PRIVATE flash_attention)
+target_include_directories(fa_int4_validate PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
 # ============================================================================
 # Info
 # ============================================================================
