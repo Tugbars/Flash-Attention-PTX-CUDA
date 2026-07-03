@@ -58,9 +58,11 @@ def rope_rotate(x, cos, sin, pos):
 
 
 class QwenFA:
-    def __init__(self, snap=SNAP, device="cuda", dtype=torch.bfloat16):
+    def __init__(self, snap=SNAP, device="cuda", dtype=torch.bfloat16,
+                 use_compile=False):
         cfg = json.loads((snap / "config.json").read_text())
         self.device, self.dtype = device, dtype
+        self.do_compile = use_compile
         self.H = cfg["hidden_size"]
         self.nq = cfg["num_attention_heads"]
         self.nkv = cfg["num_key_value_heads"]
@@ -79,8 +81,8 @@ class QwenFA:
                         else wd["lm_head.weight"])
         # merge QKV and gate+up into single GEMMs (vLLM-style): at B=1 the
         # decode step is launch/latency-bound, so 2 fat GEMMs beat 5 thin ones
-        self.qs = self.nq * self.hd            # q rows in the merged output
-        self.ks = self.nkv * self.hd
+        self.q_sz = self.nq * self.hd          # q rows in the merged output
+        self.kv_sz = self.nkv * self.hd
         self.layers = []
         for i in range(self.nl):
             p = f"model.layers.{i}."
@@ -100,6 +102,16 @@ class QwenFA:
             })
         del wd
         self.graph = None
+        # Inductor fuses the elementwise chains (rmsnorm/rope/silu); the
+        # mutating stages (cache writes, fp8 calibration) live OUTSIDE the
+        # compiled regions of prefill, and inside for decode (write->attend
+        # ordering matters there; gate 3 of --verify checks that path).
+        self._core = (torch.compile(self._prefill_core, fullgraph=True,
+                                    dynamic=False)
+                      if use_compile else self._prefill_core)
+        self._stepf = (torch.compile(self._step, fullgraph=True,
+                                     dynamic=False)
+                       if use_compile else self._step)
 
     # -- cache ------------------------------------------------------------
     def setup_cache(self, batch, max_seq, kv_dtype="auto"):
@@ -135,34 +147,22 @@ class QwenFA:
         self.sin = ang.sin().to(self.device)
 
     # -- prefill (varlen, packed) -------------------------------------------
-    @torch.inference_mode()
-    def prefill(self, ids):
-        """ids: int64 [B, L] (equal lengths). Returns last-token logits."""
-        B, L = ids.shape
-        assert B == self.B and L + 1 < self.max_seq
-        calibrate = self.kv_dtype == "fp8" and int(self.seq_lens.max()) == 0
-        flat = ids.reshape(-1).to(self.device)
-        pos = torch.arange(L, device=self.device).repeat(B)
-        cu = torch.arange(0, (B + 1) * L, L, dtype=torch.int32,
-                          device=self.device)
-        slots = (self.slot_base.repeat_interleave(L)
-                 + torch.arange(L, dtype=torch.int32,
-                                device=self.device).repeat(B))
+    def _prefill_core(self, flat, pos, cu, L):
+        """Pure-functional prefill (compilable): returns last-token logits
+        plus each layer's rotated K and V for the eager write stage."""
         h = self.embed[flat]                                   # [B*L, H]
-        for li, w in enumerate(self.layers):
+        k_out, v_out = [], []
+        for w in self.layers:
             x = rmsnorm(h, w["ln1"], self.eps)
             qkv = F.linear(x, w["wqkv"], w["bqkv"])
-            q, k, v = qkv.split([self.qs, self.ks, self.ks], dim=-1)
+            q, k, v = qkv.split([self.q_sz, self.kv_sz, self.kv_sz], dim=-1)
             q = q.reshape(-1, self.nq, self.hd)
             k = k.reshape(-1, self.nkv, self.hd)
             v = v.reshape(-1, self.nkv, self.hd).contiguous()
             q = rope_rotate(q, self.cos, self.sin, pos)
             k = rope_rotate(k, self.cos, self.sin, pos)
-            c = self.caches[li]
-            if calibrate:  # per-layer per-tensor fp8 scales from the prompt
-                c.k_scale = max(k.abs().max().item() / 448.0, 1e-6)
-                c.v_scale = max(v.abs().max().item() / 448.0, 1e-6)
-            c.write(k, v, slots)                               # pre-rotated K
+            k_out.append(k)
+            v_out.append(v)
             o = fa_ptx.attention(q, k, v, cu_seqlens_q=cu, cu_seqlens_k=cu,
                                  max_seqlen_q=L, num_kv_heads=self.nkv,
                                  causal=True)
@@ -170,9 +170,35 @@ class QwenFA:
             x = rmsnorm(h, w["ln2"], self.eps)
             g, u = F.linear(x, w["wgu"]).chunk(2, dim=-1)
             h = h + F.linear(F.silu(g) * u, w["wd"])
+        last = h.view(-1, L, self.H)[:, -1]
+        logits = F.linear(rmsnorm(last, self.norm_f, self.eps), self.lm_head)
+        return logits, k_out, v_out
+
+    @torch.inference_mode()
+    def prefill(self, ids):
+        """ids: int64 [B, L] (equal lengths). Returns last-token logits.
+        Cache writes (and fp8 calibration) happen eagerly AFTER the core:
+        prefill attention uses the in-flight K/V, not the cache, so the
+        split is semantics-preserving and keeps mutation out of Inductor."""
+        B, L = ids.shape
+        assert B == self.B and L + 1 < self.max_seq
+        flat = ids.reshape(-1).to(self.device)
+        pos = torch.arange(L, device=self.device).repeat(B)
+        cu = torch.arange(0, (B + 1) * L, L, dtype=torch.int32,
+                          device=self.device)
+        slots = (self.slot_base.repeat_interleave(L)
+                 + torch.arange(L, dtype=torch.int32,
+                                device=self.device).repeat(B))
+        logits, k_out, v_out = self._core(flat, pos, cu, L)
+        calibrate = self.kv_dtype == "fp8" and int(self.seq_lens.max()) == 0
+        for li, c in enumerate(self.caches):
+            if calibrate:  # per-layer per-tensor fp8 scales from the prompt
+                c.k_scale = max(k_out[li].abs().max().item() / 448.0, 1e-6)
+                c.v_scale = max(v_out[li].abs().max().item() / 448.0, 1e-6)
+            c.write(k_out[li], v_out[li], slots)               # pre-rotated K
+            k_out[li] = v_out[li] = None   # release: ~28KB/token if pinned
         self.seq_lens += L
-        last = h.view(B, L, self.H)[:, -1]
-        return F.linear(rmsnorm(last, self.norm_f, self.eps), self.lm_head)
+        return logits
 
     # -- one decode step (graph-capturable: device state only) ----------------
     def _step(self, ids, pos_s, slots_s):
@@ -180,7 +206,7 @@ class QwenFA:
         for li, w in enumerate(self.layers):
             x = rmsnorm(h, w["ln1"], self.eps)
             qkv = F.linear(x, w["wqkv"], w["bqkv"])
-            q, k, v = qkv.split([self.qs, self.ks, self.ks], dim=-1)
+            q, k, v = qkv.split([self.q_sz, self.kv_sz, self.kv_sz], dim=-1)
             q = q.reshape(-1, self.nq, self.hd)
             k = k.reshape(-1, self.nkv, self.hd).contiguous()
             v = v.reshape(-1, self.nkv, self.hd).contiguous()
@@ -205,42 +231,41 @@ class QwenFA:
 
     # -- whole-step CUDA graph -------------------------------------------------
     @torch.inference_mode()
-    def capture(self, first_ids, compile_step=False):
+    def capture(self, first_ids):
         """Capture one full decode step. Warmup passes EXECUTE real steps
-        (each producing one token into ids_s); the capture pass only
-        records. With compile_step, Inductor fuses the elementwise chains
-        (rmsnorm/rope/silu) into a few kernels first, and the CUDA graph
-        then captures the compiled step — the two compose."""
+        (each producing one token, collected in warmup_ids); the capture
+        pass only records. With use_compile, Inductor fuses the elementwise
+        chains first and the CUDA graph captures the compiled step — the
+        two compose. The first warmup pass must be EAGER: attend()'s lazy
+        scratch sizing returns a python int, which dynamo can't trace; once
+        scratches exist, that branch never runs under compilation."""
         self.ids_s = first_ids.clone()
         self.pos_s = torch.zeros(self.B, dtype=torch.int32,
                                  device=self.device)
         self.slots_s = torch.zeros(self.B, dtype=torch.int32,
                                    device=self.device)
-        step_fn = [self._step]
+        self.warmup_ids = []
 
-        def body():
+        def body(fn):
             self.pos_s.copy_(self.seq_lens)
             self.slots_s.copy_(self.slot_base + self.seq_lens)
             self.seq_lens += 1
-            logits = step_fn[0](self.ids_s, self.pos_s, self.slots_s)
+            logits = fn(self.ids_s, self.pos_s, self.slots_s)
             self.ids_s.copy_(logits.argmax(-1))
 
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
-            body()          # eager warmup: allocates every attend scratch
-            if compile_step:
-                # compile AFTER scratches exist: attend()'s lazy sizing
-                # branch (returns a python int) then never runs under dynamo
-                step_fn[0] = torch.compile(self._step, fullgraph=True,
-                                           dynamic=False)
-                body()      # compiling pass
-                body()      # settled pass, no compile machinery
+            body(self._step)   # eager warmup: allocates every attend scratch
+            self.warmup_ids.append(self.ids_s.clone())
+            if self.do_compile:
+                for _ in range(2):       # compiling pass, then settled pass
+                    body(self._stepf)
+                    self.warmup_ids.append(self.ids_s.clone())
         torch.cuda.current_stream().wait_stream(s)
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
-            body()                       # recorded, not executed
-        self.warmup_tokens = 3 if compile_step else 1
+            body(self._stepf)            # recorded, not executed
 
     @torch.inference_mode()
     def generate(self, prompt_ids, n_tokens):
@@ -250,11 +275,16 @@ class QwenFA:
         toks[:, 0] = self.prefill(prompt_ids).argmax(-1)
         if n_tokens == 1:
             return toks
-        self.capture(toks[:, 0])         # warmup produced token 1
-        toks[:, 1] = self.ids_s
-        for t in range(2, n_tokens):
+        self.capture(toks[:, 0])
+        idx = 1
+        for t in self.warmup_ids:        # tokens produced during warmup
+            if idx < n_tokens:
+                toks[:, idx] = t
+                idx += 1
+        while idx < n_tokens:
             self.graph.replay()
-            toks[:, t].copy_(self.ids_s)
+            toks[:, idx].copy_(self.ids_s)
+            idx += 1
         return toks
 
     @torch.inference_mode()
@@ -294,10 +324,13 @@ def cmd_verify(args):
     del ref
     torch.cuda.empty_cache()
 
-    m = QwenFA()
+    m = QwenFA(use_compile=args.compile)
+    # one max_seq for all three gates: the RoPE table shape stays constant,
+    # so a compiled prefill core is built once and reused across setups
+    S = L + args.gen + 16
 
     # gate 1: prefill last-token logits
-    m.setup_cache(1, L + 8, args.kv)
+    m.setup_cache(1, S, args.kv)
     ours_logits = m.prefill(ids)[0].float()
     d = ours_logits - ref_logits
     nr = (d.pow(2).mean().sqrt() / ref_logits.pow(2).mean().sqrt()).item()
@@ -309,7 +342,7 @@ def cmd_verify(args):
     # same as every other gate), then teacher-force the generated region.
     full = torch.cat([ids[0], ref_gen]).unsqueeze(0)
     n = full.shape[1]
-    m.setup_cache(1, n + 8, args.kv)
+    m.setup_cache(1, S, args.kv)
     first = m.prefill(full[:, :L]).argmax(-1)
     agree = int(first.item() == full[0, L].item())
     total = 1
@@ -320,7 +353,8 @@ def cmd_verify(args):
     print(f"teacher-forced argmax agreement: {agree}/{total}")
 
     # gate 3: free-running greedy prefix match, full-step graph decode
-    m.setup_cache(1, L + args.gen + 8, args.kv)
+    # (with --compile this exercises the COMPILED decode step end-to-end)
+    m.setup_cache(1, S, args.kv)
     ours = m.generate(ids, args.gen)[0]
     match = 0
     for a, b in zip(ours.tolist(), ref_gen.tolist()):
@@ -338,17 +372,25 @@ def cmd_bench(args):
     ids = tok(text, return_tensors="pt").input_ids[:, :args.prompt_len]
     ids = ids.repeat(args.batch, 1).cuda()
 
-    m = QwenFA()
-    # budget: prompt + capture-warmup(1) + bench-warmup(10) + gen + eager(55)
-    m.setup_cache(args.batch, args.prompt_len + args.gen + 96, args.kv)
+    m = QwenFA(use_compile=args.compile)
+    # budget: prompt + capture-warmup(3) + bench-warmup(10) + gen + eager(55)
+    S = args.prompt_len + args.gen + 96
+    if args.compile:  # throwaway run so compile time stays out of the timing
+        m.setup_cache(args.batch, S, args.kv)
+        m.prefill(ids)
 
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    logits = m.prefill(ids)
-    torch.cuda.synchronize()
-    tpre = time.perf_counter() - t0
+    # prefill timing: state is consumed by a prefill, so re-setup per rep
+    # (setup itself is outside the timed window) and take the best rep
+    tpre = float("inf")
+    for _ in range(3):
+        m.setup_cache(args.batch, S, args.kv)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        logits = m.prefill(ids)
+        torch.cuda.synchronize()
+        tpre = min(tpre, time.perf_counter() - t0)
 
-    m.capture(logits.argmax(-1), compile_step=args.compile)
+    m.capture(logits.argmax(-1))
     ms = m.bench_decode(args.gen) * 1e3
     print(f"model=Qwen2.5-1.5B bf16  kv={args.kv}  B={args.batch}  "
           f"prompt={args.prompt_len}  gen={args.gen}  "
