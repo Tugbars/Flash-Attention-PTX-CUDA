@@ -103,7 +103,9 @@ def attention(
     Varlen mode (pass cu_seqlens_q/k): q is packed [total_q, H_q, D] and
     k/v are [total_k, H_kv, D]; causal is bottom-right aligned, so
     seqlen_k > seqlen_q is chunked/append prefill.
-    scale = 0 means 1/sqrt(D). num_kv_heads = 0 means MHA.
+    scale = 0 means 1/sqrt(D). num_kv_heads = 0 infers the KV head count
+    from k's shape (GQA/MQA included); pass a value only to override.
+    Ops are inference-only: tensors requiring grad raise at call time.
     """
     return _ops.attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q,
                           num_kv_heads, causal, scale, autotune)

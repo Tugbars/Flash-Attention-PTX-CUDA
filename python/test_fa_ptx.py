@@ -34,14 +34,19 @@ def nrmse(a, b):
 
 # --- 1. batch attention vs torch SDPA ---------------------------------------
 def t_batch():
-    for (B, H, Hkv, S, D) in [(2, 8, 8, 512, 128), (2, 8, 2, 1024, 64)]:
-        q = torch.randn(B, H, S, D, device="cuda", dtype=torch.float16)
-        k = torch.randn(B, Hkv, S, D, device="cuda", dtype=torch.float16)
-        v = torch.randn(B, Hkv, S, D, device="cuda", dtype=torch.float16)
-        o = fa_ptx.attention(q, k, v, num_kv_heads=Hkv, causal=True)
+    cases = [(2, 8, 8, 512, 128, torch.float16, 1e-3),
+             (2, 8, 2, 1024, 64, torch.float16, 1e-3),
+             (2, 8, 2, 512, 128, torch.bfloat16, 6e-3)]
+    for (B, H, Hkv, S, D, dt, thr) in cases:
+        q = torch.randn(B, H, S, D, device="cuda", dtype=dt)
+        k = torch.randn(B, Hkv, S, D, device="cuda", dtype=dt)
+        v = torch.randn(B, Hkv, S, D, device="cuda", dtype=dt)
+        # num_kv_heads intentionally omitted: inferred from k.shape
+        o = fa_ptx.attention(q, k, v, causal=True)
         ref = sdpa_ref(q, k, v, True, enable_gqa=(Hkv != H))
         e = nrmse(o, ref)
-        check(f"batch B={B} H={H}/{Hkv} S={S} D={D}", e < 1e-3, f"nrmse={e:.5f}")
+        check(f"batch B={B} H={H}/{Hkv} S={S} D={D} {str(dt)[6:]}", e < thr,
+              f"nrmse={e:.5f}")
 
 
 # --- 2. varlen attention vs per-sequence SDPA --------------------------------
@@ -146,8 +151,11 @@ def t_compile():
     except ImportError:
         pass
     compiled = torch.compile(block, fullgraph=True, backend=backend)(q, k, v)
-    check(f"torch.compile fullgraph ({backend})",
-          torch.equal(eager, compiled) or nrmse(compiled, eager) < 1e-6)
+    # Inductor recomputes surrounding fp16 elementwise ops in fp32-then-round,
+    # so eager vs compiled differ by fp16 rounding on the silu/add — the
+    # attention op itself is the same kernel either way. Tolerance accordingly.
+    e = nrmse(compiled, eager)
+    check(f"torch.compile fullgraph ({backend})", e < 2e-3, f"nrmse={e:.6f}")
 
 
 # --- 5. CUDA graph: capture decode, mutate state in place, replay ------------
@@ -198,6 +206,22 @@ def t_cuda_graph():
           f"nrmse={e1:.5f}")
 
 
+# --- 6. inference-only guard fires eagerly ----------------------------------
+def t_grad_guard():
+    q = torch.randn(1, 4, 128, 64, device="cuda", dtype=torch.float16,
+                    requires_grad=True)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    raised = False
+    try:
+        fa_ptx.attention(q, k, v)
+    except RuntimeError as e:
+        raised = "inference-only" in str(e)
+    check("grad-tensor raises eagerly", raised)
+    with torch.no_grad():  # and no_grad passes through fine
+        o = fa_ptx.attention(q, k, v)
+    check("no_grad path still works", o.shape == q.shape)
+
+
 if __name__ == "__main__":
     print("=== fa_ptx binding tests ===")
     t_batch()
@@ -207,6 +231,7 @@ if __name__ == "__main__":
     t_paged("int4", 1.5e-1)
     t_compile()
     t_cuda_graph()
+    t_grad_guard()
     print("\n" + ("ALL OK" if not FAILURES else
                   f"!!! {len(FAILURES)} FAILURES: {FAILURES}"))
     sys.exit(len(FAILURES))

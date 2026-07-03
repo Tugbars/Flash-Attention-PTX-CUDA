@@ -16,8 +16,16 @@
 //   - outputs allocated through the torch caching allocator (graph-aware)
 //   - mutation is declared in the schemas ((a!) annotations)
 // Fake/meta implementations live in the Python package (register_fake).
+//
+// GIL: intentionally NOT managed here. torch's op-call machinery handles the
+// GIL around dispatcher invocations, and these impls are also entered from
+// non-Python contexts (compiled graphs, CUDA-graph capture, C++ callers)
+// where no GIL is held — a manual gil_scoped_release would be UB there. The
+// launches below only ENQUEUE work (microseconds), so there is no long
+// GIL-holding region to begin with.
 // ============================================================================
 #include <ATen/ATen.h>
+#include <c10/core/GradMode.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/library.h>
@@ -27,6 +35,19 @@
 namespace {
 
 using namespace transformer;
+
+// These ops have no backward. Fail EAGERLY (at call time, with a clear
+// message) instead of silently producing grad-less outputs that explode at
+// .backward(). torch.no_grad() / inference tensors pass through untouched.
+void check_inference(const char *name,
+                     std::initializer_list<const at::Tensor *> ts) {
+  if (!at::GradMode::is_enabled())
+    return;
+  for (const at::Tensor *t : ts)
+    TORCH_CHECK(!t->requires_grad(), "fa_ptx::", name,
+                " is inference-only (no backward is implemented). Wrap the "
+                "call in torch.no_grad() or pass detached tensors.");
+}
 
 DType dtype_of(const at::Tensor &t) {
   TORCH_CHECK(t.scalar_type() == at::kHalf || t.scalar_type() == at::kBFloat16,
@@ -66,6 +87,7 @@ at::Tensor attention(const at::Tensor &q, const at::Tensor &k,
   check_qkv(q, "q");
   check_qkv(k, "k");
   check_qkv(v, "v");
+  check_inference("attention", {&q, &k, &v});
   const at::cuda::CUDAGuard guard(q.device());
   at::Tensor o = at::empty_like(q);
 
@@ -78,7 +100,11 @@ at::Tensor attention(const at::Tensor &q, const at::Tensor &k,
   a.scale = static_cast<float>(scale);
   a.dtype = dtype_of(q);
   a.autotune = autotune;
-  a.num_kv_heads = static_cast<int>(num_kv_heads);
+  // KV head count is readable from k in both layouts ([B,Hkv,S,D] and
+  // [Tk,Hkv,D] both carry heads at dim 1); 0 means "infer". An explicit
+  // nonzero value overrides (and is validated against q downstream).
+  a.num_kv_heads = (num_kv_heads > 0) ? static_cast<int>(num_kv_heads)
+                                      : static_cast<int>(k.size(1));
   a.stream = c10::cuda::getCurrentCUDAStream().stream();
 
   if (cu_seqlens_q.has_value()) {
@@ -144,6 +170,7 @@ at::Tensor cache_attention(
   check_qkv(q, "q");
   TORCH_CHECK(q.dim() == 3, "fa_ptx: cache_attention expects packed "
                             "[tokens, heads, d_head] (decode: tokens == B)");
+  check_inference("cache_attention", {&q});
   const at::cuda::CUDAGuard guard(q.device());
   at::Tensor o = at::empty_like(q);
 
@@ -196,6 +223,7 @@ void cache_write(const at::Tensor &k_new, const at::Tensor &v_new,
   check_qkv(v_new, "v_new");
   TORCH_CHECK(k_new.dim() == 3,
               "fa_ptx: k_new/v_new must be [tokens, kv_heads, d_head]");
+  check_inference("cache_write", {&k_new, &v_new});
   const at::cuda::CUDAGuard guard(k_new.device());
 
   FaCacheWriteArgs a = {};
