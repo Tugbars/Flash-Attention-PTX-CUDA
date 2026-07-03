@@ -66,6 +66,23 @@ target_include_directories(flash_bench PRIVATE
 )
 
 # ============================================================================
+# Strict correctness gate — std=1 inputs, double reference, noise-floor
+# thresholds. Compiles the decode kernel directly (it is not part of the
+# flash_attention library). Run after any kernel change; exit code 0 = pass.
+# ============================================================================
+add_executable(fa_validate
+    tests/fa_validate.cu
+    kernels/flash_attention_decode.cu
+)
+target_link_libraries(fa_validate PRIVATE flash_attention)
+target_include_directories(fa_validate PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+target_compile_options(fa_validate PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+)
+
+# ============================================================================
 # Info
 # ============================================================================
 message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
