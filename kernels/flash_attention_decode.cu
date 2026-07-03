@@ -439,7 +439,14 @@ __global__ void decode_partial_paged(
     int num_splits, float scale, float v_scale) {
   constexpr int THREADS = 2 * D;
   constexpr int NWARPS = THREADS / 32;
-  constexpr int CH = D / 32;
+  // Wide-load row pairing: at D=64 a warp processes TWO KV rows per step
+  // (lanes 0-15 row j, lanes 16-31 row j+1), so every lane loads 4 channels
+  // regardless of D — doubling per-lane load width at D=64 (fp16 8B, fp8 4B,
+  // int4 2B) and amortizing the per-row softmax machinery over two rows.
+  // RPS=1 at D=128 degenerates to the classic one-row loop.
+  constexpr int RPS = (D == 64) ? 2 : 1; // rows per warp step
+  constexpr int LPR = 32 / RPS;          // lanes per row
+  constexpr int CHW = D / LPR;           // channels per lane (= 4)
 
   const int s = blockIdx.x;
   const int h_q = blockIdx.y;
@@ -463,41 +470,68 @@ __global__ void decode_partial_paged(
   for (int i = tid; i < D; i += THREADS)
     smem_q[i] = Q[q_off + i];
   __syncthreads();
-  float qreg[CH];
-  dec_loadv<T, CH>(smem_q + lane * CH, qreg);
+
+  const int rol = lane / LPR;         // which of the RPS rows this lane serves
+  const int chb = (lane % LPR) * CHW; // channel base within the head dim
+  float qreg[CHW];
+  dec_loadv<T, CHW>(smem_q + chb, qreg);
 
   const int base = s * chunk;
   const int next = min(base + chunk, S_kv);
 
   float m_w = -FLT_MAX, l_w = 0.0f;
-  float acc[CH];
+  float acc[CHW];
 #pragma unroll
-  for (int c = 0; c < CH; c++)
+  for (int c = 0; c < CHW; c++)
     acc[c] = 0.0f;
 
-  for (int j = base + warp; j < next; j += NWARPS) {
-    const TKV *kj = paged_row<TKV>(Kc, bt, j, page_size, H_kv, h_kv, D);
-    float kf[CH];
-    dec_load_kv<TKV, CH>(kj + lane * CH, kf);
+  for (int j = base + warp * RPS; j < next; j += NWARPS * RPS) {
+    const int my_j = j + rol;
+    const bool valid = (my_j < next);
+    float kf[CHW], vf[CHW];
+#pragma unroll
+    for (int c = 0; c < CHW; c++) {
+      kf[c] = 0.0f;
+      vf[c] = 0.0f;
+    }
+    if (valid) {
+      const TKV *kj = paged_row<TKV>(Kc, bt, my_j, page_size, H_kv, h_kv, D);
+      dec_load_kv<TKV, CHW>(kj + chb, kf);
+      const TKV *vj = paged_row<TKV>(Vc, bt, my_j, page_size, H_kv, h_kv, D);
+      dec_load_kv<TKV, CHW>(vj + chb, vf);
+    }
     float part = 0.0f;
 #pragma unroll
-    for (int c = 0; c < CH; c++)
+    for (int c = 0; c < CHW; c++)
       part += qreg[c] * kf[c];
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
+    for (int off = LPR / 2; off > 0; off >>= 1)
       part += __shfl_xor_sync(0xffffffffu, part, off);
-    float s_j = part * scale;
-    float m_new = fmaxf(m_w, s_j);
-    float corr = __expf(m_w - m_new);
-    float p = __expf(s_j - m_new);
-    const TKV *vj = paged_row<TKV>(Vc, bt, j, page_size, H_kv, h_kv, D);
-    float vf[CH];
-    dec_load_kv<TKV, CH>(vj + lane * CH, vf);
+    // sequential online update over the RPS rows of this step
 #pragma unroll
-    for (int c = 0; c < CH; c++)
-      acc[c] = acc[c] * corr + p * vf[c];
-    l_w = l_w * corr + p;
-    m_w = m_new;
+    for (int r = 0; r < RPS; r++) {
+      float s_r = __shfl_sync(0xffffffffu, part, r * LPR) * scale;
+      const bool rvalid = (j + r < next);
+      float m_new = rvalid ? fmaxf(m_w, s_r) : m_w;
+      float corr = __expf(m_w - m_new);
+      float p = rvalid ? __expf(s_r - m_new) : 0.0f;
+      float pw = (r == rol) ? p : 0.0f;
+#pragma unroll
+      for (int c = 0; c < CHW; c++)
+        acc[c] = acc[c] * corr + pw * vf[c];
+      l_w = l_w * corr + p;
+      m_w = m_new;
+    }
+  }
+
+  // merge the RPS row-halves (no-op at RPS==1): both halves hold the same
+  // channels; after this every lane carries the warp's full accumulation for
+  // its channel slice.
+#pragma unroll
+  for (int o = LPR; o < 32; o <<= 1) {
+#pragma unroll
+    for (int c = 0; c < CHW; c++)
+      acc[c] += __shfl_xor_sync(0xffffffffu, acc[c], o);
   }
 
   if (lane == 0) {
@@ -505,8 +539,8 @@ __global__ void decode_partial_paged(
     red_l[warp] = l_w;
   }
 #pragma unroll
-  for (int c = 0; c < CH; c++)
-    red_acc[warp][lane * CH + c] = acc[c];
+  for (int c = 0; c < CHW; c++)
+    red_acc[warp][chb + c] = acc[c];
   __syncthreads();
 
   float m_blk = -FLT_MAX;
@@ -552,7 +586,11 @@ __global__ void decode_partial_gqa_paged(
     const int *__restrict__ block_table, const int *__restrict__ seq_lens,
     int H_q, int H_kv, int max_blocks, int page_size, int chunk,
     int num_splits, float scale, float v_scale, int group) {
-  constexpr int CH = D / 32;
+  // Same wide-load row pairing as decode_partial_paged (see comment there):
+  // at D=64 each warp consumes two smem rows per step with 4-channel lanes.
+  constexpr int RPS = (D == 64) ? 2 : 1;
+  constexpr int LPR = 32 / RPS;
+  constexpr int CHW = D / LPR;
   constexpr int TILE_N = 32;
   const int s = blockIdx.x;
   const int h_kv = blockIdx.y;
@@ -569,16 +607,18 @@ __global__ void decode_partial_gqa_paged(
   __shared__ TKV sV[TILE_N * D];
 
   const size_t q_off = (size_t)(b * H_q + h_q) * D;
-  float qreg[CH];
-  dec_loadv<T, CH>(Q + q_off + lane * CH, qreg);
+  const int rol = lane / LPR;
+  const int chb = (lane % LPR) * CHW;
+  float qreg[CHW];
+  dec_loadv<T, CHW>(Q + q_off + chb, qreg);
 
   const int base = s * chunk;
   const int next = min(base + chunk, S_kv);
 
   float m_w = -FLT_MAX, l_w = 0.0f;
-  float acc[CH];
+  float acc[CHW];
 #pragma unroll
-  for (int c = 0; c < CH; c++)
+  for (int c = 0; c < CHW; c++)
     acc[c] = 0.0f;
 
   for (int t0 = base; t0 < next; t0 += TILE_N) {
@@ -598,43 +638,64 @@ __global__ void decode_partial_gqa_paged(
     }
     __syncthreads();
 
-    for (int jj = 0; jj < tn; jj++) {
-      float kf[CH];
-      dec_load_kv<TKV, CH>(sK + jj * D + lane * CH, kf);
+    for (int jj = 0; jj < tn; jj += RPS) {
+      const int my = jj + rol;
+      const bool valid = (my < tn);
+      float kf[CHW], vf[CHW];
+#pragma unroll
+      for (int c = 0; c < CHW; c++) {
+        kf[c] = 0.0f;
+        vf[c] = 0.0f;
+      }
+      if (valid) {
+        dec_load_kv<TKV, CHW>(sK + my * D + chb, kf);
+        dec_load_kv<TKV, CHW>(sV + my * D + chb, vf);
+      }
       float part = 0.0f;
 #pragma unroll
-      for (int c = 0; c < CH; c++)
+      for (int c = 0; c < CHW; c++)
         part += qreg[c] * kf[c];
 #pragma unroll
-      for (int off = 16; off > 0; off >>= 1)
+      for (int off = LPR / 2; off > 0; off >>= 1)
         part += __shfl_xor_sync(0xffffffffu, part, off);
-      float s_j = part * scale;
-      float m_new = fmaxf(m_w, s_j);
-      float corr = __expf(m_w - m_new);
-      float p = __expf(s_j - m_new);
-      float vf[CH];
-      dec_load_kv<TKV, CH>(sV + jj * D + lane * CH, vf);
 #pragma unroll
-      for (int c = 0; c < CH; c++)
-        acc[c] = acc[c] * corr + p * vf[c];
-      l_w = l_w * corr + p;
-      m_w = m_new;
+      for (int r = 0; r < RPS; r++) {
+        float s_r = __shfl_sync(0xffffffffu, part, r * LPR) * scale;
+        const bool rvalid = (jj + r < tn);
+        float m_new = rvalid ? fmaxf(m_w, s_r) : m_w;
+        float corr = __expf(m_w - m_new);
+        float p = rvalid ? __expf(s_r - m_new) : 0.0f;
+        float pw = (r == rol) ? p : 0.0f;
+#pragma unroll
+        for (int c = 0; c < CHW; c++)
+          acc[c] = acc[c] * corr + pw * vf[c];
+        l_w = l_w * corr + p;
+        m_w = m_new;
+      }
     }
     __syncthreads();
+  }
+
+  // merge the RPS row-halves (no-op at RPS==1)
+#pragma unroll
+  for (int o = LPR; o < 32; o <<= 1) {
+#pragma unroll
+    for (int c = 0; c < CHW; c++)
+      acc[c] += __shfl_xor_sync(0xffffffffu, acc[c], o);
   }
 
   if (num_splits == 1) {
     float inv = (l_w > 0.0f) ? (v_scale / l_w) : 0.0f; // FP8 dequant fold
 #pragma unroll
-    for (int c = 0; c < CH; c++)
-      O[q_off + lane * CH + c] = to_elem<T>(acc[c] * inv);
+    for (int c = 0; c < CHW; c++)
+      O[q_off + chb + c] = to_elem<T>(acc[c] * inv);
     if (LSE && lane == 0)
       LSE[b * H_q + h_q] = (l_w > 0.0f) ? (m_w + logf(l_w)) : -INFINITY;
   } else {
     size_t io = ((size_t)(b * H_q + h_q) * num_splits + s) * D;
 #pragma unroll
-    for (int c = 0; c < CH; c++)
-      Op[io + lane * CH + c] = acc[c] * v_scale; // FP8 dequant fold
+    for (int c = 0; c < CHW; c++)
+      Op[io + chb + c] = acc[c] * v_scale; // FP8 dequant fold
     if (lane == 0) {
       size_t im = (size_t)(b * H_q + h_q) * num_splits + s;
       mp[im] = m_w;
@@ -653,21 +714,21 @@ __global__ void decode_partial_gqa_paged(
 // addressing plus the second scale stream don't fit the element-type mold.
 // ============================================================================
 
-// Dequant CH channels for one lane. Lane l owns channels [l*CH, l*CH+CH),
-// which sit inside ONE group (32 channels = 32/CH lanes). payload: CH/2 bytes.
+// Dequant CH channels starting at channel base `chb` (multiple of CH; the CH
+// channels sit inside ONE 32-channel group). payload: CH/2 bytes at chb/2.
 template <int CH>
 __device__ __forceinline__ void dec_load_int4(const uint8_t *prow,
-                                              const __half2 *srow, int lane,
+                                              const __half2 *srow, int chb,
                                               float (&o)[CH]) {
-  const int gid = (lane * CH) >> 5; // group of 32 channels
+  const int gid = chb >> 5; // group of 32 channels
   const __half2 sz = srow[gid];
   const float scale = __low2float(sz), zero = __high2float(sz);
-  if constexpr (CH == 2) { // D=64: 1 byte
-    uint8_t b = prow[lane];
+  if constexpr (CH == 2) { // 1 byte
+    uint8_t b = prow[chb >> 1];
     o[0] = (float)(b & 0xF) * scale + zero;
     o[1] = (float)(b >> 4) * scale + zero;
-  } else { // CH == 4, D=128: 2 bytes
-    uint16_t u = *reinterpret_cast<const uint16_t *>(prow + lane * 2);
+  } else { // CH == 4: 2 bytes
+    uint16_t u = *reinterpret_cast<const uint16_t *>(prow + (chb >> 1));
     o[0] = (float)(u & 0xF) * scale + zero;
     o[1] = (float)((u >> 4) & 0xF) * scale + zero;
     o[2] = (float)((u >> 8) & 0xF) * scale + zero;
@@ -686,9 +747,14 @@ __global__ void decode_partial_paged_int4(
     int page_size, int chunk, int num_splits, float scale) {
   constexpr int THREADS = 2 * D;
   constexpr int NWARPS = THREADS / 32;
-  constexpr int CH = D / 32;
   constexpr int NG = D / 32; // groups per (token, head)
   constexpr int PB = D / 2;  // payload bytes per (token, head)
+  // Wide-load row pairing (see decode_partial_paged): 4-channel lanes at both
+  // head dims; at D=64 each warp consumes two rows per step (2-byte int4
+  // payload loads instead of 1-byte).
+  constexpr int RPS = (D == 64) ? 2 : 1;
+  constexpr int LPR = 32 / RPS;
+  constexpr int CHW = D / LPR;
 
   const int s = blockIdx.x;
   const int h_q = blockIdx.y;
@@ -712,45 +778,66 @@ __global__ void decode_partial_paged_int4(
   for (int i = tid; i < D; i += THREADS)
     smem_q[i] = Q[q_off + i];
   __syncthreads();
-  float qreg[CH];
-  dec_loadv<T, CH>(smem_q + lane * CH, qreg);
+  const int rol = lane / LPR;
+  const int chb = (lane % LPR) * CHW;
+  float qreg[CHW];
+  dec_loadv<T, CHW>(smem_q + chb, qreg);
 
   const int base = s * chunk;
   const int next = min(base + chunk, S_kv);
 
   float m_w = -FLT_MAX, l_w = 0.0f;
-  float acc[CH];
+  float acc[CHW];
 #pragma unroll
-  for (int c = 0; c < CH; c++)
+  for (int c = 0; c < CHW; c++)
     acc[c] = 0.0f;
 
-  for (int j = base + warp; j < next; j += NWARPS) {
-    int blk = j / page_size;
-    size_t row = (size_t)bt[blk] * page_size + (j - blk * page_size);
-    const uint8_t *kp = Kp + (row * H_kv + h_kv) * PB;
-    const __half2 *ks = Ks + (row * H_kv + h_kv) * NG;
-    float kf[CH];
-    dec_load_int4<CH>(kp, ks, lane, kf);
+  for (int j = base + warp * RPS; j < next; j += NWARPS * RPS) {
+    const int my_j = j + rol;
+    const bool valid = (my_j < next);
+    float kf[CHW], vf[CHW];
+#pragma unroll
+    for (int c = 0; c < CHW; c++) {
+      kf[c] = 0.0f;
+      vf[c] = 0.0f;
+    }
+    if (valid) {
+      int blk = my_j / page_size;
+      size_t row = (size_t)bt[blk] * page_size + (my_j - blk * page_size);
+      dec_load_int4<CHW>(Kp + (row * H_kv + h_kv) * PB,
+                         Ks + (row * H_kv + h_kv) * NG, chb, kf);
+      dec_load_int4<CHW>(Vp + (row * H_kv + h_kv) * PB,
+                         Vs + (row * H_kv + h_kv) * NG, chb, vf);
+    }
     float part = 0.0f;
 #pragma unroll
-    for (int c = 0; c < CH; c++)
+    for (int c = 0; c < CHW; c++)
       part += qreg[c] * kf[c];
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
+    for (int off = LPR / 2; off > 0; off >>= 1)
       part += __shfl_xor_sync(0xffffffffu, part, off);
-    float s_j = part * scale;
-    float m_new = fmaxf(m_w, s_j);
-    float corr = __expf(m_w - m_new);
-    float p = __expf(s_j - m_new);
-    const uint8_t *vp = Vp + (row * H_kv + h_kv) * PB;
-    const __half2 *vs = Vs + (row * H_kv + h_kv) * NG;
-    float vf[CH];
-    dec_load_int4<CH>(vp, vs, lane, vf);
 #pragma unroll
-    for (int c = 0; c < CH; c++)
-      acc[c] = acc[c] * corr + p * vf[c];
-    l_w = l_w * corr + p;
-    m_w = m_new;
+    for (int r = 0; r < RPS; r++) {
+      float s_r = __shfl_sync(0xffffffffu, part, r * LPR) * scale;
+      const bool rvalid = (j + r < next);
+      float m_new = rvalid ? fmaxf(m_w, s_r) : m_w;
+      float corr = __expf(m_w - m_new);
+      float p = rvalid ? __expf(s_r - m_new) : 0.0f;
+      float pw = (r == rol) ? p : 0.0f;
+#pragma unroll
+      for (int c = 0; c < CHW; c++)
+        acc[c] = acc[c] * corr + pw * vf[c];
+      l_w = l_w * corr + p;
+      m_w = m_new;
+    }
+  }
+
+  // merge the RPS row-halves (no-op at RPS==1)
+#pragma unroll
+  for (int o = LPR; o < 32; o <<= 1) {
+#pragma unroll
+    for (int c = 0; c < CHW; c++)
+      acc[c] += __shfl_xor_sync(0xffffffffu, acc[c], o);
   }
 
   if (lane == 0) {
@@ -758,8 +845,8 @@ __global__ void decode_partial_paged_int4(
     red_l[warp] = l_w;
   }
 #pragma unroll
-  for (int c = 0; c < CH; c++)
-    red_acc[warp][lane * CH + c] = acc[c];
+  for (int c = 0; c < CHW; c++)
+    red_acc[warp][chb + c] = acc[c];
   __syncthreads();
 
   float m_blk = -FLT_MAX;
@@ -805,10 +892,13 @@ __global__ void decode_partial_gqa_paged_int4(
     float *__restrict__ lp, const int *__restrict__ block_table,
     const int *__restrict__ seq_lens, int H_q, int H_kv, int max_blocks,
     int page_size, int chunk, int num_splits, float scale, int group) {
-  constexpr int CH = D / 32;
   constexpr int NG = D / 32;
   constexpr int PB = D / 2;
   constexpr int TILE_N = 32;
+  // Wide-load row pairing (see decode_partial_paged).
+  constexpr int RPS = (D == 64) ? 2 : 1;
+  constexpr int LPR = 32 / RPS;
+  constexpr int CHW = D / LPR;
   const int s = blockIdx.x;
   const int h_kv = blockIdx.y;
   const int b = blockIdx.z;
@@ -826,16 +916,18 @@ __global__ void decode_partial_gqa_paged_int4(
   __shared__ __half2 sVs[TILE_N * NG];
 
   const size_t q_off = (size_t)(b * H_q + h_q) * D;
-  float qreg[CH];
-  dec_loadv<T, CH>(Q + q_off + lane * CH, qreg);
+  const int rol = lane / LPR;
+  const int chb = (lane % LPR) * CHW;
+  float qreg[CHW];
+  dec_loadv<T, CHW>(Q + q_off + chb, qreg);
 
   const int base = s * chunk;
   const int next = min(base + chunk, S_kv);
 
   float m_w = -FLT_MAX, l_w = 0.0f;
-  float acc[CH];
+  float acc[CHW];
 #pragma unroll
-  for (int c = 0; c < CH; c++)
+  for (int c = 0; c < CHW; c++)
     acc[c] = 0.0f;
 
   for (int t0 = base; t0 < next; t0 += TILE_N) {
@@ -862,43 +954,64 @@ __global__ void decode_partial_gqa_paged_int4(
     }
     __syncthreads();
 
-    for (int jj = 0; jj < tn; jj++) {
-      float kf[CH];
-      dec_load_int4<CH>(sKp + jj * PB, sKs + jj * NG, lane, kf);
+    for (int jj = 0; jj < tn; jj += RPS) {
+      const int my = jj + rol;
+      const bool valid = (my < tn);
+      float kf[CHW], vf[CHW];
+#pragma unroll
+      for (int c = 0; c < CHW; c++) {
+        kf[c] = 0.0f;
+        vf[c] = 0.0f;
+      }
+      if (valid) {
+        dec_load_int4<CHW>(sKp + my * PB, sKs + my * NG, chb, kf);
+        dec_load_int4<CHW>(sVp + my * PB, sVs + my * NG, chb, vf);
+      }
       float part = 0.0f;
 #pragma unroll
-      for (int c = 0; c < CH; c++)
+      for (int c = 0; c < CHW; c++)
         part += qreg[c] * kf[c];
 #pragma unroll
-      for (int off = 16; off > 0; off >>= 1)
+      for (int off = LPR / 2; off > 0; off >>= 1)
         part += __shfl_xor_sync(0xffffffffu, part, off);
-      float s_j = part * scale;
-      float m_new = fmaxf(m_w, s_j);
-      float corr = __expf(m_w - m_new);
-      float p = __expf(s_j - m_new);
-      float vf[CH];
-      dec_load_int4<CH>(sVp + jj * PB, sVs + jj * NG, lane, vf);
 #pragma unroll
-      for (int c = 0; c < CH; c++)
-        acc[c] = acc[c] * corr + p * vf[c];
-      l_w = l_w * corr + p;
-      m_w = m_new;
+      for (int r = 0; r < RPS; r++) {
+        float s_r = __shfl_sync(0xffffffffu, part, r * LPR) * scale;
+        const bool rvalid = (jj + r < tn);
+        float m_new = rvalid ? fmaxf(m_w, s_r) : m_w;
+        float corr = __expf(m_w - m_new);
+        float p = rvalid ? __expf(s_r - m_new) : 0.0f;
+        float pw = (r == rol) ? p : 0.0f;
+#pragma unroll
+        for (int c = 0; c < CHW; c++)
+          acc[c] = acc[c] * corr + pw * vf[c];
+        l_w = l_w * corr + p;
+        m_w = m_new;
+      }
     }
     __syncthreads();
+  }
+
+  // merge the RPS row-halves (no-op at RPS==1)
+#pragma unroll
+  for (int o = LPR; o < 32; o <<= 1) {
+#pragma unroll
+    for (int c = 0; c < CHW; c++)
+      acc[c] += __shfl_xor_sync(0xffffffffu, acc[c], o);
   }
 
   if (num_splits == 1) {
     float inv = (l_w > 0.0f) ? (1.0f / l_w) : 0.0f;
 #pragma unroll
-    for (int c = 0; c < CH; c++)
-      O[q_off + lane * CH + c] = to_elem<T>(acc[c] * inv);
+    for (int c = 0; c < CHW; c++)
+      O[q_off + chb + c] = to_elem<T>(acc[c] * inv);
     if (LSE && lane == 0)
       LSE[b * H_q + h_q] = (l_w > 0.0f) ? (m_w + logf(l_w)) : -INFINITY;
   } else {
     size_t io = ((size_t)(b * H_q + h_q) * num_splits + s) * D;
 #pragma unroll
-    for (int c = 0; c < CH; c++)
-      Op[io + lane * CH + c] = acc[c];
+    for (int c = 0; c < CHW; c++)
+      Op[io + chb + c] = acc[c];
     if (lane == 0) {
       size_t im = (size_t)(b * H_q + h_q) * num_splits + s;
       mp[im] = m_w;
