@@ -13,6 +13,7 @@
 <p align="center">
   <a href="#performance">Performance</a> ·
   <a href="#how-it-works">How It Works</a> ·
+  <a href="docs/how-to-use.md">How to Use</a> ·
   <a href="#building">Building</a> ·
   <a href="#visualization">Visualization</a> ·
   <a href="#architecture">Architecture</a>
@@ -179,6 +180,13 @@ The RTX 5080 (sm_120, consumer Blackwell) lacks datacenter features that product
 
 ## Building
 
+> **Using the kernels in your own project?** Start with the user manual —
+> **[docs/how-to-use.md](docs/how-to-use.md)** (also as a
+> [styled page](docs/how_to_use.html)): build & link, the three-callable API,
+> ragged/varlen prompts, and a complete continuous-batching serving loop with
+> a quantized paged KV cache. Field-by-field reference:
+> [docs/api-guide.md](docs/api-guide.md).
+
 ### Requirements
 
 - CUDA Toolkit 12.0+ (tested with 13.1)
@@ -280,7 +288,13 @@ flash-attention-cuda/
 │   ├── error_analysis.png
 │   └── head_comparison.png
 └── docs/
-    └── flash_attention_story.html  # interactive deep-dive with animations
+    ├── how-to-use.md               # user manual: build, integrate, serving loop
+    ├── how_to_use.html             # same manual, portable styled page
+    ├── api-guide.md                # unified-API reference (3 callables + KvCache)
+    ├── vllm-comparison.md          # head-to-head vs vLLM FA2: methodology + tables
+    ├── cutlass-comparison.md       # vs CUTLASS FMHA on consumer Blackwell
+    ├── flash_attention_story.html  # prefill engineering narrative (interactive)
+    └── flash_attention_decode_story.html  # decode kernel narrative
 ```
 
 ### Kernel parameters

@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How to use this library — flash attention on consumer Blackwell</title>
+<style>
+  :root{
+    --ink:#1c1c1a; --muted:#6c6b64; --faint:#8a8980;
+    --bg:#fbfbf8; --panel:#f5f4ee; --rule:#e5e4dd; --rule2:#d2d1c8;
+    --accent:#1f5f9e; --win:#1c7d4d; --loss:#b23b39;
+    --serif: Charter,"Bitstream Charter","Palatino Linotype","Book Antiqua",Palatino,Georgia,serif;
+    --sans: system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:"SF Mono","JetBrains Mono","Cascadia Mono",ui-monospace,Consolas,"Liberation Mono",monospace;
+  }
+  *{box-sizing:border-box;}
+  html{-webkit-text-size-adjust:100%;}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--serif);
+       font-size:19px;line-height:1.66;text-rendering:optimizeLegibility;
+       -webkit-font-smoothing:antialiased;}
+  .wrap{max-width:744px;margin:0 auto;padding:60px 24px 120px;}
+
+  header.doc{border-bottom:1px solid var(--rule2);padding-bottom:26px;margin-bottom:36px;}
+  .eyebrow{font-family:var(--sans);font-size:.72rem;letter-spacing:.13em;text-transform:uppercase;
+           color:var(--accent);font-weight:600;margin-bottom:14px;}
+  h1{font-size:2.05rem;line-height:1.18;font-weight:700;letter-spacing:-.012em;margin:0 0 14px;}
+  .subtitle{font-size:1.12rem;color:var(--muted);font-style:italic;margin:0 0 20px;line-height:1.5;}
+  .meta{font-family:var(--sans);font-size:.78rem;letter-spacing:.02em;color:var(--faint);}
+  .meta span{color:var(--muted);}
+
+  .abstract{font-size:.98rem;color:#37362f;background:var(--panel);border:1px solid var(--rule);
+            border-radius:6px;padding:18px 22px;margin:0 0 8px;line-height:1.6;}
+
+  h2{font-size:1.42rem;font-weight:700;letter-spacing:-.01em;margin:58px 0 14px;line-height:1.25;}
+  h2 .no{font-family:var(--sans);font-size:.72em;font-weight:600;color:var(--accent);margin-right:.55em;
+         vertical-align:.06em;}
+  h3{font-size:1.06rem;font-weight:700;margin:30px 0 8px;}
+  p{margin:0 0 18px;}
+  a{color:var(--accent);text-decoration:none;border-bottom:1px solid rgba(31,95,158,.32);}
+  a:hover{border-bottom-color:var(--accent);}
+  em{font-style:italic;}
+  strong{font-weight:700;}
+
+  code{font-family:var(--mono);font-size:.84em;background:#eeede6;padding:1px 5px;border-radius:3px;
+       color:#33322b;}
+  pre{font-family:var(--mono);font-size:.8rem;line-height:1.55;background:#f7f6f0;border:1px solid var(--rule);
+      border-radius:6px;padding:16px 18px;overflow-x:auto;margin:0 0 20px;}
+  pre code{background:none;padding:0;font-size:1em;}
+  .cm{color:#8a8980;}
+
+  table{border-collapse:collapse;width:100%;font-family:var(--sans);font-size:.82rem;margin:0 0 22px;}
+  th{font-weight:600;text-align:left;border-bottom:2px solid var(--rule2);padding:8px 10px;color:#44433b;}
+  td{border-bottom:1px solid var(--rule);padding:8px 10px;vertical-align:top;}
+  tr:last-child td{border-bottom:none;}
+  td.good{color:var(--win);font-weight:600;}
+  td.bad{color:var(--loss);}
+
+  .note{background:var(--panel);border-left:3px solid var(--accent);border-radius:0 6px 6px 0;
+        padding:12px 18px;margin:0 0 20px;font-size:.92rem;line-height:1.55;}
+  .warn{background:#faf3ec;border-left:3px solid #b0762b;border-radius:0 6px 6px 0;
+        padding:12px 18px;margin:0 0 20px;font-size:.92rem;line-height:1.55;}
+
+  ul,ol{margin:0 0 18px;padding-left:26px;}
+  li{margin-bottom:6px;}
+  footer{margin-top:70px;border-top:1px solid var(--rule2);padding-top:18px;
+         font-family:var(--sans);font-size:.78rem;color:var(--faint);}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="doc">
+  <div class="eyebrow">User Manual</div>
+  <h1>How to use this library</h1>
+  <p class="subtitle">From a first attention call to a full continuous-batching
+  serving loop with a quantized paged KV cache — three callables, one descriptor.</p>
+  <div class="meta">flash-attention-cuda &nbsp;·&nbsp; <span>consumer Blackwell (sm_120), tuned on RTX 5080</span>
+  &nbsp;·&nbsp; <span>fp16 / bf16 · D = 64 / 128 · MHA / GQA / MQA</span></div>
+</header>
+
+<p class="abstract">
+This is the practical manual. The entire feature set — batched and ragged
+prefill, split-KV decode, paged KV caches with FP8/INT4 quantization, cache
+writes, chunked multi-turn prefill — is reachable through
+<code>fa_attention</code>, <code>fa_cache_attention</code>, and
+<code>fa_cache_write</code>, configured by plain structs. For the field-by-field
+reference see <a href="api-guide.md">api-guide.md</a>; for how the kernels work
+and how fast they are, see the README and
+<a href="vllm-comparison.md">vllm-comparison.md</a>.
+</p>
+
+<h2><span class="no">1</span>Build and link</h2>
+<pre><code>mkdir build &amp;&amp; cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake --build . --target flash_attention   <span class="cm"># the static library</span>
+cmake --build . --target flash_bench       <span class="cm"># optional benchmark suite</span></code></pre>
+<p>Requirements: CUDA 12.0+ (13.x tested), CMake 3.20+, compute capability 8.0+.
+For fastest builds pin your GPU in CMakeLists.txt
+(<code>set(CMAKE_CUDA_ARCHITECTURES "120")</code> for an RTX&nbsp;5080).
+Integration is one header and one library:</p>
+<pre><code>target_link_libraries(your_app PRIVATE flash_attention)
+<span class="cm">// #include "flash_attention.h" — everything is in namespace transformer</span></code></pre>
+
+<h2><span class="no">2</span>The mental model</h2>
+<table>
+  <tr><th>Callable</th><th>Use it for</th></tr>
+  <tr><td><code>fa_attention</code></td><td>attention over tensors you hold (prompts, training-style batches)</td></tr>
+  <tr><td><code>fa_cache_attention</code></td><td>attention against a paged KV cache — decode <em>and</em> chunked prefill, routed by query length</td></tr>
+  <tr><td><code>fa_cache_write</code></td><td>appending new K/V into the cache (quantizes automatically)</td></tr>
+  <tr><td><code>KvCache</code> (struct)</td><td>all state of one cache: pools, block table, lengths, geometry, quantization</td></tr>
+</table>
+<p>Conventions that apply everywhere:</p>
+<ul>
+  <li>fp16/bf16 chosen by the <code>DType dtype</code> field; pointers are typed
+      <code>half*</code> as address carriers either way.</li>
+  <li>GQA/MQA via <code>num_kv_heads</code> (0 = MHA); <code>d_head</code> ∈ {64, 128};
+      <code>scale = 0</code> means 1/√d_head.</li>
+  <li>All index arrays (<code>cu_seqlens_*</code>, <code>block_table</code>,
+      <code>seq_lens</code>, <code>slot_mapping</code>) are <strong>device</strong> memory.</li>
+  <li>Zero-initialize every args struct — the defaults are all valid. Bad
+      arguments abort with a named message instead of corrupting memory.</li>
+</ul>
+
+<h2><span class="no">3</span>Recipe: plain batched attention</h2>
+<pre><code>FaAttentionArgs a = {};
+a.Q = q; a.K = k; a.V = v; a.O = o;   <span class="cm">// device half*, [B,H,S,D]</span>
+a.batch_size = 8;
+a.num_heads  = 32;
+a.num_kv_heads = 8;                    <span class="cm">// GQA 4:1 (0 = MHA)</span>
+a.seq_len = 4096;
+a.d_head  = 128;
+a.causal  = true;
+a.autotune = true;                     <span class="cm">// optional per-shape tile search (wisdom-cached)</span>
+fa_attention(a);</code></pre>
+<p>The dispatcher picks the kernel tier by GPU saturation automatically;
+<code>autotune</code> benchmarks the candidate tiles once for this exact shape
+and remembers the winner across runs.</p>
+
+<h2><span class="no">4</span>Recipe: ragged prompts (varlen)</h2>
+<p>Pack unequal-length sequences with <em>no padding</em>: <code>Q/O</code>
+become <code>[total_q, H, D]</code> — exactly what a QKV projection produces,
+so no transpose — with device prefix sums:</p>
+<pre><code><span class="cm">// lens = {512, 300, 1000}  →  cu_q = {0, 512, 812, 1812}</span>
+FaAttentionArgs a = {};
+a.Q = q_packed; a.K = k_packed; a.V = v_packed; a.O = o_packed;
+a.cu_seqlens_q = cu_q;                 <span class="cm">// switches to varlen mode</span>
+a.cu_seqlens_k = cu_k;
+a.batch_size = 3; a.num_heads = 32; a.num_kv_heads = 8;
+a.max_seqlen_q = 1000; a.d_head = 128; a.causal = true;
+fa_attention(a);</code></pre>
+<div class="note">Causal masking in varlen mode is <strong>bottom-right
+aligned</strong>: query <em>i</em> attends kv <em>j ≤ i + (seqlen_k −
+seqlen_q)</em>. Passing a longer <code>seqlen_k</code> therefore <em>is</em>
+chunked/append prefill — new tokens attending an existing prefix plus
+themselves.</div>
+
+<h2><span class="no">5</span>Recipe: the serving loop</h2>
+<p><strong>Step 0 — allocate the cache.</strong> Payload pools are
+<code>[num_pages, page_size, H_kv, D]</code> elements of the cache dtype
+(AUTO: 2 B/elem · FP8: 1 · INT4: 0.5 plus scale pools):</p>
+<pre><code>KvCache cache = {};
+cache.K = k_pool; cache.V = v_pool;
+cache.block_table = block_table;       <span class="cm">// [B, max_blocks_per_seq], device</span>
+cache.seq_lens = seq_lens;             <span class="cm">// [B], device</span>
+cache.max_blocks_per_seq = max_blocks;
+cache.page_size = 16;
+cache.num_kv_heads = 8; cache.d_head = 128;
+cache.max_seq_len_kv = 32768;          <span class="cm">// host-known upper bound</span>
+cache.kv_dtype = KvDType::FP8_E4M3;    <span class="cm">// see §6</span>
+cache.k_scale = k_max/448.f; cache.v_scale = v_max/448.f;</code></pre>
+
+<p><strong>Step 1 — prompt attention, then fill the cache.</strong></p>
+<pre><code>fa_attention(varlen_prompt_args);      <span class="cm">// §4: prompts, no cache yet</span>
+
+FaCacheWriteArgs w = {};
+w.K_new = k_packed; w.V_new = v_packed; <span class="cm">// [total_tokens, H_kv, D]</span>
+w.slot_mapping = slots;                 <span class="cm">// [total_tokens]: page*ps + slot</span>
+w.num_tokens = total_tokens; w.cache = cache;
+fa_cache_write(w);                      <span class="cm">// quantizes per cache.kv_dtype</span></code></pre>
+
+<p><strong>Step 2 — the decode loop.</strong> One query token per sequence;
+<code>Q</code> is <code>[B, H_q, D]</code>:</p>
+<pre><code>FaCacheAttentionArgs d = {};
+d.Q = q_step; d.O = o_step; d.cache = cache;
+d.batch_size = B; d.num_heads = 32;
+d.max_seqlen_q = 1;                    <span class="cm">// → decode path (split-KV)</span>
+size_t sb = fa_cache_attention_scratch_bytes(d);
+cudaMalloc(&amp;d.scratch, sb);            <span class="cm">// allocate once, reuse every step</span>
+
+for (;;) {
+  fa_cache_attention(d);
+  <span class="cm">/* model computes next token + its K/V ... */</span>
+  fa_cache_write(step_w);              <span class="cm">// append 1 token per sequence</span>
+  <span class="cm">/* scheduler bumps seq_lens, grows block tables, admits/evicts */</span>
+}</code></pre>
+
+<p><strong>Step 3 — multi-turn follow-up (chunked prefill).</strong> Write
+the new tokens' K/V into the cache <em>first</em>, then run the chunk against
+the whole cache:</p>
+<pre><code>fa_cache_write(chunk_w);               <span class="cm">// new K/V → pages FIRST</span>
+
+FaCacheAttentionArgs p = {};
+p.Q = chunk_q; p.O = chunk_o; p.cache = cache;
+p.cu_seqlens_q = cu_chunk;
+p.max_seqlen_q = max_chunk_len;        <span class="cm">// &gt; 1 → chunked-prefill path</span>
+p.batch_size = B; p.num_heads = 32; p.causal = true;
+fa_cache_attention(p);</code></pre>
+<div class="warn">Chunked prefill currently requires an AUTO (fp16/bf16)
+cache; FP8/INT4 caches are decode-only for now.</div>
+
+<h2><span class="no">6</span>Choosing a KV-cache dtype</h2>
+<table>
+  <tr><th><code>kv_dtype</code></th><th>KV memory</th><th>Decode speed<br>(D=128, long ctx)</th><th>Accuracy cost<br>(worst case)</th><th>Scales</th></tr>
+  <tr><td><code>AUTO</code></td><td>1×</td><td>baseline (~99% HBM peak)</td><td>—</td><td>—</td></tr>
+  <tr><td><code>FP8_E4M3</code></td><td class="good">1/2</td><td class="good">~1.8× faster</td><td>~0.035 nrmse</td><td>you provide per-tensor <code>k_scale/v_scale</code> (max|X|/448)</td></tr>
+  <tr><td><code>INT4_G32</code></td><td class="good">~1/4</td><td>~1.2–1.8× faster</td><td>~0.10 nrmse</td><td>computed automatically per 32-channel group (allocate <code>K_scales/V_scales</code>)</td></tr>
+</table>
+<p>Rule of thumb: <strong>FP8 for speed, INT4 for capacity.</strong> The
+accuracy costs are gaussian-random worst cases; calibrated real-model KV does
+better, and both formats add <em>zero kernel error</em> on top of the
+quantization itself.</p>
+
+<h2><span class="no">7</span>Validate and benchmark</h2>
+<p>Seven independent gates validate everything against double-precision
+references under a strict policy (random std=1 inputs, thresholds ~4× the
+noise floor). Run them after any change; each exits 0 on pass:</p>
+<pre><code>fa_validate · fa_varlen_validate · fa_paged_validate · fa_fp8_validate
+fa_int4_validate · fa_paged_prefill_validate · fa_api_validate</code></pre>
+<p><code>flash_bench</code> reports per-shape TFLOPS through the production
+dispatcher.</p>
+
+<h2><span class="no">8</span>Troubleshooting</h2>
+<table>
+  <tr><th>Symptom</th><th>Likely cause</th></tr>
+  <tr><td>abort: <code>… requires scratch</code></td><td>decode called without a <code>fa_cache_attention_scratch_bytes</code> allocation</td></tr>
+  <tr><td>abort: <code>FP8 … requires k_scale/v_scale &gt; 0</code></td><td>scales left at the zero-init default</td></tr>
+  <tr><td>abort: <code>INT4_G32 … requires K_scales/V_scales</code></td><td>scale pools not allocated/attached</td></tr>
+  <tr><td>abort: <code>quantized caches … decode-only</code></td><td>chunked prefill on an FP8/INT4 cache — use AUTO for prefill</td></tr>
+  <tr><td>garbage output, no abort</td><td>index arrays passed as host memory; stale <code>block_table</code>/<code>seq_lens</code>; or K/V not written to the cache before a prefill chunk</td></tr>
+  <tr><td>decode output all zeros for one sequence</td><td>its <code>seq_lens[b]</code> is 0 — by design</td></tr>
+  <tr><td>results differ run-to-run</td><td>they shouldn't — all kernels are deterministic; suspect your own buffers</td></tr>
+</table>
+
+<h2><span class="no">9</span>Going deeper</h2>
+<ul>
+  <li><a href="api-guide.md">api-guide.md</a> — every struct field and control lever.</li>
+  <li>Header of <code>kernels/flash_attention.cu</code> — kernel design and the dispatch crossover tables.</li>
+  <li><a href="vllm-comparison.md">vllm-comparison.md</a> — methodology and the full head-to-head vs vLLM FlashAttention-2.</li>
+  <li><a href="flash_attention_story.html">flash_attention_story.html</a> and
+      <a href="flash_attention_decode_story.html">flash_attention_decode_story.html</a> — the engineering narratives.</li>
+</ul>
+
+<footer>flash-attention-cuda · user manual · generated alongside docs/how-to-use.md (same content, portable form)</footer>
+
+</div>
+</body>
+</html>
