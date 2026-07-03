@@ -198,7 +198,7 @@ quantized caches are decode-only for now.
 | `kv_dtype` | KV memory | Decode speed (D=128, long ctx) | Accuracy cost | Scales |
 |---|---|---|---|---|
 | `AUTO` | 1× | baseline (~99% of HBM peak) | — | — |
-| `FP8_E4M3` | **1/2** | **~1.8× faster** | ~0.035 nrmse (worst case) | you provide per-tensor `k_scale`/`v_scale` (`max|X|/448`) |
+| `FP8_E4M3` | **1/2** | **~1.8× faster** | ~0.035 nrmse (worst case) | you provide per-tensor `k_scale`/`v_scale` (max abs / 448) |
 | `INT4_G32` | **~1/4** | ~1.2–1.8× faster | ~0.10 nrmse (worst case) | computed automatically per 32-channel group; allocate `K_scales`/`V_scales` pools |
 
 Rule of thumb: **FP8 when you want speed, INT4 when you need to fit a longer
@@ -238,7 +238,75 @@ references, thresholds ~4× the fp16/bf16 noise floor) — do not weaken them.
 | decode output all zeros for one sequence | its `seq_lens[b]` is 0 — by design (nothing to attend) |
 | results differ run-to-run | they shouldn't: all kernels are deterministic; suspect your own buffers |
 
-## 10. Going deeper
+## 10. Python bindings (PyTorch)
+
+The same three-callable surface is available from Python as the `fa_ptx`
+package. Install with `pip install -e python/` (needs nvcc + a CUDA torch),
+or just `import fa_ptx` from the repo for a JIT build. All tensors are CUDA
+`float16`/`bfloat16`; index tensors are CUDA `int32`.
+
+### `fa_ptx.attention(...) -> Tensor`
+
+```python
+fa_ptx.attention(q, k, v, *,
+    cu_seqlens_q=None,   # None -> batch mode; set -> varlen mode
+    cu_seqlens_k=None,   # required in varlen mode
+    max_seqlen_q=0,      # varlen: longest query segment
+    num_kv_heads=0,      # 0 = MHA; else GQA/MQA
+    causal=True,
+    scale=0.0,           # 0 = 1/sqrt(d_head)
+    autotune=False)      # batch mode only
+```
+
+Batch mode: `q/k/v` are `[B, H, S, D]`. Varlen mode: `q` is packed
+`[total_q, H_q, D]`, `k/v` packed `[total_k, H_kv, D]`; causal is
+bottom-right aligned (longer `k` = chunked/append). Returns `O` shaped like
+`q`.
+
+### `fa_ptx.PagedKVCache`
+
+One object per cache. Create it:
+
+```python
+cache = fa_ptx.PagedKVCache.allocate(
+    num_pages=..., page_size=16, num_kv_heads=8, d_head=128,
+    batch_size=B, max_seq_len_kv=32768,
+    kv_dtype="auto",          # "auto" (fp16/bf16) | "fp8" | "int4"
+    k_scale=0.0, v_scale=0.0, # required > 0 for "fp8"
+    dtype=torch.float16, device="cuda")
+```
+
+or wrap existing pools by constructing the dataclass directly
+(`k_pool/v_pool`, `block_table [B, max_blocks]`, `seq_lens [B]`, plus the
+same geometry fields). The **caller mutates** `block_table`, `seq_lens`, and
+pool contents in place as sequences grow — that is the supported pattern.
+
+Its two methods:
+
+```python
+cache.write(k_new, v_new, slot_mapping)
+#   k_new/v_new : [num_tokens, H_kv, D]      (quantized per cache.kv_dtype)
+#   slot_mapping: [num_tokens] int32, page_id * page_size + slot; < 0 skips
+
+o = cache.attend(q, *,
+    cu_seqlens_q=None,   # None / max_seqlen_q == 1 -> decode
+    max_seqlen_q=1,      # > 1 -> chunked prefill ("auto" caches only)
+    causal=True, scale=0.0,
+    num_splits=0)        # decode split-KV; 0 = auto
+#   decode: q is [B, H_q, D]; prefill: q packed [total_q, H_q, D]
+```
+
+Decode scratch is managed by the object automatically.
+
+### Raw ops
+
+For graph surgery or custom integration, the underlying operators are
+directly available: `torch.ops.fa_ptx.attention`, `.cache_attention`,
+`.cache_write`, and `.cache_scratch_bytes(batch, heads, kv_heads, d_head,
+max_kv, splits)`. They are `torch.compile`- and CUDA-graph-compatible; the
+`fa_ptx` wrappers above are thin conveniences over them.
+
+## 11. Going deeper
 
 - [api-guide.md](api-guide.md) — every struct field and lever.
 - Header of [kernels/flash_attention.cu](../kernels/flash_attention.cu) —

@@ -15,6 +15,11 @@ The older `launch_*` entry points remain supported (the validation gates use
 them); the facade produces bit-identical outputs (asserted by
 `tests/fa_api_validate.cu`) and is the recommended surface.
 
+**From Python**, the same surface is the `fa_ptx` package:
+`fa_ptx.attention(...)` and `fa_ptx.PagedKVCache` (`.allocate` / `.write` /
+`.attend`), with raw operators at `torch.ops.fa_ptx.*`. Signatures and
+layouts are documented in [how-to-use.md](how-to-use.md) §10.
+
 Conventions used everywhere: fp16/bf16 selected by `DType dtype` (pointers are
 typed `half*` as address carriers); GQA/MQA via `num_kv_heads` (0 = MHA);
 `d_head` is 64 or 128; `scale = 0` means `1/sqrt(d_head)`; `lse` output is

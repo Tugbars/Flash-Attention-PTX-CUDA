@@ -241,7 +241,55 @@ dispatcher.</p>
   <tr><td>results differ run-to-run</td><td>they shouldn't — all kernels are deterministic; suspect your own buffers</td></tr>
 </table>
 
-<h2><span class="no">9</span>Going deeper</h2>
+<h2><span class="no">9</span>Python bindings — the handles</h2>
+<p>The same surface is available from Python as the <code>fa_ptx</code> package
+(<code>pip install -e python/</code>, or <code>import fa_ptx</code> from the
+repo for a JIT build). All tensors are CUDA fp16/bf16; index tensors are CUDA
+int32. The ops are <code>torch.compile</code>- and CUDA-graph-compatible.</p>
+
+<h3><code>fa_ptx.attention(...) → Tensor</code></h3>
+<pre><code>fa_ptx.attention(q, k, v, *,
+    cu_seqlens_q=None,   <span class="cm"># None → batch mode; set → varlen mode</span>
+    cu_seqlens_k=None,   <span class="cm"># required in varlen mode</span>
+    max_seqlen_q=0,      <span class="cm"># varlen: longest query segment</span>
+    num_kv_heads=0,      <span class="cm"># 0 = MHA; else GQA/MQA</span>
+    causal=True,
+    scale=0.0,           <span class="cm"># 0 = 1/sqrt(d_head)</span>
+    autotune=False)      <span class="cm"># batch mode only</span></code></pre>
+<p>Batch mode: <code>q/k/v</code> are <code>[B,H,S,D]</code>. Varlen mode:
+<code>q</code> packed <code>[total_q, H_q, D]</code>, <code>k/v</code> packed
+<code>[total_k, H_kv, D]</code>; causal is bottom-right aligned. Returns
+<code>O</code> shaped like <code>q</code>.</p>
+
+<h3><code>fa_ptx.PagedKVCache</code></h3>
+<pre><code>cache = fa_ptx.PagedKVCache.allocate(
+    num_pages=..., page_size=16, num_kv_heads=8, d_head=128,
+    batch_size=B, max_seq_len_kv=32768,
+    kv_dtype="auto",          <span class="cm"># "auto" (fp16/bf16) | "fp8" | "int4"</span>
+    k_scale=0.0, v_scale=0.0, <span class="cm"># required &gt; 0 for "fp8"</span>
+    dtype=torch.float16, device="cuda")</code></pre>
+<p>Or wrap existing pools by constructing the dataclass directly
+(<code>k_pool/v_pool</code>, <code>block_table [B, max_blocks]</code>,
+<code>seq_lens [B]</code>, plus the geometry fields). The <strong>caller
+mutates</strong> <code>block_table</code>, <code>seq_lens</code>, and pool
+contents in place as sequences grow — that is the supported pattern.</p>
+<pre><code>cache.write(k_new, v_new, slot_mapping)
+<span class="cm">#   k_new/v_new : [num_tokens, H_kv, D]      (quantized per cache.kv_dtype)</span>
+<span class="cm">#   slot_mapping: [num_tokens] int32, page_id*page_size + slot; &lt; 0 skips</span>
+
+o = cache.attend(q, *,
+    cu_seqlens_q=None,   <span class="cm"># None / max_seqlen_q == 1 → decode</span>
+    max_seqlen_q=1,      <span class="cm"># &gt; 1 → chunked prefill ("auto" caches only)</span>
+    causal=True, scale=0.0,
+    num_splits=0)        <span class="cm"># decode split-KV; 0 = auto</span>
+<span class="cm">#   decode: q is [B, H_q, D]; prefill: q packed [total_q, H_q, D]</span></code></pre>
+<p>Decode scratch is managed by the object automatically. For custom
+integration the raw operators are exposed as
+<code>torch.ops.fa_ptx.attention</code>, <code>.cache_attention</code>,
+<code>.cache_write</code>, and <code>.cache_scratch_bytes</code> — the
+wrappers above are thin conveniences over them.</p>
+
+<h2><span class="no">10</span>Going deeper</h2>
 <ul>
   <li><a href="api-guide.md">api-guide.md</a> — every struct field and control lever.</li>
   <li>Header of <code>kernels/flash_attention.cu</code> — kernel design and the dispatch crossover tables.</li>
