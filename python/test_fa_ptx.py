@@ -130,6 +130,63 @@ def t_paged(kv_dtype, thr):
     return cache, q
 
 
+# --- 3b. fused-RoPE cache write ----------------------------------------------
+def fresh_cache(kv_dtype, B, Hkv, D, lens, ps=16):
+    """Empty cache + flat slot mapping (sequential pages), nothing written."""
+    max_k = max(lens)
+    cache = fa_ptx.PagedKVCache.allocate(
+        num_pages=B * ((max_k + ps - 1) // ps) + 2, page_size=ps,
+        num_kv_heads=Hkv, d_head=D, batch_size=B, max_seq_len_kv=max_k,
+        kv_dtype=kv_dtype, k_scale=0.02, v_scale=0.02)
+    mb = cache.block_table.shape[1]
+    cache.block_table.copy_(
+        torch.arange(B * mb, dtype=torch.int32).reshape(B, mb).cuda())
+    cache.seq_lens.copy_(torch.tensor(lens, dtype=torch.int32).cuda())
+    slots = [b * mb * ps + t for b, ln in enumerate(lens) for t in range(ln)]
+    return cache, torch.tensor(slots, dtype=torch.int32, device="cuda")
+
+
+def rope_tables(max_pos, D, base=10000.0):
+    inv = 1.0 / (base ** (torch.arange(0, D, 2, dtype=torch.float32) / D))
+    ang = torch.outer(torch.arange(max_pos, dtype=torch.float32), inv)
+    return ang.cos().cuda(), ang.sin().cuda()
+
+
+def rope_rotate(k, cos, sin, pos):
+    """NeoX/Llama half-rotation reference in fp32: k [T,Hkv,D], pos [T]."""
+    c = cos[pos.long()].unsqueeze(1)  # [T,1,D/2]
+    s = sin[pos.long()].unsqueeze(1)
+    x1, x2 = k.float().chunk(2, dim=-1)
+    return torch.cat([x1 * c - x2 * s, x2 * c + x1 * s], dim=-1)
+
+
+def t_rope(kv_dtype, thr):
+    B, Hq, Hkv, D = 2, 32, 8, 128
+    lens = [100, 37]
+    cos, sin = rope_tables(max(lens), D)
+    pos = torch.cat([torch.arange(ln) for ln in lens]).to(torch.int32).cuda()
+    k_raw = torch.randn(sum(lens), Hkv, D, device="cuda", dtype=torch.float16)
+    v_raw = torch.randn_like(k_raw)
+
+    cache, slots = fresh_cache(kv_dtype, B, Hkv, D, lens)
+    cache.write(k_raw, v_raw, slots, rope_cos=cos, rope_sin=sin,
+                positions=pos)
+
+    k_ref = rope_rotate(k_raw, cos, sin, pos)  # fp32, full precision
+    ks, vs = list(k_ref.split(lens)), list(v_raw.split(lens))
+    q = torch.randn(B, Hq, D, device="cuda", dtype=torch.float16)
+    o = cache.attend(q)
+    e = nrmse(o, decode_ref(q, ks, vs, lens, Hq, Hkv))
+    check(f"rope-fused write ({kv_dtype})", e < thr, f"nrmse={e:.5f}")
+
+    if kv_dtype == "auto":  # fused rotation == rotate-then-plain-write
+        cache2, slots2 = fresh_cache(kv_dtype, B, Hkv, D, lens)
+        cache2.write(k_ref.half(), v_raw, slots2)
+        d = (cache.k_pool.float() - cache2.k_pool.float()).abs().max().item()
+        check("rope fused == pre-rotated pool (fp16)", d < 2e-3,
+              f"maxabs={d:.5f}")
+
+
 # --- 4. torch.compile: fullgraph trace through our ops -----------------------
 def t_compile():
     B, H, S, D = 2, 8, 512, 128
@@ -206,6 +263,49 @@ def t_cuda_graph():
           f"nrmse={e1:.5f}")
 
 
+# --- 5b. CaptureCache: bucketed graphs, routing, replay after growth ---------
+def t_capture_cache():
+    B, Hq, Hkv, D = 4, 32, 8, 128
+    lens = [257, 130, 47, 16]
+    cache, ks, vs = make_cache_and_ref("auto", B, Hq, Hkv, D, lens)
+    cc = fa_ptx.CaptureCache(cache, num_heads=Hq, buckets=(2, 4))
+
+    # full batch -> captures bucket 4
+    q4 = torch.randn(B, Hq, D, device="cuda", dtype=torch.float16)
+    o4 = cc.decode(q4).clone()
+    torch.cuda.synchronize()
+    e = nrmse(o4, decode_ref(q4, ks, vs, lens, Hq, Hkv))
+    check("capture-cache B=4 -> bucket 4", e < 1e-3, f"nrmse={e:.5f}")
+
+    # small batch -> captures bucket 2 (prefix views of the same device state)
+    q2 = torch.randn(2, Hq, D, device="cuda", dtype=torch.float16)
+    o2 = cc.decode(q2).clone()
+    torch.cuda.synchronize()
+    e = nrmse(o2, decode_ref(q2, ks[:2], vs[:2], lens[:2], Hq, Hkv))
+    check("capture-cache B=2 -> bucket 2", e < 1e-3, f"nrmse={e:.5f}")
+
+    # grow seq 1 IN PLACE, then B=3 must route UP to bucket 4 and replay the
+    # already-captured graph (no recapture) with the grown state visible
+    n_graphs = len(cc._graphs)
+    new_k = torch.randn(1, Hkv, D, device="cuda", dtype=torch.float16)
+    new_v = torch.randn(1, Hkv, D, device="cuda", dtype=torch.float16)
+    ps, mb = cache.k_pool.shape[1], cache.block_table.shape[1]
+    slot = 1 * mb * ps + lens[1]
+    cache.write(new_k, new_v,
+                torch.tensor([slot], dtype=torch.int32, device="cuda"))
+    cache.seq_lens[1] += 1
+    ks[1] = torch.cat([ks[1], new_k]); vs[1] = torch.cat([vs[1], new_v])
+    lens[1] += 1
+
+    q3 = torch.randn(3, Hq, D, device="cuda", dtype=torch.float16)
+    o3 = cc.decode(q3).clone()
+    torch.cuda.synchronize()
+    e = nrmse(o3, decode_ref(q3, ks[:3], vs[:3], lens[:3], Hq, Hkv))
+    ok = e < 1e-3 and len(cc._graphs) == n_graphs
+    check("capture-cache B=3 -> bucket 4, replay after growth", ok,
+          f"nrmse={e:.5f} graphs={len(cc._graphs)}")
+
+
 # --- 6. inference-only guard fires eagerly ----------------------------------
 def t_grad_guard():
     q = torch.randn(1, 4, 128, 64, device="cuda", dtype=torch.float16,
@@ -229,8 +329,12 @@ if __name__ == "__main__":
     t_paged("auto", 1e-3)
     t_paged("fp8", 5e-2)
     t_paged("int4", 1.5e-1)
+    t_rope("auto", 1e-3)
+    t_rope("fp8", 5e-2)
+    t_rope("int4", 1.5e-1)
     t_compile()
     t_cuda_graph()
+    t_capture_cache()
     t_grad_guard()
     print("\n" + ("ALL OK" if not FAILURES else
                   f"!!! {len(FAILURES)} FAILURES: {FAILURES}"))

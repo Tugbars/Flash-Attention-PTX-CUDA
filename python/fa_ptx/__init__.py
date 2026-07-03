@@ -77,7 +77,8 @@ def _cache_attention_fake(q, k_pool, v_pool, k_scales, v_scales, block_table,
 @torch.library.register_fake("fa_ptx::cache_write")
 def _cache_write_fake(k_new, v_new, k_pool, v_pool, k_scales, v_scales,
                       block_table, seq_lens, slot_mapping, d_head,
-                      max_seq_len_kv, kv_dtype, k_scale, v_scale):
+                      max_seq_len_kv, kv_dtype, k_scale, v_scale,
+                      rope_cos=None, rope_sin=None, positions=None):
     return None
 
 
@@ -182,13 +183,23 @@ class PagedKVCache:
 
     # -- operations ----------------------------------------------------------
     def write(self, k_new: torch.Tensor, v_new: torch.Tensor,
-              slot_mapping: torch.Tensor) -> None:
-        """Append packed [num_tokens, H_kv, D] K/V (quantizes per kv_dtype)."""
+              slot_mapping: torch.Tensor, *,
+              rope_cos: Optional[torch.Tensor] = None,
+              rope_sin: Optional[torch.Tensor] = None,
+              positions: Optional[torch.Tensor] = None) -> None:
+        """Append packed [num_tokens, H_kv, D] K/V (quantizes per kv_dtype).
+
+        Fused RoPE (optional, all three or none): rotates K (NeoX/Llama
+        half-rotation) before quantization; V is never rotated. rope_cos /
+        rope_sin are float32 [max_pos, D/2] tables, positions is int32
+        [num_tokens]. Pass pre-rotated K with these left as None to keep the
+        plain write path (bit-identical to before).
+        """
         _ops.cache_write(k_new, v_new, self.k_pool, self.v_pool,
                          self.k_scales, self.v_scales, self.block_table,
                          self.seq_lens, slot_mapping, self.d_head,
                          self.max_seq_len_kv, self.kv_dtype, self.k_scale,
-                         self.v_scale)
+                         self.v_scale, rope_cos, rope_sin, positions)
 
     def attend(
         self,
@@ -226,5 +237,69 @@ class PagedKVCache:
     _scratch_key: tuple = field(default=(), repr=False)
 
 
-__all__ = ["attention", "PagedKVCache", "KV_AUTO", "KV_FP8_E4M3",
-           "KV_INT4_G32"]
+class CaptureCache:
+    """CUDA-graph bucketing for the decode step.
+
+    Captures one graph per batch-size bucket and replays on subsequent calls
+    — per-token CPU launch cost drops to a single graph replay. Contract:
+
+      * the PagedKVCache must be allocated with batch_size >= max(buckets);
+      * active sequences occupy slots [0, B) (compact them); slots >= B are
+        idle whenever their seq_lens entry is 0 (the kernels write zeros for
+        length-0 sequences by design);
+      * grow/shrink sequences by mutating cache.seq_lens / cache.block_table
+        / pool contents IN PLACE — captured graphs see the updates;
+      * the returned tensor is a view of the bucket's static output buffer,
+        valid until the next decode() on the same bucket (clone to keep).
+    """
+
+    def __init__(self, cache: PagedKVCache, num_heads: int,
+                 buckets=(1, 2, 4, 8, 16, 32), dtype=torch.float16,
+                 device="cuda"):
+        bmax = cache.seq_lens.shape[0]
+        self.cache = cache
+        self.num_heads = num_heads
+        self.dtype = dtype
+        self.device = device
+        self.buckets = sorted(b for b in buckets if b <= bmax)
+        if not self.buckets or self.buckets[-1] < bmax:
+            self.buckets = sorted(set(self.buckets) | {bmax})
+        self._graphs = {}  # bucket -> (graph, static_q, static_o)
+
+    def _capture(self, b: int):
+        c = self.cache
+        q = torch.zeros(b, self.num_heads, c.d_head, dtype=self.dtype,
+                        device=self.device)
+        # per-bucket prefix VIEWS share device storage with the live arrays
+        view = PagedKVCache(
+            k_pool=c.k_pool, v_pool=c.v_pool,
+            block_table=c.block_table[:b], seq_lens=c.seq_lens[:b],
+            d_head=c.d_head, max_seq_len_kv=c.max_seq_len_kv,
+            kv_dtype=c.kv_dtype, k_scale=c.k_scale, v_scale=c.v_scale,
+            k_scales=c.k_scales, v_scales=c.v_scales)
+        # warmup on a side stream (required before capture), then capture
+        view.attend(q)
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            view.attend(q)
+        torch.cuda.current_stream().wait_stream(s)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            o = view.attend(q)
+        self._graphs[b] = (g, q, o)
+
+    def decode(self, q: torch.Tensor) -> torch.Tensor:
+        """One decode step for q = [B, H_q, D]; B <= max bucket."""
+        B = q.shape[0]
+        bucket = next(b for b in self.buckets if b >= B)
+        if bucket not in self._graphs:
+            self._capture(bucket)
+        g, static_q, static_o = self._graphs[bucket]
+        static_q[:B].copy_(q)
+        g.replay()
+        return static_o[:B]
+
+
+__all__ = ["attention", "PagedKVCache", "CaptureCache", "KV_AUTO",
+           "KV_FP8_E4M3", "KV_INT4_G32"]

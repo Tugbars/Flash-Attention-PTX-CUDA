@@ -1380,22 +1380,43 @@ void launch_flash_attention_decode_paged(const FlashDecodePagedParams &p) {
 // pools via slot_mapping (flat slot = page * page_size + offset; negative
 // skips). FP8 caches quantize on the way: fp8(x / scale), saturating.
 // ============================================================================
-template <class T, class TKV>
-__global__ void kv_cache_write_kernel(const T *__restrict__ K_new,
-                                      const T *__restrict__ V_new,
-                                      TKV *__restrict__ Kc,
-                                      TKV *__restrict__ Vc,
-                                      const int *__restrict__ slot_mapping,
-                                      int hd, float k_inv, float v_inv) {
+template <class T, class TKV, bool ROPE>
+__global__ void kv_cache_write_kernel(
+    const T *__restrict__ K_new, const T *__restrict__ V_new,
+    TKV *__restrict__ Kc, TKV *__restrict__ Vc,
+    const int *__restrict__ slot_mapping, int H_kv, int D,
+    const float *__restrict__ rope_cos, const float *__restrict__ rope_sin,
+    const int *__restrict__ positions, float k_inv, float v_inv) {
   const int t = blockIdx.x;
   const int slot = slot_mapping[t];
   if (slot < 0)
     return;
+  const int hd = H_kv * D;
   const size_t src = (size_t)t * hd;
   const size_t dst = (size_t)slot * hd;
-  for (int i = threadIdx.x; i < hd; i += blockDim.x) {
-    Kc[dst + i] = float_to_kv<TKV>(elem_to_float(K_new[src + i]) * k_inv);
+
+  // V: plain copy (never rotated)
+  for (int i = threadIdx.x; i < hd; i += blockDim.x)
     Vc[dst + i] = float_to_kv<TKV>(elem_to_float(V_new[src + i]) * v_inv);
+
+  if constexpr (!ROPE) {
+    for (int i = threadIdx.x; i < hd; i += blockDim.x)
+      Kc[dst + i] = float_to_kv<TKV>(elem_to_float(K_new[src + i]) * k_inv);
+  } else {
+    // NeoX/Llama half-rotation, fused before quantization: one thread per
+    // (head, d < D/2) pair writes both rotated halves.
+    const int half_d = D / 2;
+    const float *c = rope_cos + (size_t)positions[t] * half_d;
+    const float *s = rope_sin + (size_t)positions[t] * half_d;
+    for (int i = threadIdx.x; i < H_kv * half_d; i += blockDim.x) {
+      const int h = i / half_d, d = i - h * half_d;
+      const float x1 = elem_to_float(K_new[src + (size_t)h * D + d]);
+      const float x2 = elem_to_float(K_new[src + (size_t)h * D + d + half_d]);
+      const float k1 = x1 * c[d] - x2 * s[d];
+      const float k2 = x2 * c[d] + x1 * s[d];
+      Kc[dst + (size_t)h * D + d] = float_to_kv<TKV>(k1 * k_inv);
+      Kc[dst + (size_t)h * D + d + half_d] = float_to_kv<TKV>(k2 * k_inv);
+    }
   }
 }
 
@@ -1403,22 +1424,43 @@ __global__ void kv_cache_write_kernel(const T *__restrict__ K_new,
 // min/max, rounds (scale, zero) to half FIRST (dequant uses the half-rounded
 // values, so quantization must too — otherwise writer and reader disagree),
 // then packs 16 nibble-pairs.
+// Rotated K read for the int4 writer: channel d of head-base `khead`,
+// NeoX/Llama half-rotation with per-position cos/sin rows.
 template <class T>
+__device__ __forceinline__ float rope_k_at(const T *khead, int d, int D,
+                                           const float *c, const float *s) {
+  const int half_d = D / 2;
+  if (d < half_d) {
+    const float x1 = elem_to_float(khead[d]);
+    const float x2 = elem_to_float(khead[d + half_d]);
+    return x1 * c[d] - x2 * s[d];
+  }
+  const int dd = d - half_d;
+  const float x1 = elem_to_float(khead[dd]);
+  const float x2 = elem_to_float(khead[d]);
+  return x2 * c[dd] + x1 * s[dd];
+}
+
+template <class T, bool ROPE>
 __global__ void kv_cache_write_int4_kernel(
     const T *__restrict__ K_new, const T *__restrict__ V_new,
     uint8_t *__restrict__ Kp, uint8_t *__restrict__ Vp,
     __half2 *__restrict__ Ks, __half2 *__restrict__ Vs,
-    const int *__restrict__ slot_mapping, int H_kv, int D) {
+    const int *__restrict__ slot_mapping, int H_kv, int D,
+    const float *__restrict__ rope_cos, const float *__restrict__ rope_sin,
+    const int *__restrict__ positions) {
   const int t = blockIdx.x;
   const int slot = slot_mapping[t];
   if (slot < 0)
     return;
   const int ng = D / 32;
   const int total_groups = H_kv * ng;
+  const float *rc = ROPE ? rope_cos + (size_t)positions[t] * (D / 2) : nullptr;
+  const float *rs = ROPE ? rope_sin + (size_t)positions[t] * (D / 2) : nullptr;
 
   for (int idx = threadIdx.x; idx < total_groups; idx += blockDim.x) {
     const int h = idx / ng, g = idx - h * ng;
-    const T *ksrc = K_new + ((size_t)t * H_kv + h) * D + g * 32;
+    const T *khead = K_new + ((size_t)t * H_kv + h) * D;
     const T *vsrc = V_new + ((size_t)t * H_kv + h) * D + g * 32;
     uint8_t *kdst = Kp + ((size_t)slot * H_kv + h) * (D / 2) + g * 16;
     uint8_t *vdst = Vp + ((size_t)slot * H_kv + h) * (D / 2) + g * 16;
@@ -1427,7 +1469,9 @@ __global__ void kv_cache_write_int4_kernel(
     float kmn = FLT_MAX, kmx = -FLT_MAX, vmn = FLT_MAX, vmx = -FLT_MAX;
 #pragma unroll
     for (int i = 0; i < 32; i++) {
-      kv0[i] = elem_to_float(ksrc[i]);
+      const int ch = g * 32 + i;
+      kv0[i] = ROPE ? rope_k_at(khead, ch, D, rc, rs)
+                    : elem_to_float(khead[ch]);
       vv0[i] = elem_to_float(vsrc[i]);
       kmn = fminf(kmn, kv0[i]);
       kmx = fmaxf(kmx, kv0[i]);
@@ -1464,37 +1508,79 @@ __global__ void kv_cache_write_int4_kernel(
   }
 }
 
+namespace {
+
+// Dispatch helper: T x TKV x ROPE for the generic writer.
+template <class T, class TKV>
+void write_generic(const KvCacheWriteParams &p, bool rope, float k_inv,
+                   float v_inv) {
+  dim3 grid(p.num_tokens);
+  const int hd = p.num_kv_heads * p.d_head;
+  dim3 block(hd < 256 ? hd : 256);
+  const T *Kn = reinterpret_cast<const T *>(p.K_new);
+  const T *Vn = reinterpret_cast<const T *>(p.V_new);
+  TKV *Kc = reinterpret_cast<TKV *>(p.K_cache);
+  TKV *Vc = reinterpret_cast<TKV *>(p.V_cache);
+  if (rope)
+    kv_cache_write_kernel<T, TKV, true><<<grid, block, 0, p.stream>>>(
+        Kn, Vn, Kc, Vc, p.slot_mapping, p.num_kv_heads, p.d_head, p.rope_cos,
+        p.rope_sin, p.positions, k_inv, v_inv);
+  else
+    kv_cache_write_kernel<T, TKV, false><<<grid, block, 0, p.stream>>>(
+        Kn, Vn, Kc, Vc, p.slot_mapping, p.num_kv_heads, p.d_head, nullptr,
+        nullptr, nullptr, k_inv, v_inv);
+}
+
+template <class T>
+void write_int4(const KvCacheWriteParams &p, bool rope) {
+  dim3 grid(p.num_tokens);
+  dim3 block(128);
+  const T *Kn = reinterpret_cast<const T *>(p.K_new);
+  const T *Vn = reinterpret_cast<const T *>(p.V_new);
+  uint8_t *Kp = reinterpret_cast<uint8_t *>(p.K_cache);
+  uint8_t *Vp = reinterpret_cast<uint8_t *>(p.V_cache);
+  __half2 *Ks = reinterpret_cast<__half2 *>(p.K_scales);
+  __half2 *Vs = reinterpret_cast<__half2 *>(p.V_scales);
+  if (rope)
+    kv_cache_write_int4_kernel<T, true><<<grid, block, 0, p.stream>>>(
+        Kn, Vn, Kp, Vp, Ks, Vs, p.slot_mapping, p.num_kv_heads, p.d_head,
+        p.rope_cos, p.rope_sin, p.positions);
+  else
+    kv_cache_write_int4_kernel<T, false><<<grid, block, 0, p.stream>>>(
+        Kn, Vn, Kp, Vp, Ks, Vs, p.slot_mapping, p.num_kv_heads, p.d_head,
+        nullptr, nullptr, nullptr);
+}
+
+} // anonymous namespace
+
 void launch_kv_cache_write(const KvCacheWriteParams &p) {
   if (p.num_tokens <= 0)
     return;
+  const bool rope = (p.rope_cos != nullptr) || (p.rope_sin != nullptr) ||
+                    (p.positions != nullptr);
+  if (rope &&
+      !(p.rope_cos != nullptr && p.rope_sin != nullptr &&
+        p.positions != nullptr)) {
+    fprintf(stderr, "kv_cache_write: fused RoPE requires ALL of rope_cos, "
+                    "rope_sin, positions (or none)\n");
+    abort();
+  }
+  const bool bf16 = (p.dtype == DType::BF16);
+
   if (p.kv_dtype == KvDType::INT4_G32) {
     if (!p.K_scales || !p.V_scales) {
       fprintf(stderr,
               "kv_cache_write: INT4_G32 requires K_scales/V_scales pools\n");
       abort();
     }
-    dim3 grid(p.num_tokens);
-    dim3 block(128);
-    if (p.dtype == DType::BF16)
-      kv_cache_write_int4_kernel<__nv_bfloat16><<<grid, block, 0, p.stream>>>(
-          reinterpret_cast<const __nv_bfloat16 *>(p.K_new),
-          reinterpret_cast<const __nv_bfloat16 *>(p.V_new),
-          reinterpret_cast<uint8_t *>(p.K_cache),
-          reinterpret_cast<uint8_t *>(p.V_cache),
-          reinterpret_cast<__half2 *>(p.K_scales),
-          reinterpret_cast<__half2 *>(p.V_scales), p.slot_mapping,
-          p.num_kv_heads, p.d_head);
+    if (bf16)
+      write_int4<__nv_bfloat16>(p, rope);
     else
-      kv_cache_write_int4_kernel<half><<<grid, block, 0, p.stream>>>(
-          p.K_new, p.V_new, reinterpret_cast<uint8_t *>(p.K_cache),
-          reinterpret_cast<uint8_t *>(p.V_cache),
-          reinterpret_cast<__half2 *>(p.K_scales),
-          reinterpret_cast<__half2 *>(p.V_scales), p.slot_mapping,
-          p.num_kv_heads, p.d_head);
+      write_int4<half>(p, rope);
     CUDA_CHECK(cudaGetLastError());
     return;
   }
-  const int hd = p.num_kv_heads * p.d_head;
+
   const bool fp8 = (p.kv_dtype == KvDType::FP8_E4M3);
   float k_inv = 1.0f, v_inv = 1.0f;
   if (fp8) {
@@ -1507,36 +1593,16 @@ void launch_kv_cache_write(const KvCacheWriteParams &p) {
     k_inv = 1.0f / p.k_scale;
     v_inv = 1.0f / p.v_scale;
   }
-  dim3 grid(p.num_tokens);
-  dim3 block(hd < 256 ? hd : 256);
-  if (p.dtype == DType::BF16) {
-    const __nv_bfloat16 *Kn = reinterpret_cast<const __nv_bfloat16 *>(p.K_new);
-    const __nv_bfloat16 *Vn = reinterpret_cast<const __nv_bfloat16 *>(p.V_new);
+  if (bf16) {
     if (fp8)
-      kv_cache_write_kernel<__nv_bfloat16, __nv_fp8_e4m3>
-          <<<grid, block, 0, p.stream>>>(
-              Kn, Vn, reinterpret_cast<__nv_fp8_e4m3 *>(p.K_cache),
-              reinterpret_cast<__nv_fp8_e4m3 *>(p.V_cache), p.slot_mapping, hd,
-              k_inv, v_inv);
+      write_generic<__nv_bfloat16, __nv_fp8_e4m3>(p, rope, k_inv, v_inv);
     else
-      kv_cache_write_kernel<__nv_bfloat16, __nv_bfloat16>
-          <<<grid, block, 0, p.stream>>>(
-              Kn, Vn, reinterpret_cast<__nv_bfloat16 *>(p.K_cache),
-              reinterpret_cast<__nv_bfloat16 *>(p.V_cache), p.slot_mapping, hd,
-              k_inv, v_inv);
+      write_generic<__nv_bfloat16, __nv_bfloat16>(p, rope, k_inv, v_inv);
   } else {
-    const half *Kn = p.K_new;
-    const half *Vn = p.V_new;
     if (fp8)
-      kv_cache_write_kernel<half, __nv_fp8_e4m3><<<grid, block, 0, p.stream>>>(
-          Kn, Vn, reinterpret_cast<__nv_fp8_e4m3 *>(p.K_cache),
-          reinterpret_cast<__nv_fp8_e4m3 *>(p.V_cache), p.slot_mapping, hd,
-          k_inv, v_inv);
+      write_generic<half, __nv_fp8_e4m3>(p, rope, k_inv, v_inv);
     else
-      kv_cache_write_kernel<half, half><<<grid, block, 0, p.stream>>>(
-          Kn, Vn, reinterpret_cast<half *>(p.K_cache),
-          reinterpret_cast<half *>(p.V_cache), p.slot_mapping, hd, k_inv,
-          v_inv);
+      write_generic<half, half>(p, rope, k_inv, v_inv);
   }
   CUDA_CHECK(cudaGetLastError());
 }

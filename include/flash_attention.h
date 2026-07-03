@@ -361,6 +361,11 @@ struct FaCacheWriteArgs {
   int num_tokens;
   KvCache cache;
   DType dtype;
+  // Optional fused RoPE for K (see KvCacheWriteParams for the convention):
+  // set all three to enable, leave null for a plain write.
+  const float *rope_cos; // [max_position, d_head/2] float32, device
+  const float *rope_sin; // [max_position, d_head/2] float32, device
+  const int *positions;  // [num_tokens] int32, device
   cudaStream_t stream;
 };
 void fa_cache_write(const FaCacheWriteArgs &args);
@@ -387,6 +392,17 @@ struct KvCacheWriteParams {
   float v_scale;
   void *K_scales;   // INT4_G32 only: written by the kernel (group scale/zero)
   void *V_scales;   // INT4_G32 only
+  // Optional fused RoPE, applied to K on the way into the cache (V is never
+  // rotated). All three pointers set = enabled; all null = plain write.
+  // NeoX/Llama half-rotation over the full head dim: for d < D/2,
+  //   k'[d]       = k[d] * cos[d] - k[d + D/2] * sin[d]
+  //   k'[d + D/2] = k[d + D/2] * cos[d] + k[d] * sin[d]
+  // rope_cos / rope_sin: [max_position, D/2] float32, device.
+  // positions: [num_tokens] int32, device — each token's absolute position.
+  // Rotation happens BEFORE quantization (fp8/int4 caches store rotated K).
+  const float *rope_cos;
+  const float *rope_sin;
+  const int *positions;
   cudaStream_t stream;
 };
 

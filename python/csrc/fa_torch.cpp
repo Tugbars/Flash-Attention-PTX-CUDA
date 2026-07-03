@@ -218,13 +218,37 @@ void cache_write(const at::Tensor &k_new, const at::Tensor &v_new,
                  const at::Tensor &block_table, const at::Tensor &seq_lens,
                  const at::Tensor &slot_mapping, int64_t d_head,
                  int64_t max_seq_len_kv, int64_t kv_dtype, double k_scale,
-                 double v_scale) {
+                 double v_scale, const c10::optional<at::Tensor> &rope_cos,
+                 const c10::optional<at::Tensor> &rope_sin,
+                 const c10::optional<at::Tensor> &positions) {
   check_qkv(k_new, "k_new");
   check_qkv(v_new, "v_new");
   TORCH_CHECK(k_new.dim() == 3,
               "fa_ptx: k_new/v_new must be [tokens, kv_heads, d_head]");
   check_inference("cache_write", {&k_new, &v_new});
   const at::cuda::CUDAGuard guard(k_new.device());
+
+  const bool rope = rope_cos.has_value() || rope_sin.has_value() ||
+                    positions.has_value();
+  if (rope) {
+    TORCH_CHECK(rope_cos.has_value() && rope_sin.has_value() &&
+                    positions.has_value(),
+                "fa_ptx: fused RoPE requires ALL of rope_cos, rope_sin, "
+                "positions (or none)");
+    for (const auto *t : {&*rope_cos, &*rope_sin}) {
+      TORCH_CHECK(t->is_cuda() && t->is_contiguous() &&
+                      t->scalar_type() == at::kFloat && t->dim() == 2 &&
+                      t->size(1) == d_head / 2,
+                  "fa_ptx: rope_cos/rope_sin must be contiguous CUDA float32 "
+                  "[max_pos, d_head/2]");
+    }
+    TORCH_CHECK(positions->is_cuda() && positions->is_contiguous() &&
+                    positions->scalar_type() == at::kInt &&
+                    positions->dim() == 1 &&
+                    positions->size(0) == k_new.size(0),
+                "fa_ptx: positions must be contiguous CUDA int32 "
+                "[num_tokens]");
+  }
 
   FaCacheWriteArgs a = {};
   a.K_new = hptr(k_new);
@@ -235,6 +259,11 @@ void cache_write(const at::Tensor &k_new, const at::Tensor &v_new,
                        seq_lens, d_head, max_seq_len_kv, kv_dtype, k_scale,
                        v_scale);
   a.dtype = dtype_of(k_new);
+  if (rope) {
+    a.rope_cos = rope_cos->data_ptr<float>();
+    a.rope_sin = rope_sin->data_ptr<float>();
+    a.positions = iptr(*positions);
+  }
   a.stream = c10::cuda::getCurrentCUDAStream().stream();
   fa_cache_write(a);
 }
@@ -255,7 +284,8 @@ TORCH_LIBRARY(fa_ptx, m) {
         "Tensor(b!) v_pool, Tensor(c!)? k_scales, Tensor(d!)? v_scales, "
         "Tensor block_table, Tensor seq_lens, Tensor slot_mapping, "
         "int d_head, int max_seq_len_kv, int kv_dtype, float k_scale, "
-        "float v_scale) -> ()");
+        "float v_scale, Tensor? rope_cos=None, Tensor? rope_sin=None, "
+        "Tensor? positions=None) -> ()");
   m.def("cache_scratch_bytes(int batch_size, int num_heads, int num_kv_heads, "
         "int d_head, int max_seq_len_kv, int num_splits) -> int");
 }

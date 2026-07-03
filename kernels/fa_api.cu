@@ -223,6 +223,9 @@ void fa_cache_write(const FaCacheWriteArgs &a) {
   p.v_scale = a.cache.v_scale;
   p.K_scales = a.cache.K_scales;
   p.V_scales = a.cache.V_scales;
+  p.rope_cos = a.rope_cos;
+  p.rope_sin = a.rope_sin;
+  p.positions = a.positions;
   p.stream = a.stream;
   launch_kv_cache_write(p);
 }

@@ -156,6 +156,11 @@ w.num_tokens = total_tokens; w.cache = cache;
 fa_cache_write(w);                         // quantizes per cache.kv_dtype
 ```
 
+Optionally fuse RoPE into the write: set `w.rope_cos` / `w.rope_sin`
+(`[max_pos, D/2]` float32 tables) and `w.positions` (`[num_tokens]` int32) —
+K is rotated (NeoX/Llama half-rotation) *before* quantization, V is copied
+untouched. All three set or all three null (null = plain write, unchanged).
+
 **Step 2 — the decode loop.** One query token per sequence; `Q` is
 `[B, H_q, D]` (which is the packed layout with one token each):
 
@@ -284,9 +289,14 @@ pool contents in place as sequences grow — that is the supported pattern.
 Its two methods:
 
 ```python
-cache.write(k_new, v_new, slot_mapping)
+cache.write(k_new, v_new, slot_mapping, *,
+    rope_cos=None, rope_sin=None, positions=None)
 #   k_new/v_new : [num_tokens, H_kv, D]      (quantized per cache.kv_dtype)
 #   slot_mapping: [num_tokens] int32, page_id * page_size + slot; < 0 skips
+#   rope_*      : optional fused RoPE — float32 [max_pos, D/2] cos/sin
+#                 tables + int32 [num_tokens] positions. Rotates K
+#                 (NeoX/Llama half-rotation) BEFORE quantization; V
+#                 untouched. All three or none (none = plain write).
 
 o = cache.attend(q, *,
     cu_seqlens_q=None,   # None / max_seqlen_q == 1 -> decode
@@ -297,6 +307,25 @@ o = cache.attend(q, *,
 ```
 
 Decode scratch is managed by the object automatically.
+
+### `fa_ptx.CaptureCache`
+
+CUDA-graph bucketing for the decode loop — one captured graph per batch
+bucket, replayed on every subsequent step (per-token CPU launch cost becomes
+a single `graph.replay()`):
+
+```python
+cc = fa_ptx.CaptureCache(cache, num_heads=32, buckets=(1, 2, 4, 8, 16, 32))
+o = cc.decode(q)         # q = [B, H_q, D]; routes to the smallest bucket >= B,
+                         # captures on first use, replays afterwards
+```
+
+Contract: allocate the cache with `batch_size >= max(buckets)`; keep active
+sequences compacted in slots `[0, B)` with idle slots' `seq_lens` at 0; grow
+sequences by mutating `seq_lens` / `block_table` / pools **in place** (the
+captured graphs see the updates — no recapture needed); the returned tensor
+is a view of the bucket's static buffer, valid until the next `decode()` on
+that bucket (`.clone()` to keep it).
 
 ### Raw ops
 

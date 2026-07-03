@@ -84,6 +84,15 @@ follows `cache.kv_dtype`: FP8 uses the cache's per-tensor `k_scale/v_scale`
 (calibrate as `max|X| / 448`); INT4_G32 computes per-32-channel group scales
 itself into `cache.K_scales/V_scales`.
 
+**Fused RoPE (optional).** Set `rope_cos` / `rope_sin` — float32
+`[max_position, D/2]` tables — and `positions` — int32 `[num_tokens]`,
+each token's absolute position — and the writer applies the NeoX/Llama
+half-rotation to K **before** quantization, in one pass with the scatter
+(V is never rotated). All three pointers set, or all three null; null keeps
+the plain write path bit-identical to before. Rotating before quantization
+matters for the FP8/INT4 caches: the cache stores post-RoPE K, so dequant
+error is applied once, not compounded through a separate rotation kernel.
+
 ## The `KvCache` descriptor and choosing `kv_dtype`
 
 ```cpp
