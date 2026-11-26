@@ -6,8 +6,8 @@
 <h1 align="center">Flash Attention PTX/CUDA</h1>
 
 <p align="center">
-  <strong>Hand-written PTX flash attention kernel achieving 200+ TFLOPS on RTX 5080</strong><br>
-  up to ~85% of theoretical peak · beats or matches vLLM FlashAttention-2 at 23 of 34 shapes · runs a real LLM end-to-end ahead of vLLM · no WGMMA, no TMA, no shortcuts
+  <strong>Hand-written PTX flash attention kernel reaching 218 TFLOPS on RTX 5080</strong><br>
+  faster than vLLM 0.34's FlashAttention-2 on all 34 benchmarked shapes · runs a real LLM end-to-end ahead of vLLM · no WGMMA, no TMA, no shortcuts
 </p>
 
 <p align="center">
@@ -24,7 +24,7 @@
 
 ## What is this?
 
-A from-scratch flash attention implementation in raw CUDA/PTX targeting consumer NVIDIA GPUs (RTX 5080, Blackwell sm_120). No libraries, no CUTLASS attention wrappers, no cuDNN — just hand-written kernels optimized step by step from 2.7 TFLOPS to 200+ TFLOPS, to the point of beating vLLM's FlashAttention-2 on the majority of measured shapes.
+A from-scratch flash attention implementation in raw CUDA/PTX targeting consumer NVIDIA GPUs (RTX 5080, Blackwell sm_120). No libraries, no CUTLASS attention wrappers, no cuDNN — just hand-written kernels optimized step by step from 2.7 TFLOPS to 218 TFLOPS, to the point of beating vLLM's FlashAttention-2 on every measured shape.
 
 The kernel uses PTX inline assembly for `mma.sync.aligned.m16n8k16` tensor core operations with `ldmatrix` for optimal shared memory → register transfers, and performs the full softmax **in registers** using warp shuffle intrinsics, eliminating the largest shared memory bottleneck in standard flash attention implementations.
 
@@ -36,27 +36,27 @@ Consumer Blackwell (sm_120) lacks the datacenter features that make H100/B200 at
   <img width="1937" height="845" alt="performance" src="https://github.com/user-attachments/assets/7a73c97a-e378-4256-8f7d-96f166ba67ab" />
 </p>
 
-**Peak: ~201 TFLOPS** at B=8, H=12, S=4096, D=64 and at B=8, S=8192, D=128 (causal attention); ~180–187 at the B=8, S=2048 sweet spots. Benchmarked head-to-head against vLLM's FlashAttention-2 in a same-process harness, the production dispatcher **wins or ties 23 of 34 shapes** (winning everywhere at B=1 and at short-to-mid context, within ~5% at the giant batch×context corner) — see [docs/vllm-comparison.md](docs/vllm-comparison.md) for the full methodology and tables.
+**Peak: 218 TFLOPS** at B=8, H=12, S=8192, D=128 and 212 at B=8, S=4096, D=64 (causal attention); ~189–199 at the B=8, S=2048 shapes. Benchmarked head-to-head against vLLM 0.34's FlashAttention-2 in a same-process harness, the production dispatch rule is **faster at all 34 shapes**: by 2.8% at the tightest one (B=8, S=4096, D=64), by 4–8% across the long-context D=128 shapes it used to trail, and by more at short sequences — see [docs/vllm-comparison.md](docs/vllm-comparison.md) for the full methodology, tables and caveats.
 
-| Config | TFLOPS | % Peak | Notes |
-|--------|-------:|-------:|-------|
-| B=1, S=512, D=64 | 48.4 | 20.6% | Small-tile tier (auto-dispatched) |
-| B=1, S=2048, D=64 | 141.3 | 60.2% | |
-| B=4, S=2048, D=64 | 177.0 | 75.4% | |
-| B=8, S=2048, D=128 | 180.1 | 76.7% | |
-| **B=8, S=4096, D=64** | **200.8** | **85.5%** | **Peak, D=64** |
-| **B=8, S=8192, D=128** | **202.4** | **86.2%** | **Peak, D=128** |
+| Config | TFLOPS | vs vLLM 0.34 FA2 | Notes |
+|--------|-------:|-----------------:|-------|
+| B=1, S=512, D=64 | 55.1 | +29.6% | Small-tile tier (auto-dispatched) |
+| B=1, S=2048, D=64 | 149.1 | +16.1% | |
+| B=4, S=2048, D=64 | 187.6 | +9.3% | |
+| B=8, S=2048, D=128 | 189.2 | +8.2% | |
+| **B=8, S=4096, D=64** | **211.6** | **+2.8%** | **Peak, D=64 — the tightest margin of the 34** |
+| **B=8, S=8192, D=128** | **217.9** | **+4.3%** | **Peak, D=128** |
 
-Measured on RTX 5080 (84 SMs, 234.8 TFLOPS FP16 theoretical peak) through the production dispatcher with random fp16 inputs, causal attention, interleaved rounds.
-The fat-warp tier (v12) is **+9–10% over v11** at every saturated shape; the exp2 fold (v13) adds up to +3.5% on top.
+Measured on RTX 5080 (84 SMs), H=12, random fp16 inputs, causal attention, interleaved rounds with vLLM in the same process (2026-11-26). TFLOPS is `4·B·H·S²·D / time` on both sides — the full-attention FLOP count. Causal attention executes about half of that product, so read these as throughput in full-attention equivalents for comparing kernels, not as tensor-core utilization. Shapes that run in well under 0.1 ms (the B=1 and S=512 rows) include per-call overhead on both sides.
+The fat-warp tier (v12) is **+9–10% over v11** at every saturated shape; the exp2 fold (v13) adds up to +3.5% on top; v14 (four-at-a-time operand loads, interior-tile mask skipping) adds **+7–11% at D=128** and +3–6% at D=64 over the kernels it replaced.
 
-Under-saturated workloads (small grids, e.g. B=1 with short sequences) are auto-dispatched to a 32×BN / 4-warp split-N tile that doubles the grid count and fills the SMs; everything saturated runs the fat-warp kernel. See [Architecture](#architecture).
+Under-saturated workloads (small grids, e.g. B=1 with short sequences) are auto-dispatched to a 32×BN / 4-warp split-N tile that doubles the grid count and fills the SMs; everything saturated runs the fat-warp kernel (`split-Q` in the source). See [Architecture](#architecture).
 
-For context, Flash Attention 2 on the A100 (datacenter Ampere) achieves approximately 60% tensor core utilization. This consumer Blackwell kernel reaches up to ~86% of theoretical FP16 peak without WGMMA, TMA, or warp specialization, using only tools available on consumer silicon — the same tensor-pipe utilization Nsight Compute measures for vLLM's FlashAttention-2 on this GPU.
+For context, Flash Attention 2 on the A100 (datacenter Ampere) achieves approximately 60% tensor core utilization. Nsight Compute put this kernel's tensor-pipe utilization at ~84% as of v13 — the same figure it measures for vLLM's FlashAttention-2 on this GPU — reached without WGMMA, TMA, or warp specialization, using only tools available on consumer silicon. (v14 has not been re-profiled; its gain came from executing fewer load instructions per matrix multiply.)
 
 ### Optimization progression
 
-Each version identified and eliminated a specific bottleneck. Every change was validated with Nsight Compute profiling.
+Each version identified and eliminated a specific bottleneck. Every change through v13 was validated with Nsight Compute profiling; v14 with paired same-process A/B timing of each change.
 
 | Version | TFLOPS | Bottleneck Removed |
 |---------|-------:|------|
@@ -70,8 +70,9 @@ Each version identified and eliminated a specific bottleneck. Every change was v
 | v11 — Occupancy | 170.5 | Alias P onto K (2→3 blocks/SM) + staged async V load (hides latency) |
 | **v12 — Fat-warp tier** | **~179** | **4-warp split-Q kernel: P never touches smem, pipelined K/V loads — 2.9× fewer instructions/tile** |
 | **v13 — exp2 softmax fold** | **~180–187** | **scale·log2(e) folded into the score multiply; every exp becomes a raw EX2** |
+| **v14 — x4 operand loads + mask skip** | **~189–199** | **K and V loaded four matrices per `ldmatrix` (one load per two MMAs, as FlashAttention-2's CUTLASS-built loop does); only the tiles that need masking are masked — this closed the long-context gap to vLLM** |
 
-(v10–v13 numbers are at B=8, S=2048; v13 peaks at ~201 at B=8, S=4096 D=64 / S=8192 D=128.)
+(v10–v14 numbers are at B=8, S=2048; v14 peaks at 218 at B=8, S=8192, D=128 and 212 at B=8, S=4096, D=64.)
 
 ### Profiler metrics (B=4, S=2048)
 
@@ -200,16 +201,18 @@ flash-attention-cuda/
 ├── include/
 │   └── flash_attention.h           # unified API: 3 callables + KvCache descriptor + params
 ├── kernels/
-│   ├── flash_attention.cu          # both prefill kernels + dispatcher + autotuner lists — the main event
+│   ├── fa_prefill_kernels.cuh      # both prefill kernels (split-Q / fat-warp, split-N / small tile) — the main event
+│   ├── ptx_intrinsics.cuh          # PTX wrappers: mma.sync, ldmatrix (x2/x4, plain/.trans), cp.async
+│   ├── flash_attention.cu          # prefill host side: validation, tile dispatcher, autotuner candidate lists
 │   ├── flash_attention_decode.cu   # split-KV decode, paged/fp8/int4 KV pools, fused-RoPE cache writer
 │   ├── fa_api.cu                   # unified-API facade (validation + routing, zero kernel code)
 │   └── fa_autotune.cu              # autotuner engine (bench → wisdom-file cache)
 ├── python/
 │   ├── fa_ptx/                     # PyTorch bindings: TORCH_LIBRARY ops, PagedKVCache, CaptureCache
 │   ├── csrc/fa_torch.cpp           # op registration (compile- and CUDA-graph-ready)
-│   ├── test_fa_ptx.py              # 19-test binding suite (SDPA parity, compile, graphs, RoPE)
+│   ├── test_fa_ptx.py              # 21-check binding suite (SDPA parity, compile, graphs, RoPE, error returns)
 │   └── e2e_qwen.py                 # Qwen2.5-1.5B end-to-end runner (see above)
-├── tests/                          # 7 C++ validation gates (fp64 references, strict tolerances)
+├── tests/                          # 8 C++ gates: 7 numeric (fp64 references, strict tolerances) + the error contract
 ├── src/
 │   └── demo.cu                     # standalone demo + correctness check
 ├── scripts/
@@ -228,14 +231,14 @@ flash-attention-cuda/
 
 ### Kernel parameters
 
-| Parameter | Fat-warp tier (v12) | Small tile |
-|-----------|--------------------:|-----------:|
+| Parameter | Fat-warp tier (split-Q) | Small tile (split-N) |
+|-----------|------------------------:|---------------------:|
 | BLOCK_M | 64 | 32 |
 | BLOCK_N | 64 | 64 (D=64) / 32 (D=128) |
 | D_HEAD | 64 or 128 | 64 or 128 |
 | NUM_WARPS | 4 (split-Q, one m16 row-tile per warp) | 4 (2 warp pairs, split-N) |
 | Shared memory | ~35 KB at D=128 (K+V only; 2 blocks/SM) | ~23–27 KB |
-| Registers (D=128 causal) | 193, 0 spills | ~90 |
+| Registers (D=128 causal) | 190, 0 spills | 94 |
 | MMA instruction | `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` | (same) |
 | Precision | FP16/BF16 compute, FP32 accumulation | (same) |
 
@@ -249,23 +252,34 @@ if (blocks < SAT_MULT * sm_count)  → small tile (32×BN, 4 warps, split-N)
 else                               → fat-warp kernel (64×64, 4 warps, split-Q)
 ```
 
-with measured crossovers `SAT_MULT = 3` (D=64) / `2` (D=128). The small variant wins on under-saturated workloads by halving BLOCK_M and doubling the grid count, which fills SMs the bigger grid would leave idle (up to +32% over vLLM FA2 at B=1, S=512). Everything saturated goes to the fat-warp kernel (v12 in the [progression table](#optimization-progression)). Per-shape routing tables live in the header of [kernels/flash_attention.cu](kernels/flash_attention.cu), and `params.autotune = true` benchmarks the candidate list once per shape and caches the winner to an FFTW-style wisdom file.
+with measured crossovers `SAT_MULT = 3` (D=64) / `2` (D=128). The small variant wins on under-saturated workloads by halving BLOCK_M and doubling the grid count, which fills SMs the bigger grid would leave idle (+23% to +37% over vLLM FA2 on the three B=1 shapes it serves in the sweep). Everything saturated goes to the fat-warp kernel (v12–v14 in the [progression table](#optimization-progression)). Per-shape routing tables live in the header of [kernels/flash_attention.cu](kernels/flash_attention.cu), and `params.autotune = true` benchmarks the candidate list once per shape and caches the winner to an FFTW-style wisdom file.
 
 ### Shared memory layout
 
+Fat-warp tier (split-Q), D=128 — Q and P live in registers, so only K and V are in shared memory:
+
 ```
-smem_q:            64 × 72 × 2B  =  9.0 KB   Q tile
-smem_k:            64 × 72 × 2B  =  9.0 KB   K tile  ← also holds P (aliased)
-smem_v:            64 × 72 × 2B  =  9.0 KB   V tile
-smem_partial_max:  2 × 64 × 4B   =  0.5 KB   cross-warp max exchange
-smem_partial_sum:  2 × 64 × 4B   =  0.5 KB   cross-warp sum exchange
-                                    --------
-Total:                              ~28 KB   (P reuses K's 9 KB → 3 blocks/SM)
+smem_k:            64 × 136 × 2B  =  17.4 KB   K tile (also stages Q once, in the prologue)
+smem_v:            64 × 136 × 2B  =  17.4 KB   V tile
+                                     --------
+Total:                               ~34.8 KB   → 2 blocks/SM
 ```
 
-P = softmax(S) is written into `smem_k` because K is dead once Q·Kᵀ has been read.
-The full story of why this matters (and every other optimization step) is in the
-[interactive deep-dive](#interactive-deep-dive).
+Small tile (split-N), 32×64 at D=64:
+
+```
+smem_q:            32 × 72 × 2B  =  4.6 KB   Q tile
+smem_k:            64 × 72 × 2B  =  9.2 KB   K tile  ← also holds P (aliased)
+smem_v:            64 × 72 × 2B  =  9.2 KB   V tile
+partial max / sum: 4 × 32 × 4B   =  0.5 KB   cross-warp softmax exchange
+                                    --------
+Total:                              ~23.6 KB
+```
+
+In the small tile, P = softmax(S) is written into `smem_k` because K is dead once Q·Kᵀ has been read
+(on the original 64×64 tile that alias was worth 2 → 3 blocks/SM). Rows are padded by 8 elements in both
+layouts to keep `ldmatrix` off shared-memory bank conflicts. The full story of why this matters (and every
+other optimization step) is in the [interactive deep-dive](#interactive-deep-dive).
 
 ## Correctness
 
