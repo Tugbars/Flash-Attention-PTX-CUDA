@@ -24,7 +24,7 @@
 
 ## What is this?
 
-A from-scratch flash attention implementation in raw CUDA/PTX targeting consumer NVIDIA GPUs (RTX 5080, Blackwell sm_120). No libraries, no CUTLASS attention wrappers, no cuDNN — just hand-written kernels optimized step by step from 2.7 TFLOPS to 218 TFLOPS, to the point of beating vLLM's FlashAttention-2 on every measured shape.
+A from-scratch flash attention implementation in raw CUDA/PTX targeting consumer NVIDIA GPUs like RTX 5080 or 5090. No libraries, no CUTLASS attention wrappers, no cuDNN — just hand-written kernels optimized step by step from 2.7 TFLOPS to 218 TFLOPS, to the point of beating vLLM's FlashAttention-2 on every measured shape.
 
 The kernel uses PTX inline assembly for `mma.sync.aligned.m16n8k16` tensor core operations with `ldmatrix` for optimal shared memory → register transfers, and performs the full softmax **in registers** using warp shuffle intrinsics, eliminating the largest shared memory bottleneck in standard flash attention implementations.
 
