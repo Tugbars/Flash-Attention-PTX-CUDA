@@ -218,51 +218,138 @@ def plot_error_analysis(O_ref, O_gpu, save_path):
 # ============================================================================
 # Figure 4: Performance Progression
 # ============================================================================
-def plot_performance(csv_path, save_path):
-    """Optimization progression bar chart."""
-    versions, tflops_vals, pct_vals = [], [], []
+# The progression chart is one series: every bar is the same kernel, one
+# optimization later. So it uses ONE de-emphasis fill for the history and one
+# accent for the current version (emphasis, not a colour per bar), values at
+# the bar ends, and a reference line for the kernel it is measured against.
+PERF_STYLE = {
+    'history':   '#62677d',   # 3.3:1 on the plot surface
+    'current':   '#d28e05',   # accent, inside the dark-surface lightness band
+    'ink':       COLORS['fg'],
+    'ink2':      '#9a98a6',   # secondary text, 6.6:1 on the plot surface
+    'grid':      '#22222e',   # hairline, one step off the surface
+    'axis':      '#3a3a48',
+    'on_history': '#ffffff',  # label inside a history bar
+    'on_current': '#0b0b0b',  # label inside the accent bar
+}
+# (name, TFLOPS) of the reference kernel at the shape of the last bars.
+PERF_REFERENCE = ('vLLM 0.34 FlashAttention-2', 184.0)
+PERF_FOOTNOTE = (
+    'v1-v9 at B=4, v10-v14 at B=8; all H=12, S=2048, D=64, causal fp16 on an RTX 5080. '
+    'TFLOPS = 4·B·H·S²·D / time.\n'
+    'v13, v14 and vLLM measured in one process on 2026-11-26; earlier bars as recorded '
+    'when each version shipped. Best shape: 218 (B=8, S=8192, D=128).'
+)
+
+
+def plot_performance(csv_path, save_path, reference=PERF_REFERENCE,
+                     footnote=PERF_FOOTNOTE):
+    """Optimization progression: horizontal bars, latest version emphasised."""
+    from matplotlib.patches import FancyBboxPatch, Rectangle
+
+    versions, vals = [], []
     with open(csv_path) as f:
         next(f)  # skip header
         for line in f:
             parts = line.strip().split(',')
+            if len(parts) < 2 or not parts[0]:
+                continue
             versions.append(parts[0])
-            tflops_vals.append(float(parts[1]))
-            pct_vals.append(float(parts[2]))
+            vals.append(float(parts[1]))  # any further columns are ignored
 
-    fig, ax = plt.subplots(figsize=(12, 5), facecolor=COLORS['bg'])
+    st = PERF_STYLE
+    mono = 'monospace'
+    n = len(versions)
+    ref_name, ref_val = reference if reference else (None, 0.0)
+    xmax = max(max(vals), ref_val) * 1.18
 
-    colors = ['#555555', '#887766', COLORS['accent2'], COLORS['accent3'],
-              COLORS['accent'], COLORS['gold']]
-    colors = colors[:len(versions)]
+    fig, ax = plt.subplots(figsize=(12, 0.52 * n + 2.0), facecolor=COLORS['bg'])
+    # Fixed margins (not tight_layout): the rounded bar ends below are sized in
+    # pixels, so the axes must not move after they are measured.
+    fig.subplots_adjust(left=0.165, right=0.975, top=0.885, bottom=0.165)
+    ax.set_facecolor(COLORS['bg2'])
+    ax.set_xlim(0, xmax)
+    ax.set_ylim(n - 0.45, -1.25)          # first version on top, headroom above it
 
-    bars = ax.barh(range(len(versions)), tflops_vals, color=colors, height=0.6,
-                   edgecolor='none', alpha=0.9)
+    # Chrome: solid hairlines, recessive.
+    for side in ('top', 'right', 'left'):
+        ax.spines[side].set_visible(False)
+    ax.spines['bottom'].set_color(st['axis'])
+    ax.spines['bottom'].set_linewidth(0.8)
+    ticks = [t for t in range(0, int(xmax) + 1, 50)]
+    ax.set_xticks(ticks)
+    ax.tick_params(axis='x', colors=st['ink2'], labelsize=9, length=0, pad=6)
+    ax.tick_params(axis='y', length=0, pad=8)
+    for t in ticks[1:]:
+        ax.axvline(t, color=st['grid'], linewidth=0.8, zorder=1)
+    for lab in ax.get_xticklabels():
+        lab.set_fontfamily(mono)
+    ax.set_xlabel('TFLOPS', color=st['ink2'], fontsize=10, fontfamily=mono, labelpad=8)
 
-    # Value labels
-    for i, (bar, tf, pct) in enumerate(zip(bars, tflops_vals, pct_vals)):
-        ax.text(bar.get_width() + 1.5, bar.get_y() + bar.get_height()/2,
-                f'{tf:.1f} TFLOPS ({pct:.0f}%)',
-                color=COLORS['fg'], va='center', fontsize=9, fontweight='bold',
-                fontfamily='monospace')
+    # Reference kernel: a threshold, so it is the one dashed rule. Drawn behind
+    # the bars; a bar that passes it covers it.
+    if ref_name:
+        ax.axvline(ref_val, color=st['ink2'], linewidth=1.1,
+                   linestyle=(0, (5, 4)), zorder=2)
+        ax.text(ref_val + xmax * 0.008, -0.78, f'{ref_name}\n{ref_val:g} TFLOPS, same shape',
+                color=st['ink2'], fontsize=8.5, fontfamily=mono, va='center',
+                ha='left', linespacing=1.35)
 
-    ax.set_yticks(range(len(versions)))
-    ax.set_yticklabels(versions, fontfamily='monospace')
-    ax.invert_yaxis()
-    style_axis(ax, 'Flash Attention Optimization Progression')
-    ax.set_xlabel('TFLOPS (FP16)', color=COLORS['dim'], fontsize=10)
-    ax.set_xlim(0, max(tflops_vals) * 1.35)
+    # Bars: square at the baseline, rounded at the data end, capped thickness.
+    fig.canvas.draw()
+    box = ax.get_window_extent()
+    px_per_x = box.width / xmax
+    px_per_y = box.height / abs(ax.get_ylim()[0] - ax.get_ylim()[1])
+    bar_h = min(0.6, 46.0 / px_per_y)                 # <= ~46 px at 150 dpi
+    r_x = 8.0 / px_per_x                              # 8 px corner radius
+    aspect = px_per_x / px_per_y                      # makes the corner circular
+    for i, v in enumerate(vals):
+        fill = st['current'] if i == n - 1 else st['history']
+        y0 = i - bar_h / 2
+        if v > 2.5 * r_x:
+            ax.add_patch(FancyBboxPatch(
+                (0, y0), v, bar_h, boxstyle=f'round,pad=0,rounding_size={r_x}',
+                mutation_aspect=aspect, facecolor=fill, edgecolor='none', zorder=3))
+            ax.add_patch(Rectangle((0, y0), v - r_x, bar_h, facecolor=fill,
+                                   edgecolor='none', zorder=3))
+        else:
+            ax.add_patch(Rectangle((0, y0), v, bar_h, facecolor=fill,
+                                   edgecolor='none', zorder=3))
 
-    # Speedup annotation
-    if len(tflops_vals) >= 2:
-        speedup = tflops_vals[-1] / tflops_vals[0]
-        ax.annotate(f'{speedup:.0f}× total speedup',
-                    xy=(tflops_vals[-1], len(versions)-1),
-                    xytext=(tflops_vals[-1] * 0.6, 0.5),
-                    color=COLORS['gold'], fontsize=11, fontweight='bold',
-                    arrowprops=dict(arrowstyle='->', color=COLORS['gold'], lw=1.5))
+        # Value at the data end: inside the bar when it fits, else just past it.
+        label = f'{v:g}'
+        last = (i == n - 1)
+        inside = v * px_per_x > 16 * len(label) + 30
+        ax.text(v - 9.0 / px_per_x if inside else v + 8.0 / px_per_x, i, label,
+                color=(st['on_current'] if last else st['on_history']) if inside else st['ink'],
+                ha='right' if inside else 'left', va='center',
+                fontsize=11 if last else 9.5, fontweight='bold',
+                fontfamily=mono, zorder=4)
 
-    plt.tight_layout()
-    fig.savefig(save_path, dpi=150, bbox_inches='tight',
+    # Version names: secondary ink, the current one in primary.
+    ax.set_yticks(range(n))
+    ax.set_yticklabels(versions, fontfamily=mono, fontsize=10)
+    for i, lab in enumerate(ax.get_yticklabels()):
+        lab.set_color(st['ink'] if i == n - 1 else st['ink2'])
+        lab.set_fontweight('bold' if i == n - 1 else 'normal')
+
+    # Headline figure, in the space the short early bars leave free.
+    if n >= 2 and vals[0] > 0:
+        hx = xmax * 0.30
+        ax.text(hx, 1.05, f'{vals[-1] / vals[0]:.0f}×', color=st['ink'], fontsize=30,
+                fontweight='bold', fontfamily=mono, ha='left', va='center')
+        ax.text(hx + xmax * 0.105, 1.05,
+                f'faster than the scalar baseline\n{vals[0]:g} → {vals[-1]:g} TFLOPS',
+                color=st['ink2'], fontsize=9.5, fontfamily=mono, ha='left',
+                va='center', linespacing=1.4)
+
+    ax.set_title('Flash Attention Optimization Progression', color=st['ink'],
+                 fontsize=14, fontweight='bold', fontfamily=mono, pad=14)
+    if footnote:
+        fig.text(0.165, 0.03, footnote, color=st['ink2'], fontsize=7.6,
+                 fontfamily=mono, ha='left', va='bottom', linespacing=1.5)
+
+    fig.savefig(save_path, dpi=150, bbox_inches='tight', pad_inches=0.25,
                 facecolor=COLORS['bg'], edgecolor='none')
     plt.close()
     print(f"  Saved {save_path}")

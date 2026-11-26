@@ -359,16 +359,25 @@ int main() {
     write_binary("k_data.bin", h_K.data(), B, H, S, D);
     write_binary("v_data.bin", h_V.data(), B, H, S, D);
 
-    // Performance data for chart — actual benchmark results at B=4, H=12, S=2048, D=64
+    // Performance data for the progression chart: recorded benchmark results,
+    // TFLOPS = 4*B*H*S^2*D / time, H=12, S=2048, D=64, causal fp16. v1-v9 at
+    // B=4, v10-v14 at B=8. v13 and v14 are from the same-process sweep against
+    // vLLM (docs/vllm-comparison.md); earlier rows are as recorded when each
+    // version shipped. Keep in sync with scripts/perf_data.csv.
     {
         std::ofstream f("perf_data.csv");
-        f << "version,tflops,pct_peak\n";
-        f << "Scalar Baseline,2.7," << (2.7/peak_tflops*100) << "\n";
-        f << "WMMA v3,26.7," << (26.7/peak_tflops*100) << "\n";
-        f << "Vectorized v6,38.3," << (38.3/peak_tflops*100) << "\n";
-        f << "PTX MMA v7,49.2," << (49.2/peak_tflops*100) << "\n";
-        f << "In-Register v8,125.2," << (125.2/peak_tflops*100) << "\n";
-        f << "Corrected v9,135.9," << (135.9/peak_tflops*100) << "\n";
+        f << "version,tflops\n";
+        f << "Scalar Baseline,2.7\n";
+        f << "WMMA v3,26.7\n";
+        f << "Vectorized v6,38.3\n";
+        f << "PTX MMA v7,49.2\n";
+        f << "In-Register v8,125.2\n";
+        f << "Rescale v9,135.9\n";
+        f << "cp.async v10,156.4\n";
+        f << "Overlap v11,170.5\n";
+        f << "Fat-warp v12,179\n";
+        f << "exp2 fold v13,185\n";
+        f << "x4 loads v14,198.7\n";
         f.close();
         printf("  Wrote perf_data.csv\n");
     }

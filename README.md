@@ -33,7 +33,7 @@ Consumer Blackwell (sm_120) lacks the datacenter features that make H100/B200 at
 ## Performance
 
 <p align="center">
-  <img width="1937" height="845" alt="performance" src="https://github.com/user-attachments/assets/7a73c97a-e378-4256-8f7d-96f166ba67ab" />
+  <img width="1739" alt="Optimization progression: 2.7 TFLOPS (scalar baseline) to 198.7 TFLOPS (v14), past vLLM 0.34 FlashAttention-2 at 184" src="scripts/figures/performance.png" />
 </p>
 
 **Peak: 218 TFLOPS** at B=8, H=12, S=8192, D=128 and 212 at B=8, S=4096, D=64 (causal attention); ~189–199 at the B=8, S=2048 shapes. Benchmarked head-to-head against vLLM 0.34's FlashAttention-2 in a same-process harness, the production dispatch rule is **faster at all 34 shapes**: by 2.8% at the tightest one (B=8, S=4096, D=64), by 4–8% across the long-context D=128 shapes it used to trail, and by more at short sequences — see [docs/vllm-comparison.md](docs/vllm-comparison.md) for the full methodology, tables and caveats.
