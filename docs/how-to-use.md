@@ -20,9 +20,10 @@ see the [README](../README.md) and [vllm-comparison.md](vllm-comparison.md).
 - **Paged KV cache** with block tables, per-sequence lengths, and optional
   **FP8** (2× smaller, ~1.8× faster decode) or **INT4** (4× smaller)
   quantization — plus the cache-write kernel that quantizes on the way in.
-- **Chunked prefill** over the paged cache (multi-turn serving).
-- Seven correctness gates that validate all of it against double-precision
-  references.
+- **Chunked prefill** over the paged cache (multi-turn serving), on fp16/bf16,
+  FP8 and INT4 caches alike.
+- Eight correctness gates that validate all of it against double-precision
+  references, plus one for the error contract.
 
 Requirements: CUDA 12.0+ (13.x tested), CMake 3.20+, a GPU with compute
 capability 8.0+ (tuned on RTX 5080 / sm_120).
@@ -204,8 +205,11 @@ p.batch_size = B; p.num_heads = 32; p.causal = true;
 fa_cache_attention(p);
 ```
 
-Note: chunked prefill currently requires an AUTO (fp16/bf16) cache;
-quantized caches are decode-only for now.
+This works on every cache type. On an FP8 or INT4 cache the kernel
+dequantizes K/V on the way into its shared-memory tiles and then runs the
+same fp16/bf16 attention, so the chunk attends the values the cache actually
+holds — the same values decode will read on the following steps. It costs
+about 1.0–1.25× the time of the same chunk on an fp16 cache (RTX 5080).
 
 ## 7. Choosing a KV-cache dtype
 
@@ -229,11 +233,11 @@ pass):
 ```bash
 cmake --build . --target fa_validate fa_varlen_validate fa_paged_validate \
                         fa_fp8_validate fa_int4_validate \
-                        fa_paged_prefill_validate fa_api_validate \
-                        fa_error_validate
+                        fa_paged_prefill_validate fa_quant_prefill_validate \
+                        fa_api_validate fa_error_validate
 ./fa_validate && ./fa_varlen_validate && ./fa_paged_validate && \
 ./fa_fp8_validate && ./fa_int4_validate && ./fa_paged_prefill_validate && \
-./fa_api_validate && ./fa_error_validate
+./fa_quant_prefill_validate && ./fa_api_validate && ./fa_error_validate
 ```
 
 The gates enforce a strict policy (random std=1 inputs, double-precision
@@ -253,9 +257,8 @@ that line to stderr (from Python: a `RuntimeError`, with the line on stderr).
 | error: `... requires scratch` | decode called without `fa_cache_attention_scratch_bytes` allocation |
 | error: `FP8 ... requires k_scale/v_scale > 0` | forgot to set scales on the `KvCache` (zero-init default is 0) |
 | error: `INT4_G32 ... requires K_scales/V_scales` | scale pools not allocated/attached |
-| error: `quantized caches ... decode-only` | chunked prefill on an FP8/INT4 cache — use an AUTO cache for prefill |
 | error: `d_head must be 64 or 128` | only 64 and 128 are compiled |
-| error: `launch failed: invalid argument` | a tensor is not 16-byte aligned (e.g. a pointer offset by part of a row), or `batch_size * num_heads > 65535` |
+| error: `launch failed: invalid argument` | a tensor or cache pool is not 16-byte aligned (e.g. a pointer offset by part of a row), an INT4 scale pool is not 4-byte aligned, or `batch_size * num_heads > 65535` |
 | output never written, no crash | the returned `cudaError_t` was ignored — check it |
 | garbage output, no error | index arrays passed as host memory, stale `block_table`/`seq_lens`, or K/V not written to the cache before a prefill chunk |
 | decode output all zeros for one sequence | its `seq_lens[b]` is 0 — by design (nothing to attend) |

@@ -210,8 +210,11 @@ p.cu_seqlens_q = cu_chunk;
 p.max_seqlen_q = max_chunk_len;        <span class="cm">// &gt; 1 → chunked-prefill path</span>
 p.batch_size = B; p.num_heads = 32; p.causal = true;
 fa_cache_attention(p);</code></pre>
-<div class="warn">Chunked prefill currently requires an AUTO (fp16/bf16)
-cache; FP8/INT4 caches are decode-only for now.</div>
+<p>This works on every cache type. On an FP8 or INT4 cache the kernel
+dequantizes K/V on the way into its shared-memory tiles and then runs the same
+fp16/bf16 attention, so the chunk attends the values the cache actually holds
+— the same values decode will read on the following steps. It costs about
+1.0–1.25× the time of the same chunk on an fp16 cache (RTX 5080).</p>
 
 <h2><span class="no">6</span>Choosing a KV-cache dtype</h2>
 <table>
@@ -226,14 +229,14 @@ better, and both formats add <em>zero kernel error</em> on top of the
 quantization itself.</p>
 
 <h2><span class="no">7</span>Validate and benchmark</h2>
-<p>Seven independent gates validate everything against double-precision
+<p>Eight independent gates validate everything against double-precision
 references under a strict policy (random std=1 inputs, thresholds ~4× the
-noise floor), and an eighth checks the error contract (every rejected argument
+noise floor), and a ninth checks the error contract (every rejected argument
 returns <code>cudaErrorInvalidValue</code> without a launch or a write). Run
 them after any change; each exits 0 on pass:</p>
 <pre><code>fa_validate · fa_varlen_validate · fa_paged_validate · fa_fp8_validate
-fa_int4_validate · fa_paged_prefill_validate · fa_api_validate
-fa_error_validate</code></pre>
+fa_int4_validate · fa_paged_prefill_validate · fa_quant_prefill_validate
+fa_api_validate · fa_error_validate</code></pre>
 <p><code>flash_bench</code> reports per-shape TFLOPS through the production
 dispatcher.</p>
 
@@ -246,9 +249,8 @@ Python: a <code>RuntimeError</code>, with the line on stderr).</p>
   <tr><td>error: <code>… requires scratch</code></td><td>decode called without a <code>fa_cache_attention_scratch_bytes</code> allocation</td></tr>
   <tr><td>error: <code>FP8 … requires k_scale/v_scale &gt; 0</code></td><td>scales left at the zero-init default</td></tr>
   <tr><td>error: <code>INT4_G32 … requires K_scales/V_scales</code></td><td>scale pools not allocated/attached</td></tr>
-  <tr><td>error: <code>quantized caches … decode-only</code></td><td>chunked prefill on an FP8/INT4 cache — use AUTO for prefill</td></tr>
   <tr><td>error: <code>d_head must be 64 or 128</code></td><td>only 64 and 128 are compiled</td></tr>
-  <tr><td>error: <code>launch failed: invalid argument</code></td><td>a tensor is not 16-byte aligned, or <code>batch_size * num_heads &gt; 65535</code></td></tr>
+  <tr><td>error: <code>launch failed: invalid argument</code></td><td>a tensor or cache pool is not 16-byte aligned, an INT4 scale pool is not 4-byte aligned, or <code>batch_size * num_heads &gt; 65535</code></td></tr>
   <tr><td>output never written, no crash</td><td>the returned <code>cudaError_t</code> was ignored — check it</td></tr>
   <tr><td>garbage output, no error</td><td>index arrays passed as host memory; stale <code>block_table</code>/<code>seq_lens</code>; or K/V not written to the cache before a prefill chunk</td></tr>
   <tr><td>decode output all zeros for one sequence</td><td>its <code>seq_lens[b]</code> is 0 — by design</td></tr>
@@ -298,7 +300,7 @@ contents in place as sequences grow — that is the supported pattern.</p>
 
 o = cache.attend(q, *,
     cu_seqlens_q=None,   <span class="cm"># None / max_seqlen_q == 1 → decode</span>
-    max_seqlen_q=1,      <span class="cm"># &gt; 1 → chunked prefill ("auto" caches only)</span>
+    max_seqlen_q=1,      <span class="cm"># &gt; 1 → chunked prefill (any kv_dtype)</span>
     causal=True, scale=0.0,
     num_splits=0)        <span class="cm"># decode split-KV; 0 = auto</span>
 <span class="cm">#   decode: q is [B, H_q, D]; prefill: q packed [total_q, H_q, D]</span></code></pre>

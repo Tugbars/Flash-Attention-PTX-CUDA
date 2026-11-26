@@ -72,8 +72,12 @@ fa_attention(a);
   workspace: size it with `fa_cache_attention_scratch_bytes(args)`.
 - **Chunked prefill** (`max_seqlen_q > 1` with `cu_seqlens_q`): new chunks
   attend each sequence's full cache, bottom-right causal against
-  `cache.seq_lens[b]`. Currently requires an AUTO (fp16/bf16) cache; the new
-  tokens' K/V must already be in the cache (write them first, see below).
+  `cache.seq_lens[b]`. The new tokens' K/V must already be in the cache
+  (write them first, see below). Works on fp16/bf16, FP8 and INT4 caches: a
+  quantized cache is dequantized on the way into the kernel's shared-memory
+  tiles and the attention itself is the fp16/bf16 pipeline, so the result is
+  attention over the values the cache holds, exactly as decode sees them.
+  Cost on a quantized cache: about 1.0–1.25× the fp16-cache time.
 
 ```cpp
 FaCacheAttentionArgs c = {};
@@ -150,8 +154,10 @@ scale calibration. What the kernels own: everything else.
 
 ## Validation gates
 
-Seven CMake targets, each an independent gate (exit 0 = pass): `fa_validate`
+Nine CMake targets, each an independent gate (exit 0 = pass): `fa_validate`
 (core, strict fp64 policy), `fa_varlen_validate`, `fa_paged_validate`,
-`fa_fp8_validate`, `fa_int4_validate`, `fa_paged_prefill_validate`, and
-`fa_api_validate` (facade bit-equivalence). Run them all after any kernel
-change.
+`fa_fp8_validate`, `fa_int4_validate`, `fa_paged_prefill_validate`,
+`fa_quant_prefill_validate` (chunked prefill over FP8 / INT4 caches, plus
+agreement with decode on the same cache), `fa_api_validate` (facade
+bit-equivalence) and `fa_error_validate` (the error contract). Run them all
+after any kernel change.

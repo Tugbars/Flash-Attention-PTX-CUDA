@@ -210,9 +210,9 @@ flash-attention-cuda/
 ├── python/
 │   ├── fa_ptx/                     # PyTorch bindings: TORCH_LIBRARY ops, PagedKVCache, CaptureCache
 │   ├── csrc/fa_torch.cpp           # op registration (compile- and CUDA-graph-ready)
-│   ├── test_fa_ptx.py              # 21-check binding suite (SDPA parity, compile, graphs, RoPE, error returns)
+│   ├── test_fa_ptx.py              # 24-check binding suite (SDPA parity, compile, graphs, RoPE, cache prefill, error returns)
 │   └── e2e_qwen.py                 # Qwen2.5-1.5B end-to-end runner (see above)
-├── tests/                          # 8 C++ gates: 7 numeric (fp64 references, strict tolerances) + the error contract
+├── tests/                          # 9 C++ gates: 8 numeric (fp64 references, strict tolerances) + the error contract
 ├── src/
 │   └── demo.cu                     # standalone demo + correctness check
 ├── scripts/
