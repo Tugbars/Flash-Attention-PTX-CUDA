@@ -174,7 +174,7 @@ static void vdecode(int B, int Hq, int Hkv, int Skv, int D, int splits,
   p.stream = 0;
   size_t sb = flash_decode_scratch_bytes(p);
   cudaMalloc(&p.scratch, sb ? sb : 16);
-  launch_flash_attention_decode(p);
+  CUDA_CHECK(launch_flash_attention_decode(p));
   cudaDeviceSynchronize();
 
   std::vector<T> Oo(Nq); std::vector<float> Lo((size_t)B * Hq);

@@ -93,7 +93,7 @@ static void verify(const std::vector<int> &lens_q, const std::vector<int> &lens_
   w.num_tokens = TK; w.num_kv_heads = Hkv; w.d_head = D;
   w.dtype = std::is_same<T, half>::value ? DType::FP16 : DType::BF16;
   w.kv_dtype = KvDType::AUTO; w.stream = 0;
-  launch_kv_cache_write(w);
+  CUDA_CHECK(launch_kv_cache_write(w));
   cudaDeviceSynchronize();
 
   // fp64 reference (bottom-right causal vs the cache length)

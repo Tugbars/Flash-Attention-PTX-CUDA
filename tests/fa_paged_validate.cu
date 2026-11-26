@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <random>
 #include "flash_attention.h"
+#include "cuda_check.h"
 using namespace transformer;
 
 static int g_fail = 0;
@@ -127,7 +128,7 @@ static void verify(const std::vector<int> &lens, int Hq, int Hkv, int D,
   p.stream = 0;
   size_t sb = flash_decode_paged_scratch_bytes(p);
   cudaMalloc(&p.scratch, sb ? sb : 16);
-  launch_flash_attention_decode_paged(p);
+  CUDA_CHECK(launch_flash_attention_decode_paged(p));
   cudaDeviceSynchronize();
 
   std::vector<T> Oo(NQ); std::vector<float> Lo((size_t)B * Hq);

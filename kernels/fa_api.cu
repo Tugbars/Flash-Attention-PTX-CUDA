@@ -7,86 +7,94 @@
 // delegates to the launch_* entry points, so outputs are bit-identical to
 // calling those entry points directly (the equivalence gate,
 // tests/fa_api_validate.cu, asserts exactly that).
+//
+// Error handling: every callable returns a cudaError_t and nothing here
+// terminates the process. A rejected argument prints one named `fa_*:` line to
+// stderr and returns cudaErrorInvalidValue before anything is launched; a
+// failed launch returns the launcher's status (also named on stderr).
 // ============================================================================
 #include "../include/flash_attention.h"
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 
 namespace transformer {
 
 namespace {
 
-[[noreturn]] void fa_fail(const char *fn, const char *msg) {
+// Report a rejected argument: one named line on stderr, then the error code.
+inline cudaError_t fa_reject(const char *fn, const char *msg) {
   fprintf(stderr, "%s: %s\n", fn, msg);
-  abort();
+  return cudaErrorInvalidValue;
 }
 
-// The prefill launchers return a cudaError_t instead of terminating. The
-// facade's contract is still "bad arguments abort with a named message", so a
-// rejected or failed launch is reported the same way — never dropped (a
-// rejected launch writes nothing to O). cudaErrorInvalidValue here means the
-// launcher's own validation fired on something check_common() does not cover:
-// a tensor that is not 16-byte aligned, or batch_size * num_heads > 65535.
-inline void check_launch(const char *fn, cudaError_t err) {
-  if (err == cudaSuccess)
-    return;
-  fprintf(stderr,
-          "%s: launch failed: %s%s\n", fn, cudaGetErrorString(err),
-          err == cudaErrorInvalidValue
-              ? " (launcher rejected an argument: Q/K/V/O must be 16-byte "
-                "aligned and batch_size * num_heads <= 65535)"
-              : "");
-  abort();
+// Pass a launcher's status through, naming the facade call on stderr when it
+// failed. `hint` says what the launcher validates beyond the facade's own
+// checks, since the prefill launchers reject silently.
+inline cudaError_t launch_status(const char *fn, cudaError_t err,
+                                 const char *hint = "") {
+  if (err != cudaSuccess)
+    fprintf(stderr, "%s: launch failed: %s%s\n", fn, cudaGetErrorString(err),
+            err == cudaErrorInvalidValue ? hint : "");
+  return err;
 }
+
+// What the prefill launchers check that check_common() does not.
+constexpr const char *kPrefillHint =
+    " (launcher rejected an argument: Q/K/V/O must be 16-byte aligned and "
+    "batch_size * num_heads <= 65535)";
 
 inline float resolve_scale(float scale, int d_head) {
   return (scale > 0.0f) ? scale : 1.0f / sqrtf((float)d_head);
 }
 
-inline void check_common(const char *fn, int d_head, int num_heads,
-                         int num_kv_heads, int batch_size) {
+inline cudaError_t check_common(const char *fn, int d_head, int num_heads,
+                                int num_kv_heads, int batch_size) {
   if (d_head != 64 && d_head != 128)
-    fa_fail(fn, "d_head must be 64 or 128");
+    return fa_reject(fn, "d_head must be 64 or 128");
   if (batch_size <= 0)
-    fa_fail(fn, "batch_size must be > 0");
+    return fa_reject(fn, "batch_size must be > 0");
   if (num_heads <= 0)
-    fa_fail(fn, "num_heads must be > 0");
+    return fa_reject(fn, "num_heads must be > 0");
   int hkv = (num_kv_heads > 0) ? num_kv_heads : num_heads;
   if (num_heads % hkv != 0)
-    fa_fail(fn, "num_heads must be a multiple of num_kv_heads (GQA)");
+    return fa_reject(fn, "num_heads must be a multiple of num_kv_heads (GQA)");
+  return cudaSuccess;
 }
 
-inline void check_cache(const char *fn, const KvCache &c) {
+inline cudaError_t check_cache(const char *fn, const KvCache &c) {
   if (!c.K || !c.V)
-    fa_fail(fn, "KvCache payload pools (K, V) must be set");
+    return fa_reject(fn, "KvCache payload pools (K, V) must be set");
   if (!c.block_table || !c.seq_lens)
-    fa_fail(fn, "KvCache block_table and seq_lens must be set");
+    return fa_reject(fn, "KvCache block_table and seq_lens must be set");
   if (c.page_size <= 0 || c.max_blocks_per_seq <= 0)
-    fa_fail(fn, "KvCache page geometry invalid");
+    return fa_reject(fn, "KvCache page geometry invalid");
   if (c.d_head != 64 && c.d_head != 128)
-    fa_fail(fn, "KvCache d_head must be 64 or 128");
+    return fa_reject(fn, "KvCache d_head must be 64 or 128");
   if (c.kv_dtype == KvDType::FP8_E4M3 &&
       (!(c.k_scale > 0.0f) || !(c.v_scale > 0.0f)))
-    fa_fail(fn, "FP8_E4M3 cache requires k_scale/v_scale > 0");
+    return fa_reject(fn, "FP8_E4M3 cache requires k_scale/v_scale > 0");
   if (c.kv_dtype == KvDType::INT4_G32 && (!c.K_scales || !c.V_scales))
-    fa_fail(fn, "INT4_G32 cache requires K_scales/V_scales pools");
+    return fa_reject(fn, "INT4_G32 cache requires K_scales/V_scales pools");
+  return cudaSuccess;
 }
 
 } // anonymous namespace
 
 // --- 1) fa_attention ---------------------------------------------------------
-void fa_attention(const FaAttentionArgs &a) {
-  check_common("fa_attention", a.d_head, a.num_heads, a.num_kv_heads,
-               a.batch_size);
+cudaError_t fa_attention(const FaAttentionArgs &a) {
+  const char *fn = "fa_attention";
+  cudaError_t e =
+      check_common(fn, a.d_head, a.num_heads, a.num_kv_heads, a.batch_size);
+  if (e != cudaSuccess)
+    return e;
   if (!a.Q || !a.K || !a.V || !a.O)
-    fa_fail("fa_attention", "Q/K/V/O must be set");
+    return fa_reject(fn, "Q/K/V/O must be set");
   const float scale = resolve_scale(a.scale, a.d_head);
 
   if (a.cu_seqlens_q == nullptr) {
     // batch mode: [B, H, S, D]
     if (a.seq_len <= 0)
-      fa_fail("fa_attention", "batch mode requires seq_len > 0");
+      return fa_reject(fn, "batch mode requires seq_len > 0");
     FlashAttentionParams p = {};
     p.Q = a.Q;
     p.K = a.K;
@@ -103,13 +111,13 @@ void fa_attention(const FaAttentionArgs &a) {
     p.dtype = a.dtype;
     p.autotune = a.autotune;
     p.stream = a.stream;
-    check_launch("fa_attention", launch_flash_attention(p));
+    return launch_status(fn, launch_flash_attention(p), kPrefillHint);
   } else {
     // varlen mode: packed [T, H, D]
     if (a.cu_seqlens_k == nullptr)
-      fa_fail("fa_attention", "varlen mode requires cu_seqlens_k");
+      return fa_reject(fn, "varlen mode requires cu_seqlens_k");
     if (a.max_seqlen_q <= 0)
-      fa_fail("fa_attention", "varlen mode requires max_seqlen_q > 0");
+      return fa_reject(fn, "varlen mode requires max_seqlen_q > 0");
     FlashAttentionVarlenParams p = {};
     p.Q = a.Q;
     p.K = a.K;
@@ -127,7 +135,7 @@ void fa_attention(const FaAttentionArgs &a) {
     p.causal = a.causal;
     p.dtype = a.dtype;
     p.stream = a.stream;
-    check_launch("fa_attention", launch_flash_attention_varlen(p));
+    return launch_status(fn, launch_flash_attention_varlen(p), kPrefillHint);
   }
 }
 
@@ -175,26 +183,32 @@ size_t fa_cache_attention_scratch_bytes(const FaCacheAttentionArgs &a) {
   return flash_decode_paged_scratch_bytes(to_decode_params(a));
 }
 
-void fa_cache_attention(const FaCacheAttentionArgs &a) {
-  check_common("fa_cache_attention", a.cache.d_head, a.num_heads,
-               a.cache.num_kv_heads, a.batch_size);
-  check_cache("fa_cache_attention", a.cache);
+cudaError_t fa_cache_attention(const FaCacheAttentionArgs &a) {
+  const char *fn = "fa_cache_attention";
+  cudaError_t e = check_common(fn, a.cache.d_head, a.num_heads,
+                               a.cache.num_kv_heads, a.batch_size);
+  if (e != cudaSuccess)
+    return e;
+  e = check_cache(fn, a.cache);
+  if (e != cudaSuccess)
+    return e;
   if (!a.Q || !a.O)
-    fa_fail("fa_cache_attention", "Q/O must be set");
+    return fa_reject(fn, "Q/O must be set");
 
   if (is_decode(a)) {
     if (!a.scratch)
-      fa_fail("fa_cache_attention",
-              "decode requires scratch (fa_cache_attention_scratch_bytes)");
-    launch_flash_attention_decode_paged(to_decode_params(a));
-    return;
+      return fa_reject(
+          fn, "decode requires scratch (fa_cache_attention_scratch_bytes)");
+    // The decode launcher names its own rejections (flash_decode_paged: ...).
+    return launch_status(
+        fn, launch_flash_attention_decode_paged(to_decode_params(a)));
   }
 
   // chunked prefill over the cache
   if (a.cache.kv_dtype != KvDType::AUTO)
-    fa_fail("fa_cache_attention",
-            "quantized caches (FP8/INT4) are decode-only for now; chunked "
-            "prefill requires an AUTO (fp16/bf16) cache");
+    return fa_reject(fn,
+                     "quantized caches (FP8/INT4) are decode-only for now; "
+                     "chunked prefill requires an AUTO (fp16/bf16) cache");
   FlashAttentionPagedPrefillParams p = {};
   p.Q = a.Q;
   p.O = a.O;
@@ -215,16 +229,20 @@ void fa_cache_attention(const FaCacheAttentionArgs &a) {
   p.causal = a.causal;
   p.dtype = a.dtype;
   p.stream = a.stream;
-  check_launch("fa_cache_attention", launch_flash_attention_paged_prefill(p));
+  return launch_status(fn, launch_flash_attention_paged_prefill(p),
+                       kPrefillHint);
 }
 
 // --- 3) fa_cache_write -------------------------------------------------------
-void fa_cache_write(const FaCacheWriteArgs &a) {
-  check_cache("fa_cache_write", a.cache);
+cudaError_t fa_cache_write(const FaCacheWriteArgs &a) {
+  const char *fn = "fa_cache_write";
+  cudaError_t e = check_cache(fn, a.cache);
+  if (e != cudaSuccess)
+    return e;
   if (!a.K_new || !a.V_new || !a.slot_mapping)
-    fa_fail("fa_cache_write", "K_new/V_new/slot_mapping must be set");
+    return fa_reject(fn, "K_new/V_new/slot_mapping must be set");
   if (a.num_tokens < 0)
-    fa_fail("fa_cache_write", "num_tokens must be >= 0");
+    return fa_reject(fn, "num_tokens must be >= 0");
 
   KvCacheWriteParams p = {};
   p.K_new = a.K_new;
@@ -245,7 +263,8 @@ void fa_cache_write(const FaCacheWriteArgs &a) {
   p.rope_sin = a.rope_sin;
   p.positions = a.positions;
   p.stream = a.stream;
-  launch_kv_cache_write(p);
+  // The writer names its own rejections (kv_cache_write: ...).
+  return launch_status(fn, launch_kv_cache_write(p));
 }
 
 } // namespace transformer

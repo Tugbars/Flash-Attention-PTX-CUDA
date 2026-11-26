@@ -22,12 +22,18 @@
 //   - L (optional) is [batch_size * num_heads, seq_len] in FP32
 //   - Minimum compute capability: sm_80 (Ampere)
 //
-// Error handling: the prefill launch_* entry points validate their arguments
-// and return a cudaError_t; they never terminate the process. The return value
-// is [[nodiscard]] — a rejected launch writes nothing to O, so an ignored
-// error is silently-uninitialised output. The decode / cache-write launchers
-// and the fa_* facade still abort with a named message (not yet migrated).
-// This header no longer defines CUDA_CHECK; tests use tests/cuda_check.h.
+// Error handling: every launch_* entry point and every fa_* facade call
+// validates its arguments and returns a cudaError_t. Nothing in this library
+// terminates the process.
+//   - cudaErrorInvalidValue: an argument was rejected. The fa_* facade and the
+//     decode / cache-write launchers also print one named line to stderr saying
+//     which (e.g. "fa_attention: d_head must be 64 or 128"); a rejected call
+//     launches nothing and writes nothing.
+//   - anything else: the CUDA launch status.
+// The return values are [[nodiscard]] — a rejected launch leaves O unwritten,
+// so an ignored error is silently-uninitialised output. The *_scratch_bytes
+// helpers return 0 when the geometry is invalid (the launch then reports it).
+// This header does not define CUDA_CHECK; the tests use tests/cuda_check.h.
 // ============================================================================
 
 #include <cuda_fp16.h>
@@ -186,9 +192,13 @@ struct FlashDecodeParams {
 
 // Implemented in kernels/flash_attention_decode.cu
 // Size the caller-owned scratch workspace (depends on the auto-picked
-// num_splits).
+// num_splits). Returns 0 if batch_size / head counts are not valid.
 size_t flash_decode_scratch_bytes(const FlashDecodeParams &params);
-void launch_flash_attention_decode(const FlashDecodeParams &params);
+// Returns cudaErrorInvalidValue (after a named stderr line) for an unsupported
+// d_head or for batch_size / head counts that are not > 0 with
+// num_q_heads % num_kv_heads == 0; otherwise the launch status.
+[[nodiscard]] cudaError_t
+launch_flash_attention_decode(const FlashDecodeParams &params);
 
 // ============================================================================
 // Paged decode — PagedAttention-style KV cache for continuous batching.
@@ -248,8 +258,14 @@ struct FlashDecodePagedParams {
   cudaStream_t stream;
 };
 
+// Returns 0 if batch_size / head counts are not valid.
 size_t flash_decode_paged_scratch_bytes(const FlashDecodePagedParams &params);
-void launch_flash_attention_decode_paged(const FlashDecodePagedParams &params);
+// Returns cudaErrorInvalidValue (after a named stderr line) for the same cases
+// as launch_flash_attention_decode, plus bad page geometry, an FP8 cache
+// without k_scale/v_scale > 0, or an INT4_G32 cache without its scale pools;
+// otherwise the launch status.
+[[nodiscard]] cudaError_t
+launch_flash_attention_decode_paged(const FlashDecodePagedParams &params);
 
 // ============================================================================
 // ======================  UNIFIED API (recommended)  =========================
@@ -271,6 +287,11 @@ void launch_flash_attention_decode_paged(const FlashDecodePagedParams &params);
 //   loop: fa_cache_attention(q=1) -> decode steps
 //   fa_cache_write                -> append generated K/V each step
 //   fa_cache_attention(q>1)      -> chunked re-prefill on a follow-up turn
+//
+// Each callable returns a cudaError_t (see "Error handling" at the top of this
+// header): cudaErrorInvalidValue plus one named `fa_*:` line on stderr for a
+// rejected argument, otherwise the launch status. Check it — a rejected call
+// writes nothing.
 // ============================================================================
 
 // All state of one paged KV cache. Pools are
@@ -317,7 +338,7 @@ struct FaAttentionArgs {
   bool autotune; // batch mode only
   cudaStream_t stream;
 };
-void fa_attention(const FaAttentionArgs &args);
+[[nodiscard]] cudaError_t fa_attention(const FaAttentionArgs &args);
 
 // --- 2) fa_cache_attention: queries against a KvCache -----------------------
 // Q/O are packed [total_q, H_q, D].
@@ -345,8 +366,10 @@ struct FaCacheAttentionArgs {
   int num_splits; // decode: 0 = auto
   cudaStream_t stream;
 };
+// 0 for the prefill mode (no workspace needed) and for invalid geometry.
 size_t fa_cache_attention_scratch_bytes(const FaCacheAttentionArgs &args);
-void fa_cache_attention(const FaCacheAttentionArgs &args);
+[[nodiscard]] cudaError_t
+fa_cache_attention(const FaCacheAttentionArgs &args);
 
 // --- 3) fa_cache_write: append packed K/V into the cache --------------------
 // K_new/V_new: [num_tokens, num_kv_heads, d_head] (compute dtype).
@@ -367,7 +390,7 @@ struct FaCacheWriteArgs {
   const int *positions;  // [num_tokens] int32, device
   cudaStream_t stream;
 };
-void fa_cache_write(const FaCacheWriteArgs &args);
+[[nodiscard]] cudaError_t fa_cache_write(const FaCacheWriteArgs &args);
 
 // ============================================================================
 // KV-cache writer (vLLM's "reshape_and_cache"): scatter freshly-computed K/V
@@ -405,6 +428,11 @@ struct KvCacheWriteParams {
   cudaStream_t stream;
 };
 
-void launch_kv_cache_write(const KvCacheWriteParams &params);
+// Returns cudaErrorInvalidValue (after a named stderr line) for a partial RoPE
+// triple, an FP8 cache without k_scale/v_scale > 0, or an INT4_G32 cache
+// without its scale pools; otherwise the launch status. num_tokens <= 0 is a
+// successful no-op.
+[[nodiscard]] cudaError_t
+launch_kv_cache_write(const KvCacheWriteParams &params);
 
 } // namespace transformer

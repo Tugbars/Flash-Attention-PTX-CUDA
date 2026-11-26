@@ -71,6 +71,19 @@ void check_qkv(const at::Tensor &t, const char *name) {
   TORCH_CHECK(t.is_contiguous(), "fa_ptx: ", name, " must be contiguous");
 }
 
+// The facade returns a cudaError_t instead of terminating the process. Turn a
+// failure into a Python exception rather than handing back an output tensor
+// that was never written. For a rejected argument the facade has already
+// printed the specific reason to stderr as an `fa_*:` line.
+void check_fa(const char *op, cudaError_t err) {
+  TORCH_CHECK(err == cudaSuccess, "fa_ptx::", op, " failed: ",
+              cudaGetErrorString(err),
+              err == cudaErrorInvalidValue
+                  ? " (an argument was rejected; the reason is on stderr as "
+                    "an `fa_*:` line)"
+                  : "");
+}
+
 KvDType kvdtype_of(int64_t v) {
   TORCH_CHECK(v >= 0 && v <= 2, "fa_ptx: kv_dtype must be 0 (auto), 1 (fp8), "
                                 "or 2 (int4)");
@@ -125,7 +138,7 @@ at::Tensor attention(const at::Tensor &q, const at::Tensor &k,
     a.seq_len = static_cast<int>(q.size(2));
     a.d_head = static_cast<int>(q.size(3));
   }
-  fa_attention(a);
+  check_fa("attention", fa_attention(a));
   return o;
 }
 
@@ -191,7 +204,7 @@ at::Tensor cache_attention(
   a.cu_seqlens_q =
       cu_seqlens_q.has_value() ? iptr(*cu_seqlens_q) : nullptr;
   a.stream = c10::cuda::getCurrentCUDAStream().stream();
-  fa_cache_attention(a);
+  check_fa("cache_attention", fa_cache_attention(a));
   return o;
 }
 
@@ -265,7 +278,7 @@ void cache_write(const at::Tensor &k_new, const at::Tensor &v_new,
     a.positions = iptr(*positions);
   }
   a.stream = c10::cuda::getCurrentCUDAStream().stream();
-  fa_cache_write(a);
+  check_fa("cache_write", fa_cache_write(a));
 }
 
 } // anonymous namespace

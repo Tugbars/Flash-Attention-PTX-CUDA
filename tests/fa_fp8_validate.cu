@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <random>
 #include "flash_attention.h"
+#include "cuda_check.h"
 using namespace transformer;
 
 static int g_fail = 0;
@@ -105,7 +106,7 @@ static void verify(const std::vector<int> &lens, int Hq, int Hkv, int D,
   w.dtype = std::is_same<T, half>::value ? DType::FP16 : DType::BF16;
   w.kv_dtype = KvDType::FP8_E4M3; w.k_scale = k_scale; w.v_scale = v_scale;
   w.stream = 0;
-  launch_kv_cache_write(w);
+  CUDA_CHECK(launch_kv_cache_write(w));
   cudaDeviceSynchronize();
 
   // (1) writer bit-check at assigned slots
@@ -184,7 +185,7 @@ static void verify(const std::vector<int> &lens, int Hq, int Hkv, int D,
   p.k_scale = k_scale; p.v_scale = v_scale; p.stream = 0;
   size_t sb = flash_decode_paged_scratch_bytes(p);
   cudaMalloc(&p.scratch, sb ? sb : 16);
-  launch_flash_attention_decode_paged(p);
+  CUDA_CHECK(launch_flash_attention_decode_paged(p));
   cudaDeviceSynchronize();
 
   std::vector<T> Oo(NQ);

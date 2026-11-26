@@ -54,7 +54,7 @@ static void t_attention() {
   FaAttentionArgs a = {};
   a.Q = Q; a.K = K; a.V = V; a.O = O2; a.batch_size = B; a.num_heads = H;
   a.seq_len = S; a.d_head = D; a.scale = 0.0f /* auto */; a.causal = true;
-  fa_attention(a);
+  CUDA_CHECK(fa_attention(a));
   cudaDeviceSynchronize();
   same(O1, O2, N * 2, "fa_attention (batch)");
 
@@ -82,7 +82,7 @@ static void t_attention() {
   va.cu_seqlens_q = dcq; va.cu_seqlens_k = dck;
   va.batch_size = 2; va.num_heads = H; va.max_seqlen_q = 500; va.d_head = D;
   va.causal = true;
-  fa_attention(va);
+  CUDA_CHECK(fa_attention(va));
   cudaDeviceSynchronize();
   same(vO1, vO2, NQ * 2, "fa_attention (varlen)");
 
@@ -151,12 +151,12 @@ static void t_cache(KvDType kvd, const char *tag) {
   w.num_tokens = TK; w.num_kv_heads = Hkv; w.d_head = D;
   w.dtype = DType::FP16; w.kv_dtype = kvd;
   w.k_scale = 0.01f; w.v_scale = 0.01f; w.stream = 0;
-  launch_kv_cache_write(w);
+  CUDA_CHECK(launch_kv_cache_write(w));
 
   FaCacheWriteArgs wa = {};
   wa.K_new = Kn; wa.V_new = Vn; wa.slot_mapping = dsm; wa.num_tokens = TK;
   wa.cache = cache; wa.dtype = DType::FP16;
-  fa_cache_write(wa);
+  CUDA_CHECK(fa_cache_write(wa));
   cudaDeviceSynchronize();
   char nm[96];
   snprintf(nm, sizeof nm, "fa_cache_write (%s)", tag);
@@ -180,14 +180,14 @@ static void t_cache(KvDType kvd, const char *tag) {
   dp.k_scale = 0.01f; dp.v_scale = 0.01f; dp.stream = 0;
   size_t sb = flash_decode_paged_scratch_bytes(dp);
   cudaMalloc(&dp.scratch, sb ? sb : 16);
-  launch_flash_attention_decode_paged(dp);
+  CUDA_CHECK(launch_flash_attention_decode_paged(dp));
 
   FaCacheAttentionArgs ca = {};
   ca.Q = Q; ca.O = O2; ca.cache = cache; ca.batch_size = B; ca.num_heads = Hq;
   ca.max_seqlen_q = 1; ca.dtype = DType::FP16;
   size_t sb2 = fa_cache_attention_scratch_bytes(ca);
   cudaMalloc(&ca.scratch, sb2 ? sb2 : 16);
-  fa_cache_attention(ca);
+  CUDA_CHECK(fa_cache_attention(ca));
   cudaDeviceSynchronize();
   snprintf(nm, sizeof nm, "fa_cache_attention dec (%s)", tag);
   same(O1, O2, NQ * 2, nm);
@@ -219,7 +219,7 @@ static void t_cache(KvDType kvd, const char *tag) {
     pa.cache = cache; pa.batch_size = B; pa.num_heads = Hq;
     pa.causal = true; pa.dtype = DType::FP16;
     pa.scratch = ca.scratch; // unused by prefill; harmless
-    fa_cache_attention(pa);
+    CUDA_CHECK(fa_cache_attention(pa));
     cudaDeviceSynchronize();
     same(pO1, pO2, NPQ * 2, "fa_cache_attention prefill");
 

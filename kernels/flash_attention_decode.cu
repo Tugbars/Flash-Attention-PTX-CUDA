@@ -22,32 +22,39 @@
 #include "../include/flash_attention.h"
 #include <cfloat>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
-#include <cstdlib>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <type_traits>
 
-// The decode / cache-write launchers have not been migrated to the prefill
-// path's cudaError_t-return convention yet (see flash_attention.cu): they still
-// terminate the process on a CUDA error or a rejected argument. The public
-// header no longer exports an abort macro, so this file carries its own until
-// that migration happens.
-#define DEC_CUDA_CHECK(call)                                                   \
-  do {                                                                         \
-    cudaError_t err_ = (call);                                                 \
-    if (err_ != cudaSuccess) {                                                 \
-      fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,         \
-              cudaGetErrorString(err_));                                       \
-      exit(EXIT_FAILURE);                                                      \
-    }                                                                          \
-  } while (0)
+// Error handling: like the prefill path (flash_attention.cu), every launcher in
+// this file returns a cudaError_t and nothing here terminates the process. A
+// rejected argument prints one named line to stderr and returns
+// cudaErrorInvalidValue; otherwise the launch status is returned.
 
 namespace transformer {
 
 namespace {
+
+// Report a rejected argument: one named line on stderr, then the error code.
+inline cudaError_t dec_reject(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vfprintf(stderr, fmt, ap);
+  va_end(ap);
+  return cudaErrorInvalidValue;
+}
+
+// Geometry the split planner needs before it can run: it divides by
+// (batch * heads) and by num_kv_heads, so these must be checked FIRST — a zero
+// here would otherwise be a host-side integer divide fault, not an error code.
+inline bool dec_geometry_ok(int batch, int num_q_heads, int num_kv_heads) {
+  return batch > 0 && num_q_heads > 0 && num_kv_heads > 0 &&
+         num_q_heads % num_kv_heads == 0;
+}
 
 // -- split-count heuristic (integer-only; scratch sizing and launch MUST agree)
 // -
@@ -91,14 +98,22 @@ inline void resolve_splits(int rows, int S_kv, int D, int sm_count, int forced,
     ns = DEC_MAX_SPLITS;
 }
 
-inline int dec_sm_count() {
+// SM count of the device, queried once per process. Reports the query's own
+// error (and caches nothing) if the device cannot be read.
+inline cudaError_t dec_sm_count(int &sm_count) {
   static int n = -1;
   if (n < 0) {
-    int dev = 0;
-    DEC_CUDA_CHECK(cudaGetDevice(&dev));
-    DEC_CUDA_CHECK(cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev));
+    int dev = 0, v = 0;
+    cudaError_t e = cudaGetDevice(&dev);
+    if (e != cudaSuccess)
+      return e;
+    e = cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, dev);
+    if (e != cudaSuccess)
+      return e;
+    n = v;
   }
-  return n;
+  sm_count = n;
+  return cudaSuccess;
 }
 inline size_t align256(size_t x) { return (x + 255) & ~size_t(255); }
 
@@ -1095,9 +1110,13 @@ struct DecPlan {
   int group;
 };
 
-static inline DecPlan dec_plan(const FlashDecodeParams &p) {
+// Requires dec_geometry_ok(). Fails only if the device cannot be queried.
+static inline cudaError_t dec_plan(const FlashDecodeParams &p, DecPlan &pl) {
   int group = p.num_q_heads / p.num_kv_heads;
-  int sm = dec_sm_count();
+  int sm = 0;
+  cudaError_t e = dec_sm_count(sm);
+  if (e != cudaSuccess)
+    return e;
   int ns_g, ch_g, ns_p, ch_p;
   resolve_splits(p.batch_size * p.num_kv_heads, p.seq_len_kv, p.d_head, sm,
                  p.num_splits, ns_g, ch_g);
@@ -1106,16 +1125,20 @@ static inline DecPlan dec_plan(const FlashDecodeParams &p) {
   bool gqa =
       (group > 1 && group <= 32) &&
       ((long long)ns_g * p.num_kv_heads * p.batch_size >= sm); // grid fills
-  DecPlan pl;
   pl.group = group;
   pl.use_gqa = gqa;
   pl.ns = gqa ? ns_g : ns_p;
   pl.chunk = gqa ? ch_g : ch_p;
-  return pl;
+  return cudaSuccess;
 }
 
+// Returns 0 when no plan exists (bad head/batch geometry, or the device cannot
+// be queried); the matching launch then reports the error.
 size_t flash_decode_scratch_bytes(const FlashDecodeParams &p) {
-  DecPlan pl = dec_plan(p);
+  DecPlan pl;
+  if (!dec_geometry_ok(p.batch_size, p.num_q_heads, p.num_kv_heads) ||
+      dec_plan(p, pl) != cudaSuccess)
+    return 0;
   size_t rows = (size_t)p.batch_size * p.num_q_heads; // partials are per-q-head
   size_t bytes_O = sizeof(float) * rows * pl.ns * p.d_head;
   size_t bytes_m = sizeof(float) * rows * pl.ns;
@@ -1172,8 +1195,20 @@ static void decode_dispatch(const FlashDecodeParams &p, const DecPlan &pl,
   }
 }
 
-void launch_flash_attention_decode(const FlashDecodeParams &p) {
-  DecPlan pl = dec_plan(p);
+cudaError_t launch_flash_attention_decode(const FlashDecodeParams &p) {
+  if (p.d_head != 64 && p.d_head != 128)
+    return dec_reject("flash_decode: unsupported d_head=%d (64 or 128)\n",
+                      p.d_head);
+  if (!dec_geometry_ok(p.batch_size, p.num_q_heads, p.num_kv_heads))
+    return dec_reject("flash_decode: bad geometry (batch_size=%d, "
+                      "num_q_heads=%d, num_kv_heads=%d; all must be > 0 and "
+                      "num_q_heads %% num_kv_heads == 0)\n",
+                      p.batch_size, p.num_q_heads, p.num_kv_heads);
+
+  DecPlan pl;
+  cudaError_t e = dec_plan(p, pl);
+  if (e != cudaSuccess)
+    return e;
   int ns = pl.ns;
   size_t rows = (size_t)p.batch_size * p.num_q_heads;
   float *Op = reinterpret_cast<float *>(p.scratch);
@@ -1183,17 +1218,11 @@ void launch_flash_attention_decode(const FlashDecodeParams &p) {
   float *lp = reinterpret_cast<float *>(reinterpret_cast<char *>(mp) +
                                         align256(sizeof(float) * rows * ns));
 
-  if (p.d_head != 64 && p.d_head != 128) {
-    fprintf(stderr, "flash_decode: unsupported d_head=%d (64 or 128)\n",
-            p.d_head);
-    abort();
-  }
-
   if (p.dtype == DType::BF16)
     decode_dispatch<__nv_bfloat16>(p, pl, Op, mp, lp);
   else
     decode_dispatch<half>(p, pl, Op, mp, lp);
-  DEC_CUDA_CHECK(cudaGetLastError());
+  return cudaGetLastError();
 }
 
 // ============================================================================
@@ -1201,9 +1230,14 @@ void launch_flash_attention_decode(const FlashDecodeParams &p) {
 // per-sequence ragged lengths are resolved on-device); everything else mirrors
 // the contiguous path, including the shared combine kernel.
 // ============================================================================
-static inline DecPlan dec_plan_paged(const FlashDecodePagedParams &p) {
+// Requires dec_geometry_ok(). Fails only if the device cannot be queried.
+static inline cudaError_t dec_plan_paged(const FlashDecodePagedParams &p,
+                                         DecPlan &pl) {
   int group = p.num_q_heads / p.num_kv_heads;
-  int sm = dec_sm_count();
+  int sm = 0;
+  cudaError_t e = dec_sm_count(sm);
+  if (e != cudaSuccess)
+    return e;
   int ns_g, ch_g, ns_p, ch_p;
   resolve_splits(p.batch_size * p.num_kv_heads, p.max_seq_len_kv, p.d_head, sm,
                  p.num_splits, ns_g, ch_g);
@@ -1211,16 +1245,20 @@ static inline DecPlan dec_plan_paged(const FlashDecodePagedParams &p) {
                  p.num_splits, ns_p, ch_p);
   bool gqa = (group > 1 && group <= 32) &&
              ((long long)ns_g * p.num_kv_heads * p.batch_size >= sm);
-  DecPlan pl;
   pl.group = group;
   pl.use_gqa = gqa;
   pl.ns = gqa ? ns_g : ns_p;
   pl.chunk = gqa ? ch_g : ch_p;
-  return pl;
+  return cudaSuccess;
 }
 
+// Returns 0 when no plan exists (bad head/batch geometry, or the device cannot
+// be queried); the matching launch then reports the error.
 size_t flash_decode_paged_scratch_bytes(const FlashDecodePagedParams &p) {
-  DecPlan pl = dec_plan_paged(p);
+  DecPlan pl;
+  if (!dec_geometry_ok(p.batch_size, p.num_q_heads, p.num_kv_heads) ||
+      dec_plan_paged(p, pl) != cudaSuccess)
+    return 0;
   size_t rows = (size_t)p.batch_size * p.num_q_heads;
   size_t bytes_O = sizeof(float) * rows * pl.ns * p.d_head;
   size_t bytes_m = sizeof(float) * rows * pl.ns;
@@ -1331,8 +1369,35 @@ static void decode_dispatch_paged(const FlashDecodePagedParams &p,
   }
 }
 
-void launch_flash_attention_decode_paged(const FlashDecodePagedParams &p) {
-  DecPlan pl = dec_plan_paged(p);
+cudaError_t
+launch_flash_attention_decode_paged(const FlashDecodePagedParams &p) {
+  // All argument checks come before the split plan and before any launch, so a
+  // rejected call has no side effects.
+  if (p.d_head != 64 && p.d_head != 128)
+    return dec_reject(
+        "flash_decode_paged: unsupported d_head=%d (64 or 128)\n", p.d_head);
+  if (!dec_geometry_ok(p.batch_size, p.num_q_heads, p.num_kv_heads))
+    return dec_reject("flash_decode_paged: bad geometry (batch_size=%d, "
+                      "num_q_heads=%d, num_kv_heads=%d; all must be > 0 and "
+                      "num_q_heads %% num_kv_heads == 0)\n",
+                      p.batch_size, p.num_q_heads, p.num_kv_heads);
+  if (p.page_size <= 0 || p.max_blocks_per_seq <= 0)
+    return dec_reject("flash_decode_paged: bad page geometry (page_size=%d, "
+                      "max_blocks_per_seq=%d)\n",
+                      p.page_size, p.max_blocks_per_seq);
+  if (p.kv_dtype == KvDType::INT4_G32 && (!p.K_scales || !p.V_scales))
+    return dec_reject("flash_decode_paged: INT4_G32 cache requires "
+                      "K_scales/V_scales pools\n");
+  if (p.kv_dtype == KvDType::FP8_E4M3 &&
+      (!(p.k_scale > 0.0f) || !(p.v_scale > 0.0f)))
+    return dec_reject("flash_decode_paged: FP8 cache requires k_scale/v_scale "
+                      "> 0 (got %g, %g)\n",
+                      p.k_scale, p.v_scale);
+
+  DecPlan pl;
+  cudaError_t e = dec_plan_paged(p, pl);
+  if (e != cudaSuccess)
+    return e;
   int ns = pl.ns;
   size_t rows = (size_t)p.batch_size * p.num_q_heads;
   float *Op = reinterpret_cast<float *>(p.scratch);
@@ -1342,36 +1407,12 @@ void launch_flash_attention_decode_paged(const FlashDecodePagedParams &p) {
   float *lp = reinterpret_cast<float *>(reinterpret_cast<char *>(mp) +
                                         align256(sizeof(float) * rows * ns));
 
-  if (p.d_head != 64 && p.d_head != 128) {
-    fprintf(stderr, "flash_decode_paged: unsupported d_head=%d (64 or 128)\n",
-            p.d_head);
-    abort();
-  }
-  if (p.page_size <= 0 || p.max_blocks_per_seq <= 0) {
-    fprintf(stderr, "flash_decode_paged: bad page geometry (page_size=%d, "
-                    "max_blocks_per_seq=%d)\n",
-            p.page_size, p.max_blocks_per_seq);
-    abort();
-  }
-
   if (p.kv_dtype == KvDType::INT4_G32) {
-    if (!p.K_scales || !p.V_scales) {
-      fprintf(stderr,
-              "flash_decode_paged: INT4_G32 cache requires K_scales/V_scales "
-              "pools\n");
-      abort();
-    }
     if (p.dtype == DType::BF16)
       decode_dispatch_paged_int4<__nv_bfloat16>(p, pl, Op, mp, lp);
     else
       decode_dispatch_paged_int4<half>(p, pl, Op, mp, lp);
   } else if (p.kv_dtype == KvDType::FP8_E4M3) {
-    if (!(p.k_scale > 0.0f) || !(p.v_scale > 0.0f)) {
-      fprintf(stderr, "flash_decode_paged: FP8 cache requires k_scale/v_scale "
-                      "> 0 (got %g, %g)\n",
-              p.k_scale, p.v_scale);
-      abort();
-    }
     // k_scale folds into the softmax scale (scores are linear in K); v_scale
     // is applied by the kernels at the output/partial write. The hot loop
     // reads raw fp8 with no per-element scale arithmetic.
@@ -1389,7 +1430,7 @@ void launch_flash_attention_decode_paged(const FlashDecodePagedParams &p) {
     else
       decode_dispatch_paged<half, half>(p, pl, Op, mp, lp, p.scale, 1.0f);
   }
-  DEC_CUDA_CHECK(cudaGetLastError());
+  return cudaGetLastError();
 }
 
 // ============================================================================
@@ -1570,43 +1611,36 @@ void write_int4(const KvCacheWriteParams &p, bool rope) {
 
 } // anonymous namespace
 
-void launch_kv_cache_write(const KvCacheWriteParams &p) {
+cudaError_t launch_kv_cache_write(const KvCacheWriteParams &p) {
   if (p.num_tokens <= 0)
-    return;
+    return cudaSuccess; // nothing to write
   const bool rope = (p.rope_cos != nullptr) || (p.rope_sin != nullptr) ||
                     (p.positions != nullptr);
   if (rope &&
       !(p.rope_cos != nullptr && p.rope_sin != nullptr &&
-        p.positions != nullptr)) {
-    fprintf(stderr, "kv_cache_write: fused RoPE requires ALL of rope_cos, "
-                    "rope_sin, positions (or none)\n");
-    abort();
-  }
+        p.positions != nullptr))
+    return dec_reject("kv_cache_write: fused RoPE requires ALL of rope_cos, "
+                      "rope_sin, positions (or none)\n");
   const bool bf16 = (p.dtype == DType::BF16);
 
   if (p.kv_dtype == KvDType::INT4_G32) {
-    if (!p.K_scales || !p.V_scales) {
-      fprintf(stderr,
-              "kv_cache_write: INT4_G32 requires K_scales/V_scales pools\n");
-      abort();
-    }
+    if (!p.K_scales || !p.V_scales)
+      return dec_reject(
+          "kv_cache_write: INT4_G32 requires K_scales/V_scales pools\n");
     if (bf16)
       write_int4<__nv_bfloat16>(p, rope);
     else
       write_int4<half>(p, rope);
-    DEC_CUDA_CHECK(cudaGetLastError());
-    return;
+    return cudaGetLastError();
   }
 
   const bool fp8 = (p.kv_dtype == KvDType::FP8_E4M3);
   float k_inv = 1.0f, v_inv = 1.0f;
   if (fp8) {
-    if (!(p.k_scale > 0.0f) || !(p.v_scale > 0.0f)) {
-      fprintf(stderr, "kv_cache_write: FP8 cache requires k_scale/v_scale > 0 "
-                      "(got %g, %g)\n",
-              p.k_scale, p.v_scale);
-      abort();
-    }
+    if (!(p.k_scale > 0.0f) || !(p.v_scale > 0.0f))
+      return dec_reject("kv_cache_write: FP8 cache requires k_scale/v_scale > "
+                        "0 (got %g, %g)\n",
+                        p.k_scale, p.v_scale);
     k_inv = 1.0f / p.k_scale;
     v_inv = 1.0f / p.v_scale;
   }
@@ -1621,7 +1655,7 @@ void launch_kv_cache_write(const KvCacheWriteParams &p) {
     else
       write_generic<half, half>(p, rope, k_inv, v_inv);
   }
-  DEC_CUDA_CHECK(cudaGetLastError());
+  return cudaGetLastError();
 }
 
 } // namespace transformer
