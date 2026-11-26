@@ -130,6 +130,36 @@ def t_paged(kv_dtype, thr):
     return cache, q
 
 
+# --- 3a. chunked prefill over the cache (follow-up turn) ---------------------
+def t_chunked_prefill(kv_dtype, thr):
+    """New query chunks attend the whole cache, their own K/V included.
+
+    Reference: SDPA over the unquantized K/V with the bottom-right causal
+    mask, so for fp8/int4 the threshold is the format's accuracy cost.
+    """
+    B, Hq, Hkv, D = 3, 32, 8, 128
+    lens_k, lens_q = [1024, 300, 200], [128, 300, 7]
+    cache, ks, vs = make_cache_and_ref(kv_dtype, B, Hq, Hkv, D, lens_k)
+    cu_q = torch.tensor([0] + list(torch.tensor(lens_q).cumsum(0)),
+                        dtype=torch.int32, device="cuda")
+    q = torch.randn(sum(lens_q), Hq, D, device="cuda", dtype=torch.float16)
+    o = cache.attend(q, cu_seqlens_q=cu_q, max_seqlen_q=max(lens_q))
+    worst = 0.0
+    for b in range(B):
+        q0, q1 = int(cu_q[b]), int(cu_q[b + 1])
+        sq, sk = lens_q[b], lens_k[b]
+        i = torch.arange(sq, device="cuda").view(-1, 1)
+        j = torch.arange(sk, device="cuda").view(1, -1)
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            q[q0:q1].transpose(0, 1).unsqueeze(0).float(),
+            ks[b].transpose(0, 1).unsqueeze(0).float(),
+            vs[b].transpose(0, 1).unsqueeze(0).float(),
+            attn_mask=(j <= i + (sk - sq)), enable_gqa=True)
+        worst = max(worst, nrmse(o[q0:q1].transpose(0, 1).unsqueeze(0), ref))
+    check(f"chunked prefill over cache ({kv_dtype})", worst < thr,
+          f"worst nrmse={worst:.5f}")
+
+
 # --- 3b. fused-RoPE cache write ----------------------------------------------
 def fresh_cache(kv_dtype, B, Hkv, D, lens, ps=16):
     """Empty cache + flat slot mapping (sequential pages), nothing written."""
@@ -348,6 +378,9 @@ if __name__ == "__main__":
     t_paged("auto", 1e-3)
     t_paged("fp8", 5e-2)
     t_paged("int4", 1.5e-1)
+    t_chunked_prefill("auto", 1e-3)
+    t_chunked_prefill("fp8", 5e-2)
+    t_chunked_prefill("int4", 1.5e-1)
     t_rope("auto", 1e-3)
     t_rope("fp8", 5e-2)
     t_rope("int4", 1.5e-1)

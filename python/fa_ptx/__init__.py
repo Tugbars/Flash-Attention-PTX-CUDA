@@ -214,8 +214,11 @@ class PagedKVCache:
         """Attention of q against this cache.
 
         Decode (default): q is [B, H_q, D], one token per sequence.
-        Chunked prefill: pass cu_seqlens_q and max_seqlen_q > 1 (new tokens'
-        K/V must already be written; AUTO caches only for now).
+        Chunked prefill: pass cu_seqlens_q and max_seqlen_q > 1; q is packed
+        [total_q, H_q, D] and each chunk attends its sequence's whole cache
+        (bottom-right causal). The new tokens' K/V must already be written.
+        Works on every kv_dtype: a quantized cache is dequantized on the fly,
+        so the result reflects the values the cache holds, as decode does.
         """
         if self._scratch is None or self._scratch_key != (
                 q.shape[0] if cu_seqlens_q is None else -1, q.shape[1],
