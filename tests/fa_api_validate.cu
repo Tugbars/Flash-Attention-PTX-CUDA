@@ -13,6 +13,7 @@
 #include <numeric>
 #include <random>
 #include "flash_attention.h"
+#include "cuda_check.h"
 using namespace transformer;
 
 static int g_fail = 0;
@@ -48,7 +49,7 @@ static void t_attention() {
   p.Q = Q; p.K = K; p.V = V; p.O = O1; p.batch_size = B; p.num_heads = H;
   p.seq_len = S; p.d_head = D; p.scale = 1.f / sqrtf((float)D);
   p.causal = true; p.stream = 0;
-  launch_flash_attention(p);
+  CUDA_CHECK(launch_flash_attention(p));
 
   FaAttentionArgs a = {};
   a.Q = Q; a.K = K; a.V = V; a.O = O2; a.batch_size = B; a.num_heads = H;
@@ -74,7 +75,7 @@ static void t_attention() {
   vp.cu_seqlens_q = dcq; vp.cu_seqlens_k = dck;
   vp.batch_size = 2; vp.num_heads = H; vp.max_seqlen_q = 500; vp.d_head = D;
   vp.scale = 1.f / sqrtf((float)D); vp.causal = true; vp.stream = 0;
-  launch_flash_attention_varlen(vp);
+  CUDA_CHECK(launch_flash_attention_varlen(vp));
 
   FaAttentionArgs va = {};
   va.Q = vQ; va.K = vK; va.V = vV; va.O = vO2;
@@ -211,7 +212,7 @@ static void t_cache(KvDType kvd, const char *tag) {
     pp.max_seqlen_q = 128; pp.max_blocks_per_seq = max_blocks;
     pp.page_size = ps; pp.d_head = D; pp.scale = 1.f / sqrtf((float)D);
     pp.causal = true; pp.dtype = DType::FP16; pp.stream = 0;
-    launch_flash_attention_paged_prefill(pp);
+    CUDA_CHECK(launch_flash_attention_paged_prefill(pp));
 
     FaCacheAttentionArgs pa = {};
     pa.Q = pQ; pa.O = pO2; pa.cu_seqlens_q = dcq; pa.max_seqlen_q = 128;

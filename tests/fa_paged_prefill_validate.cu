@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <random>
 #include "flash_attention.h"
+#include "cuda_check.h"
 using namespace transformer;
 
 static int g_fail = 0;
@@ -149,7 +150,7 @@ static void verify(const std::vector<int> &lens_q, const std::vector<int> &lens_
   p.max_seqlen_q = max_q; p.max_blocks_per_seq = max_blocks;
   p.page_size = page_size; p.d_head = D; p.scale = sc; p.causal = causal;
   p.dtype = w.dtype; p.stream = 0;
-  launch_flash_attention_paged_prefill(p);
+  CUDA_CHECK(launch_flash_attention_paged_prefill(p));
   cudaDeviceSynchronize();
 
   std::vector<T> Oo(NQ); std::vector<float> Lo((size_t)TQ * Hq);

@@ -139,10 +139,15 @@ void fa_wisdom_save(const FaKey &k, const FaGeom &g) {
         << " " << std::get<1>(g) << " " << std::get<2>(g) << "\n";
 }
 
+// Sentinel time for a candidate that could not be benchmarked (OOM, or its
+// launch reported an error). Never selected: the search requires ms < this.
+constexpr float FA_BENCH_FAILED = 1e30f;
+
 // do_bench: time `launch` on throwaway buffers of the real problem shape.
 // Returns mean ms (cudaEvent) — the measurement our A/B harness uses. Warms up
-// 25 iters first so a cold GPU doesn't bias the early configs slow.
-float fa_do_bench(void (*launch)(const FlashAttentionParams &),
+// 25 iters first so a cold GPU doesn't bias the early configs slow. Returns
+// FA_BENCH_FAILED if the buffers cannot be allocated or any launch fails.
+float fa_do_bench(cudaError_t (*launch)(const FlashAttentionParams &),
                   const FlashAttentionParams &base) {
   const int B = base.batch_size, Hq = base.num_heads, S = base.seq_len,
             D = base.d_head;
@@ -156,7 +161,7 @@ float fa_do_bench(void (*launch)(const FlashAttentionParams &),
       cudaMalloc(&O, nq * 2) != cudaSuccess ||
       cudaMalloc(&L, (size_t)B * Hq * S * sizeof(float)) != cudaSuccess) {
     cudaFree(Q); cudaFree(K); cudaFree(V); cudaFree(O); cudaFree(L);
-    return 1e30f; // OOM → infinitely slow
+    return FA_BENCH_FAILED; // OOM → infinitely slow
   }
   cudaMemset(Q, 0x3c, nq * 2);
   cudaMemset(K, 0x3c, nkv * 2);
@@ -165,23 +170,28 @@ float fa_do_bench(void (*launch)(const FlashAttentionParams &),
   p.Q = Q; p.K = K; p.V = V; p.O = O; p.L = L;
   p.autotune = false;
   p.stream = 0;
-  for (int i = 0; i < 25; i++)
-    launch(p);
+  // A candidate that fails to launch is reported as FA_BENCH_FAILED so the
+  // search skips it; the first error ends the run (the rest would fail too).
+  cudaError_t err = cudaSuccess;
+  for (int i = 0; i < 25 && err == cudaSuccess; i++)
+    err = launch(p);
   cudaDeviceSynchronize();
-  cudaEvent_t a, b;
-  cudaEventCreate(&a);
-  cudaEventCreate(&b);
-  cudaEventRecord(a);
-  for (int i = 0; i < 30; i++)
-    launch(p);
-  cudaEventRecord(b);
-  cudaEventSynchronize(b);
   float ms = 0;
-  cudaEventElapsedTime(&ms, a, b);
-  cudaEventDestroy(a);
-  cudaEventDestroy(b);
+  if (err == cudaSuccess) {
+    cudaEvent_t a, b;
+    cudaEventCreate(&a);
+    cudaEventCreate(&b);
+    cudaEventRecord(a);
+    for (int i = 0; i < 30 && err == cudaSuccess; i++)
+      err = launch(p);
+    cudaEventRecord(b);
+    cudaEventSynchronize(b);
+    cudaEventElapsedTime(&ms, a, b);
+    cudaEventDestroy(a);
+    cudaEventDestroy(b);
+  }
   cudaFree(Q); cudaFree(K); cudaFree(V); cudaFree(O); cudaFree(L);
-  return ms / 30.0f;
+  return (err == cudaSuccess) ? ms / 30.0f : FA_BENCH_FAILED;
 }
 
 // Resolve a geometry to an index in `cands` (-1 if it isn't a current candidate).
@@ -210,7 +220,7 @@ int fa_autotune_pick(const FaCandidate *cands, int n,
     if (it != cache.end() && fa_geom_index(cands, n, it->second) >= 0) {
       geom = it->second; // cache/wisdom hit and still a valid candidate
     } else {
-      float best = 1e30f;
+      float best = FA_BENCH_FAILED;
       int best_i = -1;
       for (int i = 0; i < n; i++) {
         if (!fa_valid(cands[i], p.d_head))
@@ -226,8 +236,12 @@ int fa_autotune_pick(const FaCandidate *cands, int n,
           best_i = i;
         }
       }
+      // No candidate was both valid and launchable (every one was pruned, hit
+      // OOM, or returned a launch error). Report it instead of guessing — the
+      // caller falls back to its heuristic — and leave the cache / wisdom
+      // untouched so a later call can search again.
       if (best_i < 0)
-        best_i = 0; // no valid candidate (shouldn't happen) → first
+        return -1;
       geom = std::make_tuple(cands[best_i].bm, cands[best_i].bn, cands[best_i].nw);
       cache[key] = geom;
       fa_wisdom_save(key, geom);
@@ -238,8 +252,7 @@ int fa_autotune_pick(const FaCandidate *cands, int n,
                cands[best_i].bn, cands[best_i].nw, best);
     }
   }
-  int idx = fa_geom_index(cands, n, geom);
-  return idx >= 0 ? idx : 0;
+  return fa_geom_index(cands, n, geom); // always >= 0: geom came from `cands`
 }
 
 } // namespace transformer

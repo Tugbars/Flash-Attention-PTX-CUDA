@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <random>
 #include "flash_attention.h"
+#include "cuda_check.h"
 
 using namespace transformer;
 static int g_fail = 0;
@@ -100,7 +101,7 @@ static void vprefill(int B, int Hq, int Hkv, int S, int D, bool causal,
   p.scale = sc; p.causal = causal;
   p.dtype = std::is_same<T, half>::value ? DType::FP16 : DType::BF16;
   p.autotune = autotune; p.stream = 0;
-  launch_flash_attention(p);
+  CUDA_CHECK(launch_flash_attention(p));
   cudaDeviceSynchronize();
 
   std::vector<T> Oo(Nq); std::vector<float> Lo((size_t)B * Hq * S);

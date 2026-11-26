@@ -14,35 +14,24 @@
 //   params.scale = 1.0f / sqrtf(64.0f);
 //   params.causal = true;
 //   params.stream = 0;
-//   transformer::launch_flash_attention(params);
+//   cudaError_t err = transformer::launch_flash_attention(params);
 //
 // Constraints:
 //   - d_head must be 64 or 128 (tuned paths; must be a multiple of 16)
 //   - Q, K, V, O are [batch_size * num_heads, seq_len, d_head] in FP16
 //   - L (optional) is [batch_size * num_heads, seq_len] in FP32
 //   - Minimum compute capability: sm_80 (Ampere)
+//
+// Error handling: the prefill launch_* entry points validate their arguments
+// and return a cudaError_t; they never terminate the process. The return value
+// is [[nodiscard]] — a rejected launch writes nothing to O, so an ignored
+// error is silently-uninitialised output. The decode / cache-write launchers
+// and the fa_* facade still abort with a named message (not yet migrated).
+// This header no longer defines CUDA_CHECK; tests use tests/cuda_check.h.
 // ============================================================================
 
-#include <cstdio>
-#include <cstdlib>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-
-
-// ============================================================================
-// Error checking macro
-// ============================================================================
-#ifndef CUDA_CHECK
-#define CUDA_CHECK(call)                                                       \
-  do {                                                                         \
-    cudaError_t err = (call);                                                  \
-    if (err != cudaSuccess) {                                                  \
-      fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,         \
-              cudaGetErrorString(err));                                        \
-      exit(EXIT_FAILURE);                                                      \
-    }                                                                          \
-  } while (0)
-#endif
 
 namespace transformer {
 
@@ -79,7 +68,15 @@ struct FlashAttentionParams {
 };
 
 // Implemented in kernels/flash_attention.cu
-void launch_flash_attention(const FlashAttentionParams &params);
+//
+// Returns cudaErrorInvalidValue for a rejected argument — unsupported d_head,
+// num_heads % num_kv_heads != 0, a null or non-16-byte-aligned Q/K/V/O,
+// batch_size * num_heads > 65535 (gridDim.y), or a non-positive length —
+// otherwise the launch status. The same contract applies to the varlen and
+// paged-prefill entry points below (which also reject null index arrays and
+// bad page geometry).
+[[nodiscard]] cudaError_t
+launch_flash_attention(const FlashAttentionParams &params);
 
 // ============================================================================
 // Varlen (ragged-batch) prefill — the serving-engine API.
@@ -94,7 +91,8 @@ void launch_flash_attention(const FlashAttentionParams &params);
 // kv j where j <= i + (seqlen_k - seqlen_q). With seqlen_k == seqlen_q this
 // is ordinary causal attention; with seqlen_k > seqlen_q it is chunked /
 // append prefill (new queries attending to an existing KV prefix plus
-// themselves). Queries with no attendable keys write O = 0.
+// themselves). Queries with no attendable keys write O = 0 and LSE = -inf
+// (all three prefill layouts agree on this).
 // ============================================================================
 struct FlashAttentionVarlenParams {
   const half *Q; // [total_q, H_q, D]  (address carrier; dtype below)
@@ -116,7 +114,8 @@ struct FlashAttentionVarlenParams {
 };
 
 // Implemented in kernels/flash_attention.cu
-void launch_flash_attention_varlen(const FlashAttentionVarlenParams &params);
+[[nodiscard]] cudaError_t
+launch_flash_attention_varlen(const FlashAttentionVarlenParams &params);
 
 // ============================================================================
 // Paged prefill — chunked prefill over a PAGED KV cache. New queries (packed
@@ -150,7 +149,7 @@ struct FlashAttentionPagedPrefillParams {
   cudaStream_t stream;
 };
 
-void launch_flash_attention_paged_prefill(
+[[nodiscard]] cudaError_t launch_flash_attention_paged_prefill(
     const FlashAttentionPagedPrefillParams &params);
 
 // ============================================================================

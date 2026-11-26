@@ -19,6 +19,7 @@
 
 // Use the project's flash attention header
 #include "../include/flash_attention.h"
+#include "../tests/cuda_check.h"
 
 using namespace transformer;
 
@@ -298,7 +299,7 @@ int main() {
 
     // Warmup
     for (int i = 0; i < 5; i++)
-        launch_flash_attention(params);
+        CUDA_CHECK(launch_flash_attention(params));
     cudaDeviceSynchronize();
 
     // Benchmark
@@ -306,7 +307,7 @@ int main() {
     const int iters = 200;
     timer.begin();
     for (int i = 0; i < iters; i++)
-        launch_flash_attention(params);
+        CUDA_CHECK(launch_flash_attention(params));
     float total_ms = timer.end();
     float avg_ms = total_ms / iters;
 

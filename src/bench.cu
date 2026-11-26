@@ -19,6 +19,7 @@
 #include <algorithm>
 
 #include "../include/flash_attention.h"
+#include "../tests/cuda_check.h"
 
 using namespace transformer;
 
@@ -267,7 +268,7 @@ bool verify_flash_attention(int batch_size, int n_heads, int seq_len, int d_head
     params.causal = true;
     params.stream = 0;
 
-    launch_flash_attention(params);
+    CUDA_CHECK(launch_flash_attention(params));
     cudaDeviceSynchronize();
 
     cudaMemcpy(h_O_half.data(), d_O, bytes, cudaMemcpyDeviceToHost);
@@ -338,12 +339,12 @@ void benchmark_flash_attention(int batch_size, int n_heads, int seq_len, int d_h
     params.causal     = true;
     params.stream     = nullptr;
 
-    for (int i = 0; i < warmup; i++) launch_flash_attention(params);
+    for (int i = 0; i < warmup; i++) CUDA_CHECK(launch_flash_attention(params));
     cudaDeviceSynchronize();
 
     CudaTimer timer;
     timer.begin();
-    for (int i = 0; i < iters; i++) launch_flash_attention(params);
+    for (int i = 0; i < iters; i++) CUDA_CHECK(launch_flash_attention(params));
     float total_ms = timer.end();
     float avg_ms = total_ms / iters;
 

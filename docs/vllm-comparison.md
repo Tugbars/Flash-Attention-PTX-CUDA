@@ -69,7 +69,7 @@ Two conclusions fall straight out of this table:
 
 ## 3. The two optimizations
 
-### 3.1 The fat-warp tier (`flash_attention_fat_kernel`)
+### 3.1 The fat-warp tier (`fa_prefill_splitq_kernel`, formerly `flash_attention_fat_kernel`)
 
 A new kernel adopting the few-fat-warps shape, dispatched at saturation
 (the split-N small tile still serves under-saturated grids, where it beats

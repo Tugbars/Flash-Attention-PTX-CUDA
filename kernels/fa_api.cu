@@ -22,6 +22,24 @@ namespace {
   abort();
 }
 
+// The prefill launchers return a cudaError_t instead of terminating. The
+// facade's contract is still "bad arguments abort with a named message", so a
+// rejected or failed launch is reported the same way — never dropped (a
+// rejected launch writes nothing to O). cudaErrorInvalidValue here means the
+// launcher's own validation fired on something check_common() does not cover:
+// a tensor that is not 16-byte aligned, or batch_size * num_heads > 65535.
+inline void check_launch(const char *fn, cudaError_t err) {
+  if (err == cudaSuccess)
+    return;
+  fprintf(stderr,
+          "%s: launch failed: %s%s\n", fn, cudaGetErrorString(err),
+          err == cudaErrorInvalidValue
+              ? " (launcher rejected an argument: Q/K/V/O must be 16-byte "
+                "aligned and batch_size * num_heads <= 65535)"
+              : "");
+  abort();
+}
+
 inline float resolve_scale(float scale, int d_head) {
   return (scale > 0.0f) ? scale : 1.0f / sqrtf((float)d_head);
 }
@@ -85,7 +103,7 @@ void fa_attention(const FaAttentionArgs &a) {
     p.dtype = a.dtype;
     p.autotune = a.autotune;
     p.stream = a.stream;
-    launch_flash_attention(p);
+    check_launch("fa_attention", launch_flash_attention(p));
   } else {
     // varlen mode: packed [T, H, D]
     if (a.cu_seqlens_k == nullptr)
@@ -109,7 +127,7 @@ void fa_attention(const FaAttentionArgs &a) {
     p.causal = a.causal;
     p.dtype = a.dtype;
     p.stream = a.stream;
-    launch_flash_attention_varlen(p);
+    check_launch("fa_attention", launch_flash_attention_varlen(p));
   }
 }
 
@@ -197,7 +215,7 @@ void fa_cache_attention(const FaCacheAttentionArgs &a) {
   p.causal = a.causal;
   p.dtype = a.dtype;
   p.stream = a.stream;
-  launch_flash_attention_paged_prefill(p);
+  check_launch("fa_cache_attention", launch_flash_attention_paged_prefill(p));
 }
 
 // --- 3) fa_cache_write -------------------------------------------------------

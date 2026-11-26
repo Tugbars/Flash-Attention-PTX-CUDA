@@ -22,11 +22,28 @@
 #include "../include/flash_attention.h"
 #include <cfloat>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <type_traits>
+
+// The decode / cache-write launchers have not been migrated to the prefill
+// path's cudaError_t-return convention yet (see flash_attention.cu): they still
+// terminate the process on a CUDA error or a rejected argument. The public
+// header no longer exports an abort macro, so this file carries its own until
+// that migration happens.
+#define DEC_CUDA_CHECK(call)                                                   \
+  do {                                                                         \
+    cudaError_t err_ = (call);                                                 \
+    if (err_ != cudaSuccess) {                                                 \
+      fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,         \
+              cudaGetErrorString(err_));                                       \
+      exit(EXIT_FAILURE);                                                      \
+    }                                                                          \
+  } while (0)
 
 namespace transformer {
 
@@ -78,8 +95,8 @@ inline int dec_sm_count() {
   static int n = -1;
   if (n < 0) {
     int dev = 0;
-    CUDA_CHECK(cudaGetDevice(&dev));
-    CUDA_CHECK(cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev));
+    DEC_CUDA_CHECK(cudaGetDevice(&dev));
+    DEC_CUDA_CHECK(cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev));
   }
   return n;
 }
@@ -1176,7 +1193,7 @@ void launch_flash_attention_decode(const FlashDecodeParams &p) {
     decode_dispatch<__nv_bfloat16>(p, pl, Op, mp, lp);
   else
     decode_dispatch<half>(p, pl, Op, mp, lp);
-  CUDA_CHECK(cudaGetLastError());
+  DEC_CUDA_CHECK(cudaGetLastError());
 }
 
 // ============================================================================
@@ -1372,7 +1389,7 @@ void launch_flash_attention_decode_paged(const FlashDecodePagedParams &p) {
     else
       decode_dispatch_paged<half, half>(p, pl, Op, mp, lp, p.scale, 1.0f);
   }
-  CUDA_CHECK(cudaGetLastError());
+  DEC_CUDA_CHECK(cudaGetLastError());
 }
 
 // ============================================================================
@@ -1577,7 +1594,7 @@ void launch_kv_cache_write(const KvCacheWriteParams &p) {
       write_int4<__nv_bfloat16>(p, rope);
     else
       write_int4<half>(p, rope);
-    CUDA_CHECK(cudaGetLastError());
+    DEC_CUDA_CHECK(cudaGetLastError());
     return;
   }
 
@@ -1604,7 +1621,7 @@ void launch_kv_cache_write(const KvCacheWriteParams &p) {
     else
       write_generic<half, half>(p, rope, k_inv, v_inv);
   }
-  CUDA_CHECK(cudaGetLastError());
+  DEC_CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace transformer
