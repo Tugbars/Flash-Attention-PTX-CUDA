@@ -117,8 +117,13 @@ Integration is one header and one library:</p>
       <code>scale = 0</code> means 1/√d_head.</li>
   <li>All index arrays (<code>cu_seqlens_*</code>, <code>block_table</code>,
       <code>seq_lens</code>, <code>slot_mapping</code>) are <strong>device</strong> memory.</li>
-  <li>Zero-initialize every args struct — the defaults are all valid. Bad
-      arguments abort with a named message instead of corrupting memory.</li>
+  <li>Zero-initialize every args struct — the defaults are all valid.</li>
+  <li>Every <code>fa_*</code> call returns a <code>cudaError_t</code>. Bad
+      arguments are rejected before anything is launched: one named
+      <code>fa_*:</code> line on stderr and <code>cudaErrorInvalidValue</code>,
+      never corrupted memory or a terminated process. Always check the result —
+      a rejected call leaves <code>O</code> unwritten (the recipes below omit
+      the check for brevity).</li>
 </ul>
 
 <h2><span class="no">3</span>Recipe: plain batched attention</h2>
@@ -223,20 +228,29 @@ quantization itself.</p>
 <h2><span class="no">7</span>Validate and benchmark</h2>
 <p>Seven independent gates validate everything against double-precision
 references under a strict policy (random std=1 inputs, thresholds ~4× the
-noise floor). Run them after any change; each exits 0 on pass:</p>
+noise floor), and an eighth checks the error contract (every rejected argument
+returns <code>cudaErrorInvalidValue</code> without a launch or a write). Run
+them after any change; each exits 0 on pass:</p>
 <pre><code>fa_validate · fa_varlen_validate · fa_paged_validate · fa_fp8_validate
-fa_int4_validate · fa_paged_prefill_validate · fa_api_validate</code></pre>
+fa_int4_validate · fa_paged_prefill_validate · fa_api_validate
+fa_error_validate</code></pre>
 <p><code>flash_bench</code> reports per-shape TFLOPS through the production
 dispatcher.</p>
 
 <h2><span class="no">8</span>Troubleshooting</h2>
+<p>An <em>error:</em> row means the call returned
+<code>cudaErrorInvalidValue</code> and printed that line to stderr (from
+Python: a <code>RuntimeError</code>, with the line on stderr).</p>
 <table>
   <tr><th>Symptom</th><th>Likely cause</th></tr>
-  <tr><td>abort: <code>… requires scratch</code></td><td>decode called without a <code>fa_cache_attention_scratch_bytes</code> allocation</td></tr>
-  <tr><td>abort: <code>FP8 … requires k_scale/v_scale &gt; 0</code></td><td>scales left at the zero-init default</td></tr>
-  <tr><td>abort: <code>INT4_G32 … requires K_scales/V_scales</code></td><td>scale pools not allocated/attached</td></tr>
-  <tr><td>abort: <code>quantized caches … decode-only</code></td><td>chunked prefill on an FP8/INT4 cache — use AUTO for prefill</td></tr>
-  <tr><td>garbage output, no abort</td><td>index arrays passed as host memory; stale <code>block_table</code>/<code>seq_lens</code>; or K/V not written to the cache before a prefill chunk</td></tr>
+  <tr><td>error: <code>… requires scratch</code></td><td>decode called without a <code>fa_cache_attention_scratch_bytes</code> allocation</td></tr>
+  <tr><td>error: <code>FP8 … requires k_scale/v_scale &gt; 0</code></td><td>scales left at the zero-init default</td></tr>
+  <tr><td>error: <code>INT4_G32 … requires K_scales/V_scales</code></td><td>scale pools not allocated/attached</td></tr>
+  <tr><td>error: <code>quantized caches … decode-only</code></td><td>chunked prefill on an FP8/INT4 cache — use AUTO for prefill</td></tr>
+  <tr><td>error: <code>d_head must be 64 or 128</code></td><td>only 64 and 128 are compiled</td></tr>
+  <tr><td>error: <code>launch failed: invalid argument</code></td><td>a tensor is not 16-byte aligned, or <code>batch_size * num_heads &gt; 65535</code></td></tr>
+  <tr><td>output never written, no crash</td><td>the returned <code>cudaError_t</code> was ignored — check it</td></tr>
+  <tr><td>garbage output, no error</td><td>index arrays passed as host memory; stale <code>block_table</code>/<code>seq_lens</code>; or K/V not written to the cache before a prefill chunk</td></tr>
   <tr><td>decode output all zeros for one sequence</td><td>its <code>seq_lens[b]</code> is 0 — by design</td></tr>
   <tr><td>results differ run-to-run</td><td>they shouldn't — all kernels are deterministic; suspect your own buffers</td></tr>
 </table>

@@ -25,6 +25,14 @@ typed `half*` as address carriers); GQA/MQA via `num_kv_heads` (0 = MHA);
 `d_head` is 64 or 128; `scale = 0` means `1/sqrt(d_head)`; `lse` output is
 optional (`nullptr` skips); all index arrays live in device memory.
 
+**Errors.** Every callable (and every `launch_*` entry point) returns a
+`[[nodiscard]] cudaError_t`; nothing in the library terminates the process. A
+rejected argument returns `cudaErrorInvalidValue` before anything is launched
+or written, with one named line on stderr (`fa_attention: d_head must be 64 or
+128`); any other value is the CUDA launch status. The snippets below omit the
+check for brevity — real code must test the result. From Python a failure
+raises `RuntimeError`. `tests/fa_error_validate.cu` gates this contract.
+
 ---
 
 ## 1. `fa_attention` — attention over tensors

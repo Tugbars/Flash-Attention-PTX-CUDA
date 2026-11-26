@@ -72,8 +72,12 @@ Conventions that apply everywhere:
   `slot_mapping`) are **device** memory.
 - Zero-initialize every args struct (`FaAttentionArgs a = {};`) — the
   defaults (fp16, MHA, auto scale, no LSE) are all valid.
-- Bad arguments abort with a named error message rather than corrupting
-  memory; treat any `fa_*:` line on stderr as a bug in the calling code.
+- Every `fa_*` call returns a `cudaError_t` (`[[nodiscard]]`). Bad arguments
+  are rejected before anything is launched: the call prints one named `fa_*:`
+  line to stderr and returns `cudaErrorInvalidValue` — it never corrupts
+  memory or terminates the process. Treat any `fa_*:` line on stderr as a bug
+  in the calling code, and always check the result: a rejected call leaves
+  `O` unwritten. (The recipes after §4 omit the check for brevity.)
 
 ## 4. Recipe: plain batched attention
 
@@ -93,7 +97,12 @@ a.d_head  = 128;
 a.causal  = true;
 a.autotune = true;                        // optional: per-shape tile search,
                                           // cached to an FA_WISDOM file
-fa_attention(a);
+cudaError_t err = fa_attention(a);
+if (err != cudaSuccess) {
+  // cudaErrorInvalidValue: an argument was rejected and the reason is on
+  // stderr as an "fa_attention: ..." line. Anything else: the launch failed.
+  // Either way O was not written.
+}
 ```
 
 The dispatcher picks the right kernel tier by GPU saturation automatically;
@@ -220,26 +229,35 @@ pass):
 ```bash
 cmake --build . --target fa_validate fa_varlen_validate fa_paged_validate \
                         fa_fp8_validate fa_int4_validate \
-                        fa_paged_prefill_validate fa_api_validate
+                        fa_paged_prefill_validate fa_api_validate \
+                        fa_error_validate
 ./fa_validate && ./fa_varlen_validate && ./fa_paged_validate && \
 ./fa_fp8_validate && ./fa_int4_validate && ./fa_paged_prefill_validate && \
-./fa_api_validate
+./fa_api_validate && ./fa_error_validate
 ```
 
 The gates enforce a strict policy (random std=1 inputs, double-precision
 references, thresholds ~4× the fp16/bf16 noise floor) — do not weaken them.
+`fa_error_validate` checks the error contract instead of numerics: every
+rejected argument must come back as `cudaErrorInvalidValue` without a launch
+or a write (its `fa_*:` / `flash_decode*:` stderr lines are expected output).
 `flash_bench` gives per-shape TFLOPS through the production dispatcher.
 
 ## 9. Troubleshooting
 
+An `error:` row means the call returned `cudaErrorInvalidValue` and printed
+that line to stderr (from Python: a `RuntimeError`, with the line on stderr).
+
 | Symptom | Likely cause |
 |---|---|
-| abort: `... requires scratch` | decode called without `fa_cache_attention_scratch_bytes` allocation |
-| abort: `FP8 ... requires k_scale/v_scale > 0` | forgot to set scales on the `KvCache` (zero-init default is 0) |
-| abort: `INT4_G32 ... requires K_scales/V_scales` | scale pools not allocated/attached |
-| abort: `quantized caches ... decode-only` | chunked prefill on an FP8/INT4 cache — use an AUTO cache for prefill |
-| abort: `unsupported d_head` | only 64 and 128 are compiled |
-| garbage output, no abort | index arrays passed as host memory, stale `block_table`/`seq_lens`, or K/V not written to the cache before a prefill chunk |
+| error: `... requires scratch` | decode called without `fa_cache_attention_scratch_bytes` allocation |
+| error: `FP8 ... requires k_scale/v_scale > 0` | forgot to set scales on the `KvCache` (zero-init default is 0) |
+| error: `INT4_G32 ... requires K_scales/V_scales` | scale pools not allocated/attached |
+| error: `quantized caches ... decode-only` | chunked prefill on an FP8/INT4 cache — use an AUTO cache for prefill |
+| error: `d_head must be 64 or 128` | only 64 and 128 are compiled |
+| error: `launch failed: invalid argument` | a tensor is not 16-byte aligned (e.g. a pointer offset by part of a row), or `batch_size * num_heads > 65535` |
+| output never written, no crash | the returned `cudaError_t` was ignored — check it |
+| garbage output, no error | index arrays passed as host memory, stale `block_table`/`seq_lens`, or K/V not written to the cache before a prefill chunk |
 | decode output all zeros for one sequence | its `seq_lens[b]` is 0 — by design (nothing to attend) |
 | results differ run-to-run | they shouldn't: all kernels are deterministic; suspect your own buffers |
 
@@ -248,7 +266,9 @@ references, thresholds ~4× the fp16/bf16 noise floor) — do not weaken them.
 The same three-callable surface is available from Python as the `fa_ptx`
 package. Install with `pip install -e python/` (needs nvcc + a CUDA torch),
 or just `import fa_ptx` from the repo for a JIT build. All tensors are CUDA
-`float16`/`bfloat16`; index tensors are CUDA `int32`.
+`float16`/`bfloat16`; index tensors are CUDA `int32`. A rejected argument
+(an unsupported `d_head`, a missing scale pool, ...) raises `RuntimeError`;
+the specific reason is printed to stderr as an `fa_*:` line.
 
 ### `fa_ptx.attention(...) -> Tensor`
 
