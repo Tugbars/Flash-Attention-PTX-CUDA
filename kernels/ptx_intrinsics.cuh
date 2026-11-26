@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <type_traits>
 
 namespace transformer {
@@ -43,6 +44,26 @@ template <>
 __device__ __forceinline__ uint32_t pack2<__nv_bfloat16>(float a, float b) {
   __nv_bfloat162 h = __floats2bfloat162_rn(a, b);
   return *reinterpret_cast<uint32_t *>(&h);
+}
+
+/// Two e4m3 (fp8) values, in the low 16 bits of @p two_bytes with the first in
+/// the low byte, to two fp16 values in one register. The conversion is exact.
+/// One `cvt` instruction from sm_89 on; earlier targets use the cuda_fp8.h
+/// emulation. (Calling __nv_cvt_fp8x2_to_halfraw2 directly on sm_89+ emits the
+/// same instruction but returns a two-field struct, which costs two extracts
+/// and a re-pack per conversion.)
+__device__ __forceinline__ uint32_t e4m3x2_to_f16x2(uint32_t two_bytes) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
+  uint32_t r;
+  asm("cvt.rn.f16x2.e4m3x2 %0, %1;"
+      : "=r"(r)
+      : "h"(static_cast<unsigned short>(two_bytes)));
+  return r;
+#else
+  const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(
+      static_cast<__nv_fp8x2_storage_t>(two_bytes), __NV_E4M3);
+  return (uint32_t)h.x | ((uint32_t)h.y << 16);
+#endif
 }
 
 /// @}

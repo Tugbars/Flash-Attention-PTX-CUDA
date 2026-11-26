@@ -124,6 +124,27 @@ struct FlashAttentionVarlenParams {
 launch_flash_attention_varlen(const FlashAttentionVarlenParams &params);
 
 // ============================================================================
+// KV-cache element type, shared by paged prefill, paged decode and the cache
+// writer. AUTO (0, the zero-init default) stores the cache in the compute
+// dtype (fp16/bf16).
+//
+// FP8_E4M3 halves cache bytes; values are stored as fp8(x / scale) with
+// caller-provided per-tensor k_scale / v_scale (typical calibration:
+// scale = max|X| / 448). Dequantization is folded outside the hot loops
+// (k_scale into the softmax scale, v_scale into the output write), so FP8
+// reads cost no per-element scale arithmetic.
+//
+// INT4_G32 quarters cache bytes: asymmetric uint4 with a (scale, zero) half2
+// per GROUP of 32 head-dim channels, computed per (token, kv-head) by the
+// cache writer — no caller calibration needed. Requires the parallel scale
+// pools (K_scales / V_scales):
+//   payload : [num_pages, page_size, H_kv, D/2]  bytes (2 nibbles/byte,
+//             channel c even = low nibble of byte c/2)
+//   scales  : [num_pages, page_size, H_kv, D/32] half2 (scale, zero)
+// ============================================================================
+enum class KvDType { AUTO = 0, FP8_E4M3 = 1, INT4_G32 = 2 };
+
+// ============================================================================
 // Paged prefill — chunked prefill over a PAGED KV cache. New queries (packed
 // varlen, [total_q, H_q, D]) attend to each sequence's full cached KV, read
 // through the block table. Causal is BOTTOM-RIGHT aligned against the cache
@@ -131,14 +152,20 @@ launch_flash_attention_varlen(const FlashAttentionVarlenParams &params);
 //
 // Contract: the new tokens' K/V must already be IN the paged cache (write
 // them with launch_kv_cache_write first); this kernel reads K/V only from the
-// pools. fp16/bf16 pools only (kv_dtype quantized prefill is future work).
+// pools.
+//
+// The cache may be quantized (kv_dtype FP8_E4M3 or INT4_G32, same pool
+// layouts as paged decode): K/V are dequantized to the compute dtype on the
+// way into the kernel's shared-memory tiles, so the attention itself is the
+// fp16/bf16 pipeline. The result is attention over the values the cache
+// actually holds — the same values paged decode reads from it.
 // ============================================================================
 struct FlashAttentionPagedPrefillParams {
   const half *Q; // [total_q, H_q, D] packed varlen (compute dtype)
   half *O;       // [total_q, H_q, D]
   float *L;      // [total_q, H_q] LSE, optional/nullptr
-  const half *K_cache;     // [num_pages, page_size, H_kv, D]
-  const half *V_cache;     // [num_pages, page_size, H_kv, D]
+  const half *K_cache;     // [num_pages, page_size, H_kv, D] (elem: kv_dtype)
+  const half *V_cache;     // [num_pages, page_size, H_kv, D] (elem: kv_dtype)
   const int *cu_seqlens_q; // [batch_size + 1], device memory
   const int *seq_lens_k;   // [batch_size] cached KV length per seq, device
   const int *block_table;  // [batch_size, max_blocks_per_seq], device
@@ -152,9 +179,18 @@ struct FlashAttentionPagedPrefillParams {
   float scale;
   bool causal;
   DType dtype;
+  KvDType kv_dtype;     // AUTO (= dtype), FP8_E4M3, or INT4_G32
+  float k_scale;        // required (> 0) when kv_dtype == FP8_E4M3
+  float v_scale;        // required (> 0) when kv_dtype == FP8_E4M3
+  const void *K_scales; // INT4_G32 only: [pages, ps, H_kv, D/32] half2
+  const void *V_scales; // INT4_G32 only
   cudaStream_t stream;
 };
 
+// Rejects (cudaErrorInvalidValue), beyond the cases listed for
+// launch_flash_attention: an FP8 cache without k_scale/v_scale > 0, and an
+// INT4_G32 cache without its scale pools (or with misaligned ones — payload
+// pools need 16-byte alignment like every tensor, scale pools 4-byte).
 [[nodiscard]] cudaError_t launch_flash_attention_paged_prefill(
     const FlashAttentionPagedPrefillParams &params);
 
@@ -214,23 +250,9 @@ launch_flash_attention_decode(const FlashDecodeParams &params);
 // Logical token j of sequence b lives at page block_table[b][j / page_size],
 // slot j % page_size. Per-sequence lengths are ragged; splits are planned on
 // max_seq_len_kv and out-of-range splits write empty partials (safe combine).
-// ============================================================================
-// KV-cache element type. AUTO (0, the zero-init default) stores the cache in
-// the compute dtype (fp16/bf16). FP8_E4M3 halves cache bytes; values are
-// stored as fp8(x / scale) with caller-provided per-tensor k_scale / v_scale
-// (typical calibration: scale = max|X| / 448). Dequantization is folded
-// outside the hot loop (k_scale into the softmax scale, v_scale into the
-// output write), so FP8 reads cost no extra per-token arithmetic.
 //
-// INT4_G32 quarters cache bytes: asymmetric uint4 with a (scale, zero) half2
-// per GROUP of 32 head-dim channels, computed per (token, kv-head) by the
-// cache writer — no caller calibration needed. Requires the parallel scale
-// pools (K_scales / V_scales):
-//   payload : [num_pages, page_size, H_kv, D/2]  bytes (2 nibbles/byte,
-//             channel c even = low nibble of byte c/2)
-//   scales  : [num_pages, page_size, H_kv, D/32] half2 (scale, zero)
-enum class KvDType { AUTO = 0, FP8_E4M3 = 1, INT4_G32 = 2 };
-
+// The cache element type is kv_dtype (see KvDType above).
+// ============================================================================
 struct FlashDecodePagedParams {
   const half *Q;       // [B, H_q, D]
   const half *K_cache; // [num_pages, page_size, H_kv, D] (elem type: kv_dtype)
@@ -347,8 +369,9 @@ struct FaAttentionArgs {
 //                   supports fp16/bf16/FP8/INT4 caches; num_splits 0 = auto;
 //                   needs `scratch` (size via fa_cache_attention_scratch_bytes).
 //   Chunked prefill: cu_seqlens_q set, max_seqlen_q > 1 — new chunks attend
-//                   the full cache, bottom-right causal. AUTO caches only (for
-//                   now). New tokens' K/V must already be written to the cache.
+//                   the full cache, bottom-right causal; fp16/bf16/FP8/INT4
+//                   caches. New tokens' K/V must already be written to the
+//                   cache.
 // lse: [total_q, H_q] in both modes.
 struct FaCacheAttentionArgs {
   const half *Q;

@@ -116,6 +116,14 @@ target_include_directories(fa_paged_prefill_validate PRIVATE
     ${CMAKE_SOURCE_DIR}/include
 )
 
+# Quantized-cache prefill gate (chunked prefill over FP8 / INT4 caches:
+# quantization-aware reference + agreement with paged decode).
+add_executable(fa_quant_prefill_validate tests/fa_quant_prefill_validate.cu)
+target_link_libraries(fa_quant_prefill_validate PRIVATE flash_attention)
+target_include_directories(fa_quant_prefill_validate PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
 # Unified-API equivalence gate: the fa_* facade must produce BIT-IDENTICAL
 # outputs to the underlying launch_* entry points.
 add_executable(fa_api_validate tests/fa_api_validate.cu)

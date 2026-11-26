@@ -10,9 +10,12 @@
  *   row tile and the full row width, so softmax is intra-warp only. Q lives in
  *   registers, P never touches shared memory (QK accumulator layout == PV A
  *   operand layout), V(i) streams behind QK+softmax and K(i+1) behind PV. Used
- *   for every saturated grid. Instantiated over three addressing policies
- *   (BatchGeometry, VarlenGeometry, PagedGeometry) that differ only in how
- *   rows are located; the compute pipeline is written once in splitq_attend().
+ *   for every saturated grid. Instantiated over five addressing policies that
+ *   differ only in how rows are located and, for the last two, decoded:
+ *   BatchGeometry, VarlenGeometry, PagedGeometry (K / V stored in the compute
+ *   type) and PagedFp8Geometry, PagedInt4Geometry (quantized paged caches,
+ *   dequantized on the way into shared memory). The compute pipeline is
+ *   written once in splitq_attend().
  *
  * - fa_prefill_splitn_kernel(): 32xBN tile, 4 warps. Warp pairs share a row
  *   tile and split the column range, exchanging softmax partials through
@@ -37,7 +40,8 @@
  * reference, nrmse < 1e-3 (fp16) / 6e-3 (bf16). Loose thresholds with small
  * inputs hid a K-fragment addressing bug (.trans on the K load, see
  * ptx_intrinsics.cuh) for the kernel's entire history; do not weaken the gate.
- * Run it, plus the varlen / paged-prefill gates, after any change here.
+ * Run it, plus the varlen / paged-prefill / quantized-prefill gates, after any
+ * change here.
  */
 
 #include "ptx_intrinsics.cuh"
@@ -162,11 +166,23 @@ __device__ __forceinline__ void mask_fragment(float (&s)[4], int col0,
  * - `k_row(t)`, `v_row(t)`: kv position t of K / V
  *
  * Each geometry is built from a kernel-argument struct by `resolve(bh_idx)`.
+ *
+ * `kDequant` says how K / V reach shared memory. false: K / V are stored in
+ * the compute type T and rows are copied as they are (cp.async from `k_row` /
+ * `v_row`). true: the pool is quantized, and instead of `k_row` / `v_row` the
+ * geometry provides (see the quantized geometries below)
+ * - `Raw`: the still-quantized data of one load, a few registers;
+ * - `k_fetch(t, u)`, `v_fetch(t, u)`: load unit u of kv position t as a `Raw`.
+ *   One unit is `kChunksPerLoad` adjacent 16-byte chunks of the row;
+ * - `decode(raw, out)`: dequantize a `Raw` to `kChunksPerLoad` chunks of T.
+ *   No memory access; a value-initialised `Raw` must decode to zeros;
+ * - `out_scale()`: a factor applied once to the output.
  * @{
  */
 
 /// Contiguous `[B*H, S, D]` tensors; K/V are `[B*H_kv, S, D]`.
 template <class T, int D> struct BatchGeometry {
+  static constexpr bool kDequant = false;
   const T *q, *k, *v;
   T *o;
   float *lse;
@@ -210,6 +226,7 @@ template <class T> struct BatchArgs {
 /// Packed token-major tensors: Q/O `[total_q, H_q, D]`, K/V
 /// `[total_k, H_kv, D]`, with cu_seqlens prefix sums. Token stride is H*D.
 template <class T, int D> struct VarlenGeometry {
+  static constexpr bool kDequant = false;
   const T *q, *k, *v;
   T *o;
   float *lse;
@@ -259,6 +276,7 @@ template <class T> struct VarlenArgs {
 /// `[num_pages, page_size, H_kv, D]`; kv position t of sequence b lives in
 /// page `block_table[b][t / page_size]`, slot `t % page_size`.
 template <class T, int D> struct PagedGeometry {
+  static constexpr bool kDequant = false;
   const T *q, *k_pool, *v_pool;
   T *o;
   float *lse;
@@ -316,6 +334,223 @@ template <class T> struct PagedArgs {
   }
 };
 
+// ----------------------------------------------------------------------------
+// Quantized paged pools (FP8_E4M3, INT4_G32)
+// ----------------------------------------------------------------------------
+//
+// A quantized pool cannot be copied into shared memory with cp.async, which
+// moves bytes. Instead each thread loads raw pool bytes into registers,
+// dequantizes them there and stores compute-type chunks (SplitqStage), so the
+// K / V tiles in shared memory, and the whole ldmatrix / MMA / softmax
+// pipeline behind them, are exactly what an fp16 / bf16 pool produces. Only
+// the two geometries below know the pool formats; they match the cache writer
+// and the decode kernels in flash_attention_decode.cu.
+
+/// Two e4m3 bytes (byte 0 in the low bits) to two elements of T in one 32-bit
+/// register. Exact: every finite e4m3 value is representable in fp16 and bf16.
+template <class T>
+__device__ __forceinline__ uint32_t fp8x2_to_elems(uint32_t two_bytes) {
+  const uint32_t as_half2 = ptx::e4m3x2_to_f16x2(two_bytes);
+  if constexpr (::std::is_same<T, __nv_bfloat16>::value) {
+    const float2 f = __half22float2(*reinterpret_cast<const __half2 *>(&as_half2));
+    return ptx::pack2<T>(f.x, f.y);
+  } else {
+    return as_half2;
+  }
+}
+
+/// Eight e4m3 bytes (two little-endian words) to one 16-byte chunk of T.
+template <class T>
+__device__ __forceinline__ uint4 fp8x8_to_chunk(uint32_t lo, uint32_t hi) {
+  return make_uint4(fp8x2_to_elems<T>(lo & 0xffffu), fp8x2_to_elems<T>(lo >> 16),
+                    fp8x2_to_elems<T>(hi & 0xffffu), fp8x2_to_elems<T>(hi >> 16));
+}
+
+/// Eight uint4 codes (channel c in bits [4c, 4c + 4) of @p codes) to one
+/// 16-byte chunk of T: `x = code * scale + zero`, rounded to T.
+template <class T>
+__device__ __forceinline__ uint4 int4x8_to_chunk(uint32_t codes, float scale,
+                                                 float zero) {
+  float x[8];
+#pragma unroll
+  for (int c = 0; c < 8; c++)
+    x[c] = (float)((codes >> (4 * c)) & 0xFu) * scale + zero;
+  return make_uint4(ptx::pack2<T>(x[0], x[1]), ptx::pack2<T>(x[2], x[3]),
+                    ptx::pack2<T>(x[4], x[5]), ptx::pack2<T>(x[6], x[7]));
+}
+
+/// Query side and page translation shared by the quantized paged geometries.
+template <class T, int D> struct PagedQuantView {
+  static constexpr bool kDequant = true;
+  const T *q;
+  T *o;
+  float *lse;
+  const int *block_table; ///< this sequence's row of the block table
+  size_t q_stride, lse_stride;
+  int page_size, num_kv_heads, h_kv;
+  int seq_q, seq_k;
+
+  __device__ __forceinline__ const T *q_row(int i) const { return q + i * q_stride; }
+  __device__ __forceinline__ T *o_row(int i) const { return o + i * q_stride; }
+  __device__ __forceinline__ float *lse_ptr(int i) const { return lse + i * lse_stride; }
+  /// Index of (kv position @p t, this block's kv head) in a pool, counted in
+  /// head rows — the pool formats differ only in the size of a head row.
+  __device__ __forceinline__ size_t head_row(int t) const {
+    const int page = t / page_size;
+    const int slot = t - page * page_size;
+    return ((size_t)block_table[page] * page_size + slot) * num_kv_heads + h_kv;
+  }
+};
+
+/// Fill the query-side and page-translation fields of a PagedQuantView from a
+/// quantized paged argument struct, for `blockIdx.y == bh`.
+template <int D, class View, class Args>
+__device__ __forceinline__ void resolve_quant_view(View &g, const Args &a, int bh) {
+  const int b = bh / a.num_q_heads;
+  const int h_q = bh - b * a.num_q_heads;
+  const int q0 = a.cu_seqlens_q[b];
+  g.q_stride = (size_t)a.num_q_heads * D;
+  g.lse_stride = (size_t)a.num_q_heads;
+  g.page_size = a.page_size;
+  g.num_kv_heads = a.num_kv_heads;
+  g.h_kv = h_q / (a.num_q_heads / a.num_kv_heads);
+  g.block_table = a.block_table + (size_t)b * a.max_blocks_per_seq;
+  g.q = a.Q + ((size_t)q0 * a.num_q_heads + h_q) * D;
+  g.o = a.O + ((size_t)q0 * a.num_q_heads + h_q) * D;
+  g.lse = a.LSE ? a.LSE + (size_t)q0 * a.num_q_heads + h_q : nullptr;
+  g.seq_q = a.cu_seqlens_q[b + 1] - q0;
+  g.seq_k = a.seq_lens_k[b];
+}
+
+/**
+ * @brief Packed varlen Q/O against an FP8_E4M3 paged KV cache.
+ *
+ * Pools are `[num_pages, page_size, H_kv, D]` e4m3 bytes holding
+ * `fp8(x / scale)` with one scale per tensor. Neither scale is applied per
+ * element: scores are linear in K, so k_scale is folded into the softmax scale
+ * by the launcher, and the output is linear in V, so v_scale multiplies the
+ * output normalisation (`out_scale()`). The tiles hold the raw e4m3 values,
+ * converted exactly.
+ *
+ * One load is 16 pool bytes: 16 channels, two 16-byte chunks of T.
+ */
+template <class T, int D> struct PagedFp8Geometry : PagedQuantView<T, D> {
+  static constexpr int kChunksPerLoad = 2;
+  struct Raw {
+    uint4 bytes; ///< 16 e4m3 bytes; all-zero decodes to zeros
+  };
+  const uint8_t *k_pool, *v_pool;
+  float v_scale;
+
+  __device__ __forceinline__ Raw fetch(const uint8_t *pool, int t, int u) const {
+    return {*reinterpret_cast<const uint4 *>(pool + this->head_row(t) * D +
+                                             u * 16)};
+  }
+  /// Channels `[16u, 16u + 16)` of kv position @p t.
+  __device__ __forceinline__ Raw k_fetch(int t, int u) const { return fetch(k_pool, t, u); }
+  __device__ __forceinline__ Raw v_fetch(int t, int u) const { return fetch(v_pool, t, u); }
+  __device__ static __forceinline__ void decode(const Raw &r, uint4 (&out)[2]) {
+    out[0] = fp8x8_to_chunk<T>(r.bytes.x, r.bytes.y);
+    out[1] = fp8x8_to_chunk<T>(r.bytes.z, r.bytes.w);
+  }
+  __device__ __forceinline__ float out_scale() const { return v_scale; }
+};
+
+/// Kernel arguments for paged prefill over an FP8_E4M3 cache.
+template <class T> struct PagedFp8Args {
+  const T *Q;
+  const uint8_t *K_pool, *V_pool;
+  T *O;
+  float *LSE;             ///< `[total_q, H_q]`, optional
+  const int *cu_seqlens_q;
+  const int *seq_lens_k;  ///< `[B]` cached kv length per sequence
+  const int *block_table; ///< `[B, max_blocks_per_seq]`
+  int max_blocks_per_seq, page_size;
+  int num_q_heads, num_kv_heads;
+  float scale;            ///< softmax scale with k_scale already folded in
+  float v_scale;
+
+  /// Resolve the view for `blockIdx.y == bh`.
+  template <int D>
+  __device__ __forceinline__ PagedFp8Geometry<T, D> resolve(int bh) const {
+    PagedFp8Geometry<T, D> g;
+    resolve_quant_view<D>(g, *this, bh);
+    g.k_pool = K_pool;
+    g.v_pool = V_pool;
+    g.v_scale = v_scale;
+    return g;
+  }
+};
+
+/**
+ * @brief Packed varlen Q/O against an INT4_G32 paged KV cache.
+ *
+ * Payload pools are `[num_pages, page_size, H_kv, D / 2]` bytes, two uint4
+ * codes per byte (even channel in the low nibble); scale pools are
+ * `[num_pages, page_size, H_kv, D / 32]` half2 `(scale, zero)`, one per group
+ * of 32 channels of each (token, kv head). The scales vary per row and group,
+ * so nothing folds out: `x = code * scale + zero` is evaluated per element on
+ * the way into the tile and rounded to T.
+ *
+ * One load is one group: 16 payload bytes plus its `(scale, zero)`, four
+ * 16-byte chunks of T.
+ */
+template <class T, int D> struct PagedInt4Geometry : PagedQuantView<T, D> {
+  static constexpr int kChunksPerLoad = 4;
+  struct Raw {
+    uint4 codes;         ///< 32 uint4 codes
+    uint32_t scale_zero; ///< their half2 (scale, zero); all-zero decodes to zeros
+  };
+  const uint8_t *k_pool, *v_pool;
+  const __half2 *k_scales, *v_scales;
+
+  __device__ __forceinline__ Raw fetch(const uint8_t *pool, const __half2 *scales,
+                                       int t, int u) const {
+    const size_t r = this->head_row(t);
+    return {*reinterpret_cast<const uint4 *>(pool + r * (D / 2) + u * 16),
+            reinterpret_cast<const uint32_t *>(scales)[r * (D / 32) + u]};
+  }
+  /// Channel group @p u (channels `[32u, 32u + 32)`) of kv position @p t.
+  __device__ __forceinline__ Raw k_fetch(int t, int u) const { return fetch(k_pool, k_scales, t, u); }
+  __device__ __forceinline__ Raw v_fetch(int t, int u) const { return fetch(v_pool, v_scales, t, u); }
+  __device__ static __forceinline__ void decode(const Raw &r, uint4 (&out)[4]) {
+    const __half2 sz = *reinterpret_cast<const __half2 *>(&r.scale_zero);
+    const float scale = __low2float(sz), zero = __high2float(sz);
+    out[0] = int4x8_to_chunk<T>(r.codes.x, scale, zero);
+    out[1] = int4x8_to_chunk<T>(r.codes.y, scale, zero);
+    out[2] = int4x8_to_chunk<T>(r.codes.z, scale, zero);
+    out[3] = int4x8_to_chunk<T>(r.codes.w, scale, zero);
+  }
+  __device__ __forceinline__ float out_scale() const { return 1.0f; }
+};
+
+/// Kernel arguments for paged prefill over an INT4_G32 cache.
+template <class T> struct PagedInt4Args {
+  const T *Q;
+  const uint8_t *K_pool, *V_pool;
+  const __half2 *K_scales, *V_scales;
+  T *O;
+  float *LSE;             ///< `[total_q, H_q]`, optional
+  const int *cu_seqlens_q;
+  const int *seq_lens_k;  ///< `[B]` cached kv length per sequence
+  const int *block_table; ///< `[B, max_blocks_per_seq]`
+  int max_blocks_per_seq, page_size;
+  int num_q_heads, num_kv_heads;
+  float scale;
+
+  /// Resolve the view for `blockIdx.y == bh`.
+  template <int D>
+  __device__ __forceinline__ PagedInt4Geometry<T, D> resolve(int bh) const {
+    PagedInt4Geometry<T, D> g;
+    resolve_quant_view<D>(g, *this, bh);
+    g.k_pool = K_pool;
+    g.v_pool = V_pool;
+    g.k_scales = K_scales;
+    g.v_scales = V_scales;
+    return g;
+  }
+};
+
 /** @} */ // end of geometry
 
 // ============================================================================
@@ -326,6 +561,85 @@ template <class T> struct PagedArgs {
 template <int BLOCK_N, int D, class T> constexpr size_t splitq_smem_bytes() {
   return 2 * (size_t)BLOCK_N * (D + kSmemPad) * sizeof(T);
 }
+
+/**
+ * @brief One thread's share of a K or V tile from a quantized pool, held in
+ *        registers between issuing the tile and landing it in shared memory.
+ *
+ * The dequantize-on-load counterpart of a cp.async group, for geometries with
+ * `kDequant`; empty for the others. fetch() issues the thread's global loads
+ * and keeps the raw (still quantized) data; store() dequantizes it and writes
+ * compute-type chunks to the tile. Keeping the two apart is what lets the
+ * loads overlap the MMA phase the way cp.async does: fetch() does not wait for
+ * the data, and store() runs after the phase the loads streamed behind.
+ *
+ * That separation is the whole cost story. Measured against the fp16-cache
+ * paged kernel (same process, RTX 5080, 11 shapes from one follow-up turn to
+ * B=8 serving): dequantizing right where the tile is issued — each load
+ * consumed as soon as it is made, so every thread waits out its loads one
+ * after another — took 1.07-2.5x the fp16 time on FP8 and 1.05-1.8x on INT4,
+ * worst on under-saturated grids. Fetching first and decoding after the MMA
+ * phase brings both to 1.0-1.25x. What is left is the decode arithmetic and
+ * the register pressure of the held data (see splitq_attend()).
+ *
+ * Every thread performs LOADS loads per tile; one load is `kChunksPerLoad`
+ * adjacent 16-byte chunks of one row. Rows at or past kv_count are zero-filled
+ * without touching the pool (they may lie in unassigned pages).
+ *
+ * @tparam THREADS  Threads per block.
+ * @tparam Geom     Geometry; see the `kDequant` interface.
+ */
+template <int BLOCK_N, int D_HEAD, int THREADS, class Geom,
+          bool = Geom::kDequant>
+struct SplitqStage {};
+
+template <int BLOCK_N, int D_HEAD, int THREADS, class Geom>
+struct SplitqStage<BLOCK_N, D_HEAD, THREADS, Geom, true> {
+  static constexpr int CPL = Geom::kChunksPerLoad;
+  static constexpr int UNITS_PER_ROW = (D_HEAD / 8) / CPL;
+  static constexpr int LOADS = BLOCK_N * UNITS_PER_ROW / THREADS; // per thread
+  static_assert((D_HEAD / 8) % CPL == 0 &&
+                    (BLOCK_N * UNITS_PER_ROW) % THREADS == 0,
+                "dequant load assignment needs whole loads per thread");
+
+  typename Geom::Raw raw[LOADS];
+
+  /**
+   * @brief Issue this thread's loads for kv rows `[kv_start, kv_start +
+   *        kv_count)`.
+   * @param tid    Thread index within the block, `[0, THREADS)`.
+   * @param fetch  `(int kv_pos, int unit) -> Geom::Raw`.
+   */
+  template <class Fetch>
+  __device__ __forceinline__ void fetch(int tid, int kv_start, int kv_count,
+                                        Fetch fetch) {
+#pragma unroll
+    for (int j = 0; j < LOADS; j++) {
+      const int idx = tid + j * THREADS;
+      const int row = idx / UNITS_PER_ROW, unit = idx % UNITS_PER_ROW;
+      raw[j] = (row < kv_count) ? fetch(kv_start + row, unit)
+                                : typename Geom::Raw{};
+    }
+  }
+
+  /// Dequantize the held data into tile @p dst, `[BLOCK_N x (D_HEAD + pad)]`
+  /// elements of T. Visible to the other warps after the next barrier.
+  template <class T>
+  __device__ __forceinline__ void store(T *dst, int tid) const {
+    constexpr int KV_STRIDE = D_HEAD + kSmemPad;
+#pragma unroll
+    for (int j = 0; j < LOADS; j++) {
+      const int idx = tid + j * THREADS;
+      const int row = idx / UNITS_PER_ROW, unit = idx % UNITS_PER_ROW;
+      uint4 chunk[CPL];
+      Geom::decode(raw[j], chunk);
+      uint4 *out = reinterpret_cast<uint4 *>(dst + row * KV_STRIDE) + unit * CPL;
+#pragma unroll
+      for (int c = 0; c < CPL; c++)
+        out[c] = chunk[c];
+    }
+  }
+};
 
 /**
  * @brief Split-Q attention for one BLOCK_M query tile (all geometries).
@@ -352,12 +666,15 @@ template <int BLOCK_N, int D, class T> constexpr size_t splitq_smem_bytes() {
  * Measured: +9-10% over the split-N kernel at saturation (parity with vLLM FA2
  * at most D=128 shapes); it loses to the small tile only on under-saturated
  * grids, which is why dispatch_by_saturation() routes those to split-N.
- * Registers (ptxas, CUDA 13.1, sm_120), all twelve instantiations per head
- * dim: D=128 uses 175-208, zero spills, 2 CTAs/SM. D=64 uses 126-128 and must
- * stay at or below 128 to run 4 CTAs/SM — the kernel's __launch_bounds__
- * enforces that (see fa_prefill_splitq_kernel). D=128 is sensitive to register
- * count beyond occupancy: variants that pushed the batch kernel from 189 to
- * 201-209 lost 2.4 to 4.4% with the CTA count unchanged.
+ * Registers (ptxas, CUDA 13.1, sm_120), the twelve stored-as-T instantiations
+ * per head dim: D=128 uses 175-208, zero spills, 2 CTAs/SM. D=64 uses 126-128
+ * and must stay at or below 128 to run 4 CTAs/SM — the kernel's
+ * __launch_bounds__ enforces that (see fa_prefill_splitq_kernel). D=128 is
+ * sensitive to register count beyond occupancy: variants that pushed the batch
+ * kernel from 189 to 201-209 lost 2.4 to 4.4% with the CTA count unchanged.
+ * The eight quantized-pool instantiations per head dim hold raw tile data in
+ * registers across the MMA phases (SplitqStage): D=128 uses 224-255, still 2
+ * CTAs/SM; D=64 is held at 128 with 8-16 bytes of spill.
  *
  * Against vLLM 0.34.0 FlashAttention-2 (same process, RTX 5080, 34 shapes,
  * 2026-11-26) this pipeline with x4 loads, interior-tile mask skipping and the
@@ -458,7 +775,9 @@ __device__ __forceinline__ void splitq_attend(const Geom &g, const int q_start,
                 "cp.async chunk assignment needs whole rows per thread step");
   const int cp_col = tid % VEC_COLS;
   const int cp_row0 = tid / VEC_COLS;
-  auto issue_tile = [&](T *dst, auto row_ptr, int kv_start, int kv_count) {
+  // (Unused for quantized pools, which go through SplitqStage instead.)
+  [[maybe_unused]] auto issue_tile = [&](T *dst, auto row_ptr, int kv_start,
+                                         int kv_count) {
     if (kv_count == BLOCK_N) {
       const uint32_t dst0 =
           ptx::smem_addr(dst + cp_row0 * KV_STRIDE + cp_col * 8);
@@ -480,20 +799,57 @@ __device__ __forceinline__ void splitq_attend(const Geom &g, const int q_start,
     }
     ptx::cp_async_commit();
   };
-  auto k_row = [&](int t) { return g.k_row(t); };
-  auto v_row = [&](int t) { return g.v_row(t); };
+  // Tile loads, written once for both kinds of geometry:
+  //   issue_k / issue_v  start loading a tile and return without waiting;
+  //   land_k / land_v    complete it; after the next barrier any warp may
+  //                      read the tile.
+  // Stored-as-T geometries issue the cp.async group above and land by waiting
+  // for it. Quantized pools (Geom::kDequant) fetch raw data into registers and
+  // land by dequantizing it into the tile (SplitqStage). In both cases the
+  // loads are in flight during the MMA phase between issue and land.
+  [[maybe_unused]] SplitqStage<BLOCK_N, D_HEAD, THREADS, Geom> k_stage, v_stage;
+  auto issue_k = [&](int kv_start, int kv_count) {
+    if constexpr (Geom::kDequant) {
+      k_stage.fetch(tid, kv_start, kv_count,
+                    [&](int t, int u) { return g.k_fetch(t, u); });
+    } else {
+      issue_tile(smem_k, [&](int t) { return g.k_row(t); }, kv_start, kv_count);
+    }
+  };
+  auto issue_v = [&](int kv_start, int kv_count) {
+    if constexpr (Geom::kDequant) {
+      v_stage.fetch(tid, kv_start, kv_count,
+                    [&](int t, int u) { return g.v_fetch(t, u); });
+    } else {
+      issue_tile(smem_v, [&](int t) { return g.v_row(t); }, kv_start, kv_count);
+    }
+  };
+  auto land_k = [&]() {
+    if constexpr (Geom::kDequant) {
+      k_stage.store(smem_k, tid);
+    } else {
+      ptx::cp_async_wait<0>(); // the only group in flight
+    }
+  };
+  auto land_v = [&]() {
+    if constexpr (Geom::kDequant) {
+      v_stage.store(smem_v, tid);
+    } else {
+      ptx::cp_async_wait<0>();
+    }
+  };
 
   if (num_kv_tiles > 0)
-    issue_tile(smem_k, k_row, 0, min(BLOCK_N, g.seq_k));
+    issue_k(0, min(BLOCK_N, g.seq_k));
 
   for (int kv_tile = 0; kv_tile < num_kv_tiles; kv_tile++) {
     const int kv_start = kv_tile * BLOCK_N;
     const int kv_count = min(BLOCK_N, g.seq_k - kv_start);
 
-    ptx::cp_async_wait<0>(); // K(i) landed (the only group in flight)
-    __syncthreads();         // K(i) visible to all warps
+    land_k();        // K(i) landed
+    __syncthreads(); // K(i) visible to all warps
 
-    issue_tile(smem_v, v_row, kv_start, kv_count); // V(i) behind QK + softmax
+    issue_v(kv_start, kv_count); // V(i) behind QK + softmax
 
     // -- A: S = Q K^T ---------------------------------------------------------
     // One ldmatrix.x4 carries the K operands of two adjacent n8 tiles (lanes
@@ -590,12 +946,12 @@ __device__ __forceinline__ void splitq_attend(const Geom &g, const int q_start,
       o_acc[di][3] *= corr1;
     }
 
-    ptx::cp_async_wait<0>(); // V(i) landed
-    __syncthreads();         // V(i) visible; K(i) dead CTA-wide
+    land_v();        // V(i) landed
+    __syncthreads(); // V(i) visible; K(i) dead CTA-wide
 
     if (kv_tile + 1 < num_kv_tiles) { // K(i+1) behind PV
       const int ks = kv_start + BLOCK_N;
-      issue_tile(smem_k, k_row, ks, min(BLOCK_N, g.seq_k - ks));
+      issue_k(ks, min(BLOCK_N, g.seq_k - ks));
     }
 
     // -- D: O += P V; A operand packed straight from s_acc --------------------
@@ -629,8 +985,13 @@ __device__ __forceinline__ void splitq_attend(const Geom &g, const int q_start,
 
   // -- Epilogue: normalise, write O (32-bit packed stores) and LSE -------------
   {
-    const float inv0 = (row_sum0 > 0.0f) ? 1.0f / row_sum0 : 0.0f;
-    const float inv1 = (row_sum1 > 0.0f) ? 1.0f / row_sum1 : 0.0f;
+    float inv0 = (row_sum0 > 0.0f) ? 1.0f / row_sum0 : 0.0f;
+    float inv1 = (row_sum1 > 0.0f) ? 1.0f / row_sum1 : 0.0f;
+    if constexpr (Geom::kDequant) {
+      // A per-tensor V scale (FP8) is applied once here: O is linear in V.
+      inv0 *= g.out_scale();
+      inv1 *= g.out_scale();
+    }
     const int gq0 = q_start + row0;
     const int gq1 = q_start + row1;
     T *o0 = (gq0 < g.seq_q) ? g.o_row(gq0) : nullptr;

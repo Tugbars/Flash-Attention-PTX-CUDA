@@ -1,8 +1,9 @@
 // Unified-API equivalence gate: fa_attention / fa_cache_attention /
 // fa_cache_write are pure facades, so their outputs must be BIT-IDENTICAL to
 // the launch_* entry points on the same inputs. Any divergence means the
-// facade mis-mapped an argument. Covers: batch + varlen attention, paged
-// decode (fp16 / FP8 / INT4 caches), chunked paged prefill, and cache writes.
+// facade mis-mapped an argument. Covers: batch + varlen attention, and for
+// fp16 / FP8 / INT4 caches alike: cache writes, paged decode, chunked paged
+// prefill.
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdio>
@@ -192,8 +193,8 @@ static void t_cache(KvDType kvd, const char *tag) {
   snprintf(nm, sizeof nm, "fa_cache_attention dec (%s)", tag);
   same(O1, O2, NQ * 2, nm);
 
-  // chunked prefill (AUTO caches only)
-  if (kvd == KvDType::AUTO) {
+  // chunked prefill over the same cache (every kv_dtype)
+  {
     std::vector<int> cq = {0, 128, 192};
     int TQ = cq.back();
     size_t NPQ = (size_t)TQ * Hq * D;
@@ -212,6 +213,8 @@ static void t_cache(KvDType kvd, const char *tag) {
     pp.max_seqlen_q = 128; pp.max_blocks_per_seq = max_blocks;
     pp.page_size = ps; pp.d_head = D; pp.scale = 1.f / sqrtf((float)D);
     pp.causal = true; pp.dtype = DType::FP16; pp.stream = 0;
+    pp.kv_dtype = kvd; pp.k_scale = 0.01f; pp.v_scale = 0.01f;
+    pp.K_scales = Ks1; pp.V_scales = Vs1;
     CUDA_CHECK(launch_flash_attention_paged_prefill(pp));
 
     FaCacheAttentionArgs pa = {};
@@ -221,7 +224,8 @@ static void t_cache(KvDType kvd, const char *tag) {
     pa.scratch = ca.scratch; // unused by prefill; harmless
     CUDA_CHECK(fa_cache_attention(pa));
     cudaDeviceSynchronize();
-    same(pO1, pO2, NPQ * 2, "fa_cache_attention prefill");
+    snprintf(nm, sizeof nm, "fa_cache_attention pre (%s)", tag);
+    same(pO1, pO2, NPQ * 2, nm);
 
     cudaFree(pQ); cudaFree(pO1); cudaFree(pO2); cudaFree(dcq);
   }

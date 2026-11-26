@@ -6,6 +6,7 @@
  * - launch_flash_attention(): batch `[B*H, S, D]`
  * - launch_flash_attention_varlen(): packed ragged batch
  * - launch_flash_attention_paged_prefill(): packed queries vs a paged KV cache
+ *   (fp16 / bf16, FP8_E4M3 or INT4_G32 pools)
  *
  * Every entry point validates its arguments and returns a cudaError_t:
  * cudaErrorInvalidValue for a rejected argument, otherwise whatever the launch
@@ -163,6 +164,25 @@ inline cudaError_t validate(const FlashAttentionPagedPrefillParams &p) {
     return cudaErrorInvalidValue;
   if (!p.cu_seqlens_q || !p.seq_lens_k || !p.block_table)
     return cudaErrorInvalidValue;
+  switch (p.kv_dtype) {
+  case KvDType::AUTO:
+    break;
+  case KvDType::FP8_E4M3: // per-tensor scales
+    if (!(p.k_scale > 0.0f) || !(p.v_scale > 0.0f))
+      return cudaErrorInvalidValue;
+    break;
+  case KvDType::INT4_G32: // parallel (scale, zero) pools, read as half2
+    if (!p.K_scales || !p.V_scales)
+      return cudaErrorInvalidValue;
+    if ((reinterpret_cast<uintptr_t>(p.K_scales) & 3u) != 0 ||
+        (reinterpret_cast<uintptr_t>(p.V_scales) & 3u) != 0)
+      return cudaErrorInvalidValue;
+    break;
+  default:
+    return cudaErrorInvalidValue;
+  }
+  // The quantized pools are read with 16-byte loads too, so one alignment
+  // rule covers every cache type.
   return check_tensors(p.Q, p.K_cache, p.V_cache, p.O);
 }
 
@@ -257,27 +277,63 @@ cudaError_t launch_splitq_varlen(const FlashAttentionVarlenParams &p) {
                    grid, block, smem, p.stream, args);
 }
 
-/// Split-Q, paged prefill.
-template <int D, class T>
-cudaError_t launch_splitq_paged(const FlashAttentionPagedPrefillParams &p) {
+/// Split-Q over one of the paged argument structs (PagedArgs, PagedFp8Args,
+/// PagedInt4Args): same grid, block and shared memory for all three, since a
+/// quantized pool is dequantized into the same fp16 / bf16 tiles.
+template <int D, class T, class Args>
+cudaError_t run_splitq_paged(const FlashAttentionPagedPrefillParams &p,
+                             const Args &args) {
   using Tile = SplitQTile;
-  const PagedArgs<T> args{as<T>(p.Q), as<T>(p.K_cache), as<T>(p.V_cache),
-                          as<T>(p.O), p.L, p.cu_seqlens_q, p.seq_lens_k,
-                          p.block_table, p.max_blocks_per_seq, p.page_size,
-                          p.num_heads,
-                          effective_kv_heads(p.num_heads, p.num_kv_heads),
-                          p.scale};
   const dim3 grid((p.max_seqlen_q + Tile::BM - 1) / Tile::BM,
                   p.batch_size * p.num_heads);
   const dim3 block(kWarpSize, Tile::NW);
   constexpr size_t smem = splitq_smem_bytes<Tile::BN, D, T>();
   return p.causal
              ? run(fa_prefill_splitq_kernel<Tile::BM, Tile::BN, D, Tile::NW,
-                                            true, T, PagedArgs<T>>,
+                                            true, T, Args>,
                    grid, block, smem, p.stream, args)
              : run(fa_prefill_splitq_kernel<Tile::BM, Tile::BN, D, Tile::NW,
-                                            false, T, PagedArgs<T>>,
+                                            false, T, Args>,
                    grid, block, smem, p.stream, args);
+}
+
+/// Split-Q, paged prefill; the cache element type selects the argument struct.
+template <int D, class T>
+cudaError_t launch_splitq_paged(const FlashAttentionPagedPrefillParams &p) {
+  const int H_kv = effective_kv_heads(p.num_heads, p.num_kv_heads);
+  const auto bytes = [](const half *pool) {
+    return reinterpret_cast<const uint8_t *>(pool);
+  };
+  switch (p.kv_dtype) {
+  case KvDType::FP8_E4M3: {
+    // Both per-tensor scales stay out of the loop. Scores are linear in K, so
+    // k_scale joins the softmax scale here; the output is linear in V, so the
+    // kernel applies v_scale once, at the output write. Same folding as the
+    // FP8 decode path.
+    const PagedFp8Args<T> args{as<T>(p.Q), bytes(p.K_cache), bytes(p.V_cache),
+                               as<T>(p.O), p.L, p.cu_seqlens_q, p.seq_lens_k,
+                               p.block_table, p.max_blocks_per_seq, p.page_size,
+                               p.num_heads, H_kv, p.scale * p.k_scale,
+                               p.v_scale};
+    return run_splitq_paged<D, T>(p, args);
+  }
+  case KvDType::INT4_G32: {
+    const PagedInt4Args<T> args{
+        as<T>(p.Q), bytes(p.K_cache), bytes(p.V_cache),
+        static_cast<const __half2 *>(p.K_scales),
+        static_cast<const __half2 *>(p.V_scales), as<T>(p.O), p.L,
+        p.cu_seqlens_q, p.seq_lens_k, p.block_table, p.max_blocks_per_seq,
+        p.page_size, p.num_heads, H_kv, p.scale};
+    return run_splitq_paged<D, T>(p, args);
+  }
+  default: {
+    const PagedArgs<T> args{as<T>(p.Q), as<T>(p.K_cache), as<T>(p.V_cache),
+                            as<T>(p.O), p.L, p.cu_seqlens_q, p.seq_lens_k,
+                            p.block_table, p.max_blocks_per_seq, p.page_size,
+                            p.num_heads, H_kv, p.scale};
+    return run_splitq_paged<D, T>(p, args);
+  }
+  }
 }
 
 // ----------------------------------------------------------------------------

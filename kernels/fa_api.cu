@@ -42,6 +42,10 @@ inline cudaError_t launch_status(const char *fn, cudaError_t err,
 constexpr const char *kPrefillHint =
     " (launcher rejected an argument: Q/K/V/O must be 16-byte aligned and "
     "batch_size * num_heads <= 65535)";
+constexpr const char *kPagedPrefillHint =
+    " (launcher rejected an argument: Q/O and the cache pools must be 16-byte "
+    "aligned, INT4_G32 scale pools 4-byte aligned, and batch_size * num_heads "
+    "<= 65535)";
 
 inline float resolve_scale(float scale, int d_head) {
   return (scale > 0.0f) ? scale : 1.0f / sqrtf((float)d_head);
@@ -204,11 +208,8 @@ cudaError_t fa_cache_attention(const FaCacheAttentionArgs &a) {
         fn, launch_flash_attention_decode_paged(to_decode_params(a)));
   }
 
-  // chunked prefill over the cache
-  if (a.cache.kv_dtype != KvDType::AUTO)
-    return fa_reject(fn,
-                     "quantized caches (FP8/INT4) are decode-only for now; "
-                     "chunked prefill requires an AUTO (fp16/bf16) cache");
+  // chunked prefill over the cache (any kv_dtype; check_cache() has already
+  // verified the FP8 scales / INT4 scale pools)
   FlashAttentionPagedPrefillParams p = {};
   p.Q = a.Q;
   p.O = a.O;
@@ -228,9 +229,14 @@ cudaError_t fa_cache_attention(const FaCacheAttentionArgs &a) {
   p.scale = resolve_scale(a.scale, a.cache.d_head);
   p.causal = a.causal;
   p.dtype = a.dtype;
+  p.kv_dtype = a.cache.kv_dtype;
+  p.k_scale = a.cache.k_scale;
+  p.v_scale = a.cache.v_scale;
+  p.K_scales = a.cache.K_scales;
+  p.V_scales = a.cache.V_scales;
   p.stream = a.stream;
   return launch_status(fn, launch_flash_attention_paged_prefill(p),
-                       kPrefillHint);
+                       kPagedPrefillHint);
 }
 
 // --- 3) fa_cache_write -------------------------------------------------------

@@ -106,6 +106,20 @@ int main() {
   expect("paged prefill: valid", launch_flash_attention_paged_prefill(pp), cudaSuccess);
   { auto p = pp; p.page_size = 0;         rejected("paged prefill: page_size = 0", launch_flash_attention_paged_prefill(p)); }
   { auto p = pp; p.block_table = nullptr; rejected("paged prefill: null block_table", launch_flash_attention_paged_prefill(p)); }
+  // Quantized caches: the pools above are large enough for either format
+  // (fp8 needs n bytes, int4 n/2 payload + n/8 scale bytes; each has 2n).
+  { auto p = pp; p.kv_dtype = KvDType::FP8_E4M3; p.k_scale = p.v_scale = 1.0f;
+    expect("paged prefill: valid, FP8 cache", launch_flash_attention_paged_prefill(p), cudaSuccess); }
+  { auto p = pp; p.kv_dtype = KvDType::FP8_E4M3;
+    rejected("paged prefill: FP8 cache without scales", launch_flash_attention_paged_prefill(p)); }
+  { auto p = pp; p.kv_dtype = KvDType::INT4_G32; p.K_scales = Q; p.V_scales = Q;
+    expect("paged prefill: valid, INT4 cache", launch_flash_attention_paged_prefill(p), cudaSuccess); }
+  { auto p = pp; p.kv_dtype = KvDType::INT4_G32;
+    rejected("paged prefill: INT4 cache without scale pools", launch_flash_attention_paged_prefill(p)); }
+  { auto p = pp; p.kv_dtype = KvDType::INT4_G32; p.K_scales = Q; p.V_scales = reinterpret_cast<const char *>(Q) + 2;
+    rejected("paged prefill: INT4 scale pool misaligned", launch_flash_attention_paged_prefill(p)); }
+  { auto p = pp; p.kv_dtype = static_cast<KvDType>(7);
+    rejected("paged prefill: unknown kv_dtype", launch_flash_attention_paged_prefill(p)); }
 
   // ---- decode launchers ---------------------------------------------------
   printf("--- decode launchers ---\n");
@@ -184,7 +198,13 @@ int main() {
   { auto a = ca; a.cache.page_size = 0; rejected("fa_cache_attention: bad page geometry", fa_cache_attention(a)); }
   { auto a = ca; a.cache.kv_dtype = KvDType::FP8_E4M3; a.cache.k_scale = a.cache.v_scale = 1.0f;
     a.cu_seqlens_q = cu; a.max_seqlen_q = S;
-    rejected("fa_cache_attention: prefill on a quantized cache", fa_cache_attention(a)); }
+    expect("fa_cache_attention: valid prefill, FP8 cache", fa_cache_attention(a), cudaSuccess); }
+  { auto a = ca; a.cache.kv_dtype = KvDType::FP8_E4M3;
+    a.cu_seqlens_q = cu; a.max_seqlen_q = S;
+    rejected("fa_cache_attention: prefill, FP8 cache without scales", fa_cache_attention(a)); }
+  { auto a = ca; a.cache.kv_dtype = KvDType::INT4_G32;
+    a.cu_seqlens_q = cu; a.max_seqlen_q = S;
+    rejected("fa_cache_attention: prefill, INT4 cache without pools", fa_cache_attention(a)); }
 
   FaCacheWriteArgs wa = {};
   wa.K_new = Q; wa.V_new = Q; wa.slot_mapping = slots; wa.num_tokens = PS;
