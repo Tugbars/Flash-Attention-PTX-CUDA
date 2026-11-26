@@ -100,9 +100,17 @@ __device__ __forceinline__ uint32_t smem_addr(const void *p) {
 ///   - A row-major V tile (rows = kv position = k of the PV GEMM) needs .trans.
 /// Using .trans on K feeds the MMA a feature-shuffled tile whose error is only
 /// visible at realistic score magnitudes.
+///
+/// An x4 load is either one m16k16 A operand or the B operands of TWO adjacent
+/// n8 tiles: registers 0-1 feed the first MMA, 2-3 the second. Both prefill
+/// kernels load K and V that way (one load per two MMAs). The x2 forms are the
+/// single-tile equivalents; nothing uses them today, they are kept for tile
+/// shapes with an odd number of n8 tiles.
 /// @{
 
-/// Load four 8x8 b16 matrices (an m16k16 A operand) from shared memory.
+/// Load four 8x8 b16 matrices without transpose: an m16k16 A operand, or the
+/// K B-operands of two adjacent n8 tiles (lanes 0-7 / 8-15 address k 0-7 /
+/// 8-15 of the first tile, lanes 16-23 / 24-31 those of the second).
 __device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], const void *p) {
   asm volatile(
       "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
@@ -126,6 +134,17 @@ __device__ __forceinline__ void ldmatrix_x2_trans(uint32_t &r0, uint32_t &r1,
                : "r"(smem_addr(p)));
 }
 
+/// Load four 8x8 b16 matrices with transpose: the V B-operands of two adjacent
+/// n8 tiles in one instruction. Lanes 0-7 / 8-15 address the k 0-7 / 8-15 rows
+/// of the first n8 tile, lanes 16-23 / 24-31 those of the second.
+__device__ __forceinline__ void ldmatrix_x4_trans(uint32_t (&r)[4],
+                                                  const void *p) {
+  asm volatile(
+      "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
+      : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+      : "r"(smem_addr(p)));
+}
+
 /// @}
 
 /// @name cp.async
@@ -143,6 +162,13 @@ __device__ __forceinline__ void cp_async_16(void *smem_dst,
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(
                    smem_addr(smem_dst)),
                "l"(gmem_src), "r"(src_size));
+}
+
+/// Unpredicated 16-byte global -> shared copy to a precomputed smem address.
+__device__ __forceinline__ void cp_async_16_full(uint32_t smem_dst,
+                                                 const void *gmem_src) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem_dst),
+               "l"(gmem_src));
 }
 
 /// Close the current cp.async group.

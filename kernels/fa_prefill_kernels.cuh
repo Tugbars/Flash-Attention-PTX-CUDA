@@ -352,9 +352,18 @@ template <int BLOCK_N, int D, class T> constexpr size_t splitq_smem_bytes() {
  * Measured: +9-10% over the split-N kernel at saturation (parity with vLLM FA2
  * at most D=128 shapes); it loses to the small tile only on under-saturated
  * grids, which is why dispatch_by_saturation() routes those to split-N.
- * Registers (ptxas, CUDA 13.1, sm_120): D=128 uses 173-191 across the six
- * (geometry, causal) instantiations, D=64 uses 118-128; zero spills. D=128
- * runs 2 CTAs/SM.
+ * Registers (ptxas, CUDA 13.1, sm_120), all twelve instantiations per head
+ * dim: D=128 uses 175-208, zero spills, 2 CTAs/SM. D=64 uses 126-128 and must
+ * stay at or below 128 to run 4 CTAs/SM — the kernel's __launch_bounds__
+ * enforces that (see fa_prefill_splitq_kernel). D=128 is sensitive to register
+ * count beyond occupancy: variants that pushed the batch kernel from 189 to
+ * 201-209 lost 2.4 to 4.4% with the CTA count unchanged.
+ *
+ * Against vLLM 0.34.0 FlashAttention-2 (same process, RTX 5080, 34 shapes,
+ * 2026-11-26) this pipeline with x4 loads, interior-tile mask skipping and the
+ * full-tile copy path is ahead at every shape: +4.3 to +8.4% on the
+ * long-context D=128 shapes it previously trailed by up to 4.6%, +2.8% at the
+ * tightest one (B=8 S=4096 D=64). Peak 218 TFLOPS (B=8 S=8192 D=128).
  *
  * @tparam BLOCK_M   Query rows per block; must equal 16 * NUM_WARPS.
  * @tparam BLOCK_N   Key rows per tile; multiple of 16, >= BLOCK_M.
@@ -437,14 +446,37 @@ __device__ __forceinline__ void splitq_attend(const Geom &g, const int q_start,
   // zero-filled; their source address is clamped to the last valid row so the
   // (unused) address is still in bounds — this matters for the paged geometry,
   // whose row lookup goes through the block table.
+  // Thread tid copies 16-byte column cp_col of rows cp_row0, cp_row0 +
+  // ROW_STEP, ... — the same assignment the generic loop below makes, written
+  // out so a FULL tile (every interior tile) needs no bounds test, no clamp and
+  // no per-copy index arithmetic: one unpredicated cp.async per chunk, with
+  // constant offsets from a per-tile base. Measured +1.1% at D=64, neutral to
+  // +0.7% at D=128.
+  constexpr int ROW_STEP = THREADS / VEC_COLS;
+  constexpr int COPIES = BLOCK_N / ROW_STEP;
+  static_assert(THREADS % VEC_COLS == 0 && BLOCK_N % ROW_STEP == 0,
+                "cp.async chunk assignment needs whole rows per thread step");
+  const int cp_col = tid % VEC_COLS;
+  const int cp_row0 = tid / VEC_COLS;
   auto issue_tile = [&](T *dst, auto row_ptr, int kv_start, int kv_count) {
+    if (kv_count == BLOCK_N) {
+      const uint32_t dst0 =
+          ptx::smem_addr(dst + cp_row0 * KV_STRIDE + cp_col * 8);
 #pragma unroll
-    for (int idx = tid; idx < BLOCK_N * VEC_COLS; idx += THREADS) {
-      const int row = idx / VEC_COLS, col = idx % VEC_COLS;
-      const bool valid = row < kv_count;
-      const T *src = row_ptr(kv_start + (valid ? row : kv_count - 1));
-      ptx::cp_async_16(reinterpret_cast<uint4 *>(dst + row * KV_STRIDE) + col,
-                       reinterpret_cast<const uint4 *>(src) + col, valid);
+      for (int j = 0; j < COPIES; j++)
+        ptx::cp_async_16_full(
+            dst0 + j * (ROW_STEP * KV_STRIDE * (int)sizeof(T)),
+            reinterpret_cast<const uint4 *>(
+                row_ptr(kv_start + cp_row0 + j * ROW_STEP)) + cp_col);
+    } else {
+#pragma unroll
+      for (int idx = tid; idx < BLOCK_N * VEC_COLS; idx += THREADS) {
+        const int row = idx / VEC_COLS, col = idx % VEC_COLS;
+        const bool valid = row < kv_count;
+        const T *src = row_ptr(kv_start + (valid ? row : kv_count - 1));
+        ptx::cp_async_16(reinterpret_cast<uint4 *>(dst + row * KV_STRIDE) + col,
+                         reinterpret_cast<const uint4 *>(src) + col, valid);
+      }
     }
     ptx::cp_async_commit();
   };
@@ -464,23 +496,57 @@ __device__ __forceinline__ void splitq_attend(const Geom &g, const int q_start,
     issue_tile(smem_v, v_row, kv_start, kv_count); // V(i) behind QK + softmax
 
     // -- A: S = Q K^T ---------------------------------------------------------
+    // One ldmatrix.x4 carries the K operands of two adjacent n8 tiles (lanes
+    // 0-15 address tile n0, lanes 16-31 tile n0 + 1), so this phase issues one
+    // load per two MMAs instead of one per MMA. Doing the same for V in step D
+    // is what closed the long-context gap to vLLM FA2, whose loop also loads
+    // four matrices at a time: together +6.4 to +6.9% at D=128 (K alone
+    // +2.4-3.0%, V alone +0.6-1.3%), ~+0.5% at D=64.
+    //
+    // Measured and rejected on top of this (D=128 unless noted): k-outer /
+    // n-inner order -0.3 to -1.2%; four accumulators in rotation, neutral;
+    // folding the scale into an FMA inside exp, -2.7 to -3.5%; scaling after
+    // the whole phase instead of per pair, neutral.
     float s_acc[QK_N8][4];
 #pragma unroll
-    for (int ni = 0; ni < QK_N8; ni++) {
-      s_acc[ni][0] = s_acc[ni][1] = s_acc[ni][2] = s_acc[ni][3] = 0.0f;
+    for (int nj = 0; nj < QK_N8 / 2; nj++) {
+      const int n0 = 2 * nj;
+      s_acc[n0][0] = s_acc[n0][1] = s_acc[n0][2] = s_acc[n0][3] = 0.0f;
+      s_acc[n0 + 1][0] = s_acc[n0 + 1][1] = s_acc[n0 + 1][2] = s_acc[n0 + 1][3] = 0.0f;
 #pragma unroll
       for (int ki = 0; ki < TILES_K; ki++) {
-        uint32_t b0, b1;
-        ptx::ldmatrix_x2(b0, b1,
-                         smem_k + (ni * 8 + (lane & 7)) * KV_STRIDE + ki * 16 +
-                             ((lane >> 3) & 1) * 8);
-        ptx::mma_m16n8k16<T>(s_acc[ni], q_frag[ki], b0, b1);
+        uint32_t b[4];
+        ptx::ldmatrix_x4(b, smem_k + ((n0 + (lane >> 4)) * 8 + (lane & 7)) * KV_STRIDE +
+                                ki * 16 + ((lane >> 3) & 1) * 8);
+        ptx::mma_m16n8k16<T>(s_acc[n0], q_frag[ki], b[0], b[1]);
+        ptx::mma_m16n8k16<T>(s_acc[n0 + 1], q_frag[ki], b[2], b[3]);
       }
 #pragma unroll
       for (int i = 0; i < 4; i++)
-        s_acc[ni][i] *= score_scale;
-      mask_fragment<CAUSAL>(s_acc[ni], kv_start + ni * 8 + frag_col,
-                            kv_start + kv_count, qlim0, qlim1);
+        s_acc[n0][i] *= score_scale;
+#pragma unroll
+      for (int i = 0; i < 4; i++)
+        s_acc[n0 + 1][i] *= score_scale;
+    }
+
+    // Interior tiles are fully visible to every row of the block: only the
+    // partial last tile and tiles reaching past row 0's causal limit are masked
+    // (at most the last two tiles of a block; exactly one for batch causal).
+    // The predicate is CTA-uniform, so skipping costs one branch per tile and
+    // saves 64 compare/selects per thread on every other tile: +1.6 to +2.2%.
+    //
+    // Going further and skipping the fully-masked MMAs of the diagonal tile per
+    // warp was measured and rejected: both a duplicated-loop and a
+    // branch-per-pair version pushed D=128 from 189 to 201-209 registers and
+    // lost 2.4 to 4.4%, more than the trimmed work is worth.
+    const bool tile_masked =
+        (kv_count < BLOCK_N) ||
+        (CAUSAL && kv_start + BLOCK_N - 1 > q_start + coff);
+    if (tile_masked) {
+#pragma unroll
+      for (int ni = 0; ni < QK_N8; ni++)
+        mask_fragment<CAUSAL>(s_acc[ni], kv_start + ni * 8 + frag_col,
+                              kv_start + kv_count, qlim0, qlim1);
     }
 
     // -- B: online softmax; P overwrites s_acc --------------------------------
@@ -533,6 +599,11 @@ __device__ __forceinline__ void splitq_attend(const Geom &g, const int q_start,
     }
 
     // -- D: O += P V; A operand packed straight from s_acc --------------------
+    // One ldmatrix.x4.trans carries the V operands of two adjacent output n8
+    // tiles (see step A). The P pack stays inside this loop on purpose: packing
+    // all of P earlier, in the softmax window, measured -3.9 to -6.0% at D=128.
+    // Skipping the o_acc rescale of step C when no row's max moved was also
+    // measured (neutral to -0.9%) and left out.
 #pragma unroll
     for (int ki = 0; ki < TILES_BN; ki++) {
       const uint32_t a[4] = {
@@ -542,14 +613,18 @@ __device__ __forceinline__ void splitq_attend(const Geom &g, const int q_start,
           ptx::pack2<T>(s_acc[2 * ki + 1][2], s_acc[2 * ki + 1][3])};
       const int v_row_off = (lane & 7) + ((lane >> 3) & 1) * 8;
 #pragma unroll
-      for (int di = 0; di < PV_N8; di++) {
-        uint32_t b0, b1;
-        ptx::ldmatrix_x2_trans(
-            b0, b1, smem_v + (ki * 16 + v_row_off) * KV_STRIDE + di * 8);
-        ptx::mma_m16n8k16<T>(o_acc[di], a, b0, b1);
+      for (int dj = 0; dj < PV_N8 / 2; dj++) {
+        uint32_t b[4];
+        ptx::ldmatrix_x4_trans(b, smem_v + (ki * 16 + v_row_off) * KV_STRIDE +
+                                      (2 * dj + (lane >> 4)) * 8);
+        ptx::mma_m16n8k16<T>(o_acc[2 * dj], a, b[0], b[1]);
+        ptx::mma_m16n8k16<T>(o_acc[2 * dj + 1], a, b[2], b[3]);
       }
     }
-    __syncthreads(); // V(i) dead before the next tile's loads
+    // V(i) dead before the next tile's loads. Strictly redundant with the next
+    // iteration's top barrier (measured: removing it is neutral), kept so each
+    // smem tile's lifetime is closed where it ends.
+    __syncthreads();
   }
 
   // -- Epilogue: normalise, write O (32-bit packed stores) and LSE -------------
@@ -590,9 +665,16 @@ __device__ __forceinline__ void splitq_attend(const Geom &g, const int q_start,
  * @param args   Kernel arguments (by value).
  * @see splitq_attend for the remaining template parameters.
  */
+// Launch bounds. The thread count alone is worth ~3% at D=64. The second
+// argument is an occupancy floor for D <= 64 only: 4 CTAs/SM means at most 128
+// registers per thread, and the varlen instantiation drifts to 129 without it
+// (3 CTAs/SM: -4% on small varlen shapes). With the floor it fits in 128 at the
+// cost of one 8-byte spill. 0 leaves D=128 exactly as the one-argument form
+// compiles it; any other value there changes its register allocation.
 template <int BLOCK_M, int BLOCK_N, int D_HEAD, int NUM_WARPS, bool CAUSAL,
           class T, class Args>
-__global__ void __launch_bounds__(kWarpSize *NUM_WARPS)
+__global__ void
+    __launch_bounds__(kWarpSize *NUM_WARPS, (D_HEAD <= 64) ? 4 : 0)
     fa_prefill_splitq_kernel(const Args args) {
   const int q_start = blockIdx.x * BLOCK_M;
   const auto g = args.template resolve<D_HEAD>(blockIdx.y);
@@ -622,6 +704,11 @@ constexpr size_t splitn_smem_bytes() {
  * computes score columns `[0, BLOCK_N/2)` and output columns `[0, D/2)`, half 1
  * the upper halves. Row max / sum are combined across the pair through shared
  * memory, so each kv tile costs two extra barriers.
+ *
+ * Like the split-Q pipeline, K and V are loaded with ldmatrix.x4 — the B
+ * operands of two adjacent n8 tiles per instruction — which also halves the
+ * Q / P A-operand loads (one per pair of MMAs). Measured +1.9 to +3.2% on the
+ * 32x64 D=64 tile, neutral on the 32x32 D=128 tile.
  *
  * Shared memory layout:
  * @code
@@ -742,23 +829,30 @@ __global__ void __launch_bounds__(kWarpSize *NUM_WARPS)
     // -- A: S = Q K^T over this half's columns --------------------------------
     float s_acc[QK_N8_HALF][4];
 #pragma unroll
-    for (int nl = 0; nl < QK_N8_HALF; nl++) {
-      const int ni = half * QK_N8_HALF + nl;
+    for (int nj = 0; nj < QK_N8_HALF / 2; nj++) {
+      const int nl = 2 * nj;                    // local n8 tiles nl, nl + 1
+      const int ni = half * QK_N8_HALF + nl;    // their position in the tile
       s_acc[nl][0] = s_acc[nl][1] = s_acc[nl][2] = s_acc[nl][3] = 0.0f;
+      s_acc[nl + 1][0] = s_acc[nl + 1][1] = s_acc[nl + 1][2] = s_acc[nl + 1][3] = 0.0f;
 #pragma unroll
       for (int ki = 0; ki < TILES_K; ki++) {
-        uint32_t a[4], b0, b1;
+        uint32_t a[4], b[4];
         ptx::ldmatrix_x4(a, smem_q + (pair * 16 + (lane & 15)) * Q_STRIDE +
                                 ki * 16 + (lane >> 4) * 8);
-        ptx::ldmatrix_x2(b0, b1,
-                         smem_k + (ni * 8 + (lane & 7)) * KV_STRIDE + ki * 16 +
-                             ((lane >> 3) & 1) * 8);
-        ptx::mma_m16n8k16<T>(s_acc[nl], a, b0, b1);
+        ptx::ldmatrix_x4(b, smem_k + ((ni + (lane >> 4)) * 8 + (lane & 7)) * KV_STRIDE +
+                                ki * 16 + ((lane >> 3) & 1) * 8);
+        ptx::mma_m16n8k16<T>(s_acc[nl], a, b[0], b[1]);
+        ptx::mma_m16n8k16<T>(s_acc[nl + 1], a, b[2], b[3]);
       }
 #pragma unroll
       for (int i = 0; i < 4; i++)
         s_acc[nl][i] *= score_scale;
       mask_fragment<CAUSAL>(s_acc[nl], kv_start + ni * 8 + frag_col,
+                            kv_start + kv_count, qlim0, qlim1);
+#pragma unroll
+      for (int i = 0; i < 4; i++)
+        s_acc[nl + 1][i] *= score_scale;
+      mask_fragment<CAUSAL>(s_acc[nl + 1], kv_start + (ni + 1) * 8 + frag_col,
                             kv_start + kv_count, qlim0, qlim1);
     }
 
@@ -828,17 +922,19 @@ __global__ void __launch_bounds__(kWarpSize *NUM_WARPS)
 
     // -- D: O += P V over this half's output columns --------------------------
 #pragma unroll
-    for (int dl = 0; dl < PV_N8_HALF; dl++) {
+    for (int dj = 0; dj < PV_N8_HALF / 2; dj++) {
+      const int dl = 2 * dj;                    // local output n8 tiles dl, dl + 1
       const int di = half * PV_N8_HALF + dl;
 #pragma unroll
       for (int ki = 0; ki < TILES_BN; ki++) {
-        uint32_t a[4], b0, b1;
+        uint32_t a[4], b[4];
         ptx::ldmatrix_x4(a, smem_p + (pair * 16 + (lane & 15)) * P_STRIDE +
                                 ki * 16 + (lane >> 4) * 8);
         const int v_row_off = (lane & 7) + ((lane >> 3) & 1) * 8;
-        ptx::ldmatrix_x2_trans(
-            b0, b1, smem_v + (ki * 16 + v_row_off) * KV_STRIDE + di * 8);
-        ptx::mma_m16n8k16<T>(o_acc[dl], a, b0, b1);
+        ptx::ldmatrix_x4_trans(b, smem_v + (ki * 16 + v_row_off) * KV_STRIDE +
+                                      (di + (lane >> 4)) * 8);
+        ptx::mma_m16n8k16<T>(o_acc[dl], a, b[0], b[1]);
+        ptx::mma_m16n8k16<T>(o_acc[dl + 1], a, b[2], b[3]);
       }
     }
     __syncthreads(); // P / V dead before the next tile's loads
