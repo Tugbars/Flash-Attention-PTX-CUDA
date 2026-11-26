@@ -322,6 +322,25 @@ def t_grad_guard():
     check("no_grad path still works", o.shape == q.shape)
 
 
+# --- 7. a rejected argument raises instead of killing the interpreter -------
+def t_rejected_args():
+    # d_head = 96 is not compiled; the C++ facade returns an error code (it
+    # used to abort the process) and the binding turns it into RuntimeError.
+    q = torch.randn(1, 4, 128, 96, device="cuda", dtype=torch.float16)
+    raised = False
+    try:
+        fa_ptx.attention(q, q, q)
+    except RuntimeError as e:
+        raised = "fa_ptx::attention failed" in str(e)
+    check("unsupported d_head raises RuntimeError", raised)
+    # ...and the library is still usable in the same process afterwards.
+    q = torch.randn(1, 4, 128, 64, device="cuda", dtype=torch.float16)
+    o = fa_ptx.attention(q, q, q)
+    torch.cuda.synchronize()
+    e = nrmse(o, sdpa_ref(q, q, q, True))
+    check("usable after a rejected call", e < 1e-3, f"nrmse={e:.5f}")
+
+
 if __name__ == "__main__":
     print("=== fa_ptx binding tests ===")
     t_batch()
@@ -336,6 +355,7 @@ if __name__ == "__main__":
     t_cuda_graph()
     t_capture_cache()
     t_grad_guard()
+    t_rejected_args()
     print("\n" + ("ALL OK" if not FAILURES else
                   f"!!! {len(FAILURES)} FAILURES: {FAILURES}"))
     sys.exit(len(FAILURES))

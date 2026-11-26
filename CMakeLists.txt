@@ -124,6 +124,14 @@ target_include_directories(fa_api_validate PRIVATE
     ${CMAKE_SOURCE_DIR}/include
 )
 
+# Error-contract gate: rejected arguments come back as cudaErrorInvalidValue
+# from every launch_* / fa_* entry point — no abort, no launch, no write.
+add_executable(fa_error_validate tests/fa_error_validate.cu)
+target_link_libraries(fa_error_validate PRIVATE flash_attention)
+target_include_directories(fa_error_validate PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
 # ============================================================================
 # Info
 # ============================================================================
