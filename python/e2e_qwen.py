@@ -19,10 +19,16 @@ Correctness gates (--verify, vs transformers eager):
 Bench (--bench): prefill tok/s + decode ms/token & tok/s, full-step CUDA
 graph vs eager, any kv dtype (auto | fp8 | int4).
 
+Cache quality (--quality TEXT): teacher-forced decoding of a long text through
+a quantized cache, scored against the same run with an fp16 cache (next-token
+agreement, KL, perplexity ratio). --fp16-layers keeps the listed layers' caches
+in fp16 ("auto" picks them from the logit noise each layer's K would suffer).
+
 Run from a vcvars64 shell (JIT build): python python/e2e_qwen.py --verify
 """
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -114,9 +120,14 @@ class QwenFA:
                        if use_compile else self._step)
 
     # -- cache ------------------------------------------------------------
-    def setup_cache(self, batch, max_seq, kv_dtype="auto"):
+    def setup_cache(self, batch, max_seq, kv_dtype="auto", fp16_layers=()):
+        """One paged cache per layer. Layers in `fp16_layers` keep their cache
+        in the compute dtype whatever `kv_dtype` says: quantizing K is not
+        equally safe in every layer (see pick_fp16_layers)."""
         self.graph = None  # any old graph references old pools
         self.B, self.max_seq, self.kv_dtype = batch, max_seq, kv_dtype
+        self.kv_dtypes = ["auto" if li in fp16_layers else kv_dtype
+                          for li in range(self.nl)]
         mb = (max_seq + PAGE - 1) // PAGE
         self.mb = mb
         # block_table & seq_lens are SHARED across the 28 per-layer caches:
@@ -125,11 +136,11 @@ class QwenFA:
                           device=self.device).reshape(batch, mb)
         sl = torch.zeros(batch, dtype=torch.int32, device=self.device)
         self.caches = []
-        for _ in range(self.nl):
+        for li in range(self.nl):
             c = fa_ptx.PagedKVCache.allocate(
                 num_pages=batch * mb, page_size=PAGE, num_kv_heads=self.nkv,
                 d_head=self.hd, batch_size=batch, max_seq_len_kv=max_seq,
-                kv_dtype=kv_dtype, k_scale=1.0, v_scale=1.0,
+                kv_dtype=self.kv_dtypes[li], k_scale=1.0, v_scale=1.0,
                 dtype=self.dtype, device=self.device)
             c.block_table, c.seq_lens = bt, sl
             self.caches.append(c)
@@ -190,15 +201,55 @@ class QwenFA:
                  + torch.arange(L, dtype=torch.int32,
                                 device=self.device).repeat(B))
         logits, k_out, v_out = self._core(flat, pos, cu, L)
-        calibrate = self.kv_dtype == "fp8" and int(self.seq_lens.max()) == 0
+        first = int(self.seq_lens.max()) == 0
         for li, c in enumerate(self.caches):
-            if calibrate:  # per-layer per-tensor fp8 scales from the prompt
+            # per-layer per-tensor fp8 scales from the prompt
+            if first and self.kv_dtypes[li] == "fp8":
                 c.k_scale = max(k_out[li].abs().max().item() / 448.0, 1e-6)
                 c.v_scale = max(v_out[li].abs().max().item() / 448.0, 1e-6)
             c.write(k_out[li], v_out[li], slots)               # pre-rotated K
             k_out[li] = v_out[li] = None   # release: ~28KB/token if pinned
         self.seq_lens += L
         return logits
+
+    # -- which layers must keep an fp16 cache ---------------------------------
+    @torch.inference_mode()
+    def layer_noise(self, ids, kv_dtype):
+        """Per layer: the noise (nats) a `kv_dtype` cache would put on the
+        attention logits, measured on the token sequence ids [L]. A plain
+        forward pass; nothing is cached."""
+        L = ids.numel()
+        flat = ids.reshape(-1).to(self.device)
+        pos = torch.arange(L, device=self.device)
+        cu = torch.tensor([0, L], dtype=torch.int32, device=self.device)
+        cos, sin = self.cos, self.sin
+        h = self.embed[flat]
+        noise = []
+        for w in self.layers:
+            x = rmsnorm(h, w["ln1"], self.eps)
+            qkv = F.linear(x, w["wqkv"], w["bqkv"])
+            q, k, v = qkv.split([self.q_sz, self.kv_sz, self.kv_sz], dim=-1)
+            q = rope_rotate(q.reshape(-1, self.nq, self.hd), cos, sin, pos)
+            k = rope_rotate(k.reshape(-1, self.nkv, self.hd), cos, sin, pos)
+            v = v.reshape(-1, self.nkv, self.hd).contiguous()
+            noise.append(fa_ptx.kv_logit_noise(q, k, kv_dtype))
+            o = fa_ptx.attention(q, k, v, cu_seqlens_q=cu, cu_seqlens_k=cu,
+                                 max_seqlen_q=L, num_kv_heads=self.nkv,
+                                 causal=True)
+            h = h + F.linear(o.reshape(-1, self.H), w["wo"])
+            x = rmsnorm(h, w["ln2"], self.eps)
+            g, u = F.linear(x, w["wgu"]).chunk(2, dim=-1)
+            h = h + F.linear(F.silu(g) * u, w["wd"])
+        return noise
+
+    def pick_fp16_layers(self, ids, kv_dtype, threshold=0.5):
+        """Layers whose K is too fragile for `kv_dtype`: logit noise above
+        `threshold` nats on the sample ids. Needs the RoPE tables, so call
+        setup_cache first."""
+        if kv_dtype == "auto":
+            return set()
+        noise = self.layer_noise(ids, kv_dtype)
+        return {li for li, x in enumerate(noise) if x > threshold}
 
     # -- one decode step (graph-capturable: device state only) ----------------
     def _step(self, ids, pos_s, slots_s):
@@ -305,6 +356,69 @@ def load_tokenizer():
     return AutoTokenizer.from_pretrained(str(SNAP))
 
 
+def resolve_fp16_layers(m, sample_ids, args, max_seq):
+    """--fp16-layers: "" (none), a comma list, or "auto" (measure)."""
+    spec = args.fp16_layers
+    if not spec or args.kv == "auto":
+        return ()
+    if spec != "auto":
+        return {int(x) for x in spec.split(",")}
+    m.setup_cache(1, max_seq, "auto")      # RoPE tables for the probe pass
+    noise = m.layer_noise(sample_ids, args.kv)
+    layers = {li for li, x in enumerate(noise) if x > 0.5}
+    worst = sorted(range(len(noise)), key=lambda li: -noise[li])[:4]
+    print(f"logit noise under {args.kv} (nats), worst layers: "
+          + ", ".join(f"L{li}={noise[li]:.2f}" for li in worst)
+          + f" -> fp16 layers {sorted(layers)}")
+    return layers
+
+
+@torch.inference_mode()
+def teacher_forced_logprobs(m, ids, prefix, kv, fp16_layers):
+    """Prefill ids[:prefix], then decode the rest of the text one token at a
+    time through the cache, always feeding the text's own next token. Returns
+    log-probs [n - 1 - prefix, vocab]: row i predicts token prefix + i + 1."""
+    n = ids.numel()
+    m.setup_cache(1, n + 16, kv, fp16_layers)
+    m.prefill(ids[None, :prefix])
+    out = []
+    for t in range(prefix, n - 1):
+        pos = m.seq_lens.clone()
+        slots = m.slot_base + m.seq_lens
+        m.seq_lens += 1
+        out.append(F.log_softmax(m._step(ids[t:t + 1], pos, slots)[0].float(), -1))
+    return torch.stack(out)
+
+
+@torch.inference_mode()
+def quality_scores(ref, got, targets, chunk=256):
+    """ref/got: log-probs [n, vocab]; targets: the text's actual next tokens."""
+    kl = top = d_nll = 0.0
+    n = ref.shape[0]
+    for a in range(0, n, chunk):
+        r, g, t = ref[a:a + chunk], got[a:a + chunk], targets[a:a + chunk, None]
+        kl += (r.exp() * (r - g)).sum(-1).sum().item()
+        top += (r.argmax(-1) == g.argmax(-1)).sum().item()
+        d_nll += (r.gather(1, t) - g.gather(1, t)).sum().item()
+    return 100.0 * top / n, kl / n, math.exp(d_nll / n)
+
+
+def cmd_quality(args):
+    tok = load_tokenizer()
+    ids = tok(Path(args.quality).read_text(encoding="utf-8"),
+              return_tensors="pt").input_ids[0, :args.max_tokens].cuda()
+    prefix = 64
+    m = QwenFA()
+    fp16 = resolve_fp16_layers(m, ids[:prefix], args, ids.numel() + 16)
+    ref = teacher_forced_logprobs(m, ids, prefix, "auto", ())
+    got = teacher_forced_logprobs(m, ids, prefix, args.kv, fp16)
+    top1, kl, ppl = quality_scores(ref, got, ids[prefix + 1:])
+    print(f"{args.quality}: {ids.numel()} tokens, {ref.shape[0]} scored | "
+          f"kv={args.kv} fp16-layers={sorted(fp16)}")
+    print(f"next-token agreement with the fp16 cache: {top1:.2f}%   "
+          f"KL {kl:.4f}   perplexity ratio {ppl:.4f}")
+
+
 def cmd_verify(args):
     tok = load_tokenizer()
     ids = tok(DEFAULT_PROMPT, return_tensors="pt").input_ids.cuda()
@@ -328,9 +442,10 @@ def cmd_verify(args):
     # one max_seq for all three gates: the RoPE table shape stays constant,
     # so a compiled prefill core is built once and reused across setups
     S = L + args.gen + 16
+    fp16 = resolve_fp16_layers(m, ids[0], args, S)
 
     # gate 1: prefill last-token logits
-    m.setup_cache(1, S, args.kv)
+    m.setup_cache(1, S, args.kv, fp16)
     ours_logits = m.prefill(ids)[0].float()
     d = ours_logits - ref_logits
     nr = (d.pow(2).mean().sqrt() / ref_logits.pow(2).mean().sqrt()).item()
@@ -342,7 +457,7 @@ def cmd_verify(args):
     # same as every other gate), then teacher-force the generated region.
     full = torch.cat([ids[0], ref_gen]).unsqueeze(0)
     n = full.shape[1]
-    m.setup_cache(1, S, args.kv)
+    m.setup_cache(1, S, args.kv, fp16)
     first = m.prefill(full[:, :L]).argmax(-1)
     agree = int(first.item() == full[0, L].item())
     total = 1
@@ -354,7 +469,7 @@ def cmd_verify(args):
 
     # gate 3: free-running greedy prefix match, full-step graph decode
     # (with --compile this exercises the COMPILED decode step end-to-end)
-    m.setup_cache(1, S, args.kv)
+    m.setup_cache(1, S, args.kv, fp16)
     ours = m.generate(ids, args.gen)[0]
     match = 0
     for a, b in zip(ours.tolist(), ref_gen.tolist()):
@@ -375,15 +490,16 @@ def cmd_bench(args):
     m = QwenFA(use_compile=args.compile)
     # budget: prompt + capture-warmup(3) + bench-warmup(10) + gen + eager(55)
     S = args.prompt_len + args.gen + 96
+    fp16 = resolve_fp16_layers(m, ids[0], args, S)
     if args.compile:  # throwaway run so compile time stays out of the timing
-        m.setup_cache(args.batch, S, args.kv)
+        m.setup_cache(args.batch, S, args.kv, fp16)
         m.prefill(ids)
 
     # prefill timing: state is consumed by a prefill, so re-setup per rep
     # (setup itself is outside the timed window) and take the best rep
     tpre = float("inf")
     for _ in range(3):
-        m.setup_cache(args.batch, S, args.kv)
+        m.setup_cache(args.batch, S, args.kv, fp16)
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         logits = m.prefill(ids)
@@ -392,7 +508,8 @@ def cmd_bench(args):
 
     m.capture(logits.argmax(-1))
     ms = m.bench_decode(args.gen) * 1e3
-    print(f"model=Qwen2.5-1.5B bf16  kv={args.kv}  B={args.batch}  "
+    print(f"model=Qwen2.5-1.5B bf16  kv={args.kv}  fp16-layers={sorted(fp16)}  "
+          f"B={args.batch}  "
           f"prompt={args.prompt_len}  gen={args.gen}  "
           f"compile={args.compile}")
     print(f"prefill: {tpre * 1e3:8.1f} ms   "
@@ -418,6 +535,13 @@ if __name__ == "__main__":
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--bench", action="store_true")
     ap.add_argument("--kv", default="auto", choices=["auto", "fp8", "int4"])
+    ap.add_argument("--fp16-layers", default="",
+                    help='layers whose cache stays fp16: "0,1,15", or "auto" '
+                         "to pick them by measured logit noise")
+    ap.add_argument("--quality", metavar="TEXT",
+                    help="score a quantized cache on a text file against an "
+                         "fp16 cache (teacher-forced decode)")
+    ap.add_argument("--max-tokens", type=int, default=4096)
     ap.add_argument("--compile", action="store_true",
                     help="torch.compile the decode step before graph capture")
     ap.add_argument("--batch", type=int, default=1)
@@ -428,5 +552,7 @@ if __name__ == "__main__":
         cmd_verify(args)
     if args.bench:
         cmd_bench(args)
-    if not (args.verify or args.bench):
-        print("nothing to do: pass --verify and/or --bench")
+    if args.quality:
+        cmd_quality(args)
+    if not (args.verify or args.bench or args.quality):
+        print("nothing to do: pass --verify, --bench and/or --quality TEXT")
