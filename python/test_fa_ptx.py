@@ -160,6 +160,42 @@ def t_chunked_prefill(kv_dtype, thr):
           f"worst nrmse={worst:.5f}")
 
 
+# --- 3c. the quality helpers mirror the real cache formats --------------------
+def t_simulate_kv(kv_dtype):
+    """Decode over a real quantized cache must equal SDPA over
+    simulate_kv(K), simulate_kv(V) to kernel precision: the simulator is the
+    cache format, not an approximation of it."""
+    B, Hq, Hkv, D = 3, 32, 8, 128
+    lens = [1024, 300, 47]
+    cache, ks, vs = make_cache_and_ref(kv_dtype, B, Hq, Hkv, D, lens)
+    q = torch.randn(B, Hq, D, device="cuda", dtype=torch.float16)
+    o = cache.attend(q)
+    ks_q = [fa_ptx.simulate_kv(k, kv_dtype, 0.02) for k in ks]
+    vs_q = [fa_ptx.simulate_kv(v, kv_dtype, 0.02) for v in vs]
+    e = nrmse(o, decode_ref(q, ks_q, vs_q, lens, Hq, Hkv))
+    check(f"simulate_kv mirrors the cache ({kv_dtype})", e < 2e-3,
+          f"nrmse={e:.5f}")
+
+
+def t_logit_noise():
+    """kv_logit_noise: zero for an fp16 cache, larger for int4 than fp8 on
+    plain gaussian data, and it flags a layer whose K has a huge channel."""
+    T, Hq, Hkv, D = 256, 8, 2, 128
+    q = torch.randn(T, Hq, D, device="cuda")
+    k = torch.randn(T, Hkv, D, device="cuda")
+    n0 = fa_ptx.kv_logit_noise(q, k, "auto")
+    n8 = fa_ptx.kv_logit_noise(q, k, "fp8")
+    n4 = fa_ptx.kv_logit_noise(q, k, "int4")
+    k_big = k.clone()
+    k_big[:, :, 5] = 300.0 + k[:, :, 5]     # one large, nearly constant channel
+    q_big = q.clone()
+    q_big[:, :, 5] *= 10.0
+    n8_big = fa_ptx.kv_logit_noise(q_big, k_big, "fp8")
+    ok = n0 == 0.0 and 0.0 < n8 < n4 and n8_big > 10 * n8
+    check("kv_logit_noise ranks formats and flags outlier K", ok,
+          f"auto={n0:.3f} fp8={n8:.3f} int4={n4:.3f} fp8+outlier={n8_big:.2f}")
+
+
 # --- 3b. fused-RoPE cache write ----------------------------------------------
 def fresh_cache(kv_dtype, B, Hkv, D, lens, ps=16):
     """Empty cache + flat slot mapping (sequential pages), nothing written."""
@@ -381,6 +417,9 @@ if __name__ == "__main__":
     t_chunked_prefill("auto", 1e-3)
     t_chunked_prefill("fp8", 5e-2)
     t_chunked_prefill("int4", 1.5e-1)
+    t_simulate_kv("fp8")
+    t_simulate_kv("int4")
+    t_logit_noise()
     t_rope("auto", 1e-3)
     t_rope("fp8", 5e-2)
     t_rope("int4", 1.5e-1)

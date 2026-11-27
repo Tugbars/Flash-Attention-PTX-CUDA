@@ -53,6 +53,8 @@ except ImportError:  # JIT-compile from source for development
 
 _ops = torch.ops.fa_ptx
 
+from .kvquality import kv_logit_noise, simulate_kv  # noqa: E402
+
 KV_AUTO, KV_FP8_E4M3, KV_INT4_G32 = 0, 1, 2
 _KV_NAMES = {"auto": KV_AUTO, "fp8": KV_FP8_E4M3, "int4": KV_INT4_G32}
 
@@ -305,4 +307,4 @@ class CaptureCache:
 
 
 __all__ = ["attention", "PagedKVCache", "CaptureCache", "KV_AUTO",
-           "KV_FP8_E4M3", "KV_INT4_G32"]
+           "KV_FP8_E4M3", "KV_INT4_G32", "kv_logit_noise", "simulate_kv"]
