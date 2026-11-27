@@ -221,12 +221,32 @@ fp16/bf16 attention, so the chunk attends the values the cache actually holds
   <tr><th><code>kv_dtype</code></th><th>KV memory</th><th>Decode speed<br>(D=128, long ctx)</th><th>Accuracy cost<br>(worst case)</th><th>Scales</th></tr>
   <tr><td><code>AUTO</code></td><td>1×</td><td>baseline (~99% HBM peak)</td><td>—</td><td>—</td></tr>
   <tr><td><code>FP8_E4M3</code></td><td class="good">1/2</td><td class="good">~1.8× faster</td><td>~0.035 nrmse</td><td>you provide per-tensor <code>k_scale/v_scale</code> (max|X|/448)</td></tr>
-  <tr><td><code>INT4_G32</code></td><td class="good">~1/4</td><td>~1.2–1.8× faster</td><td>~0.10 nrmse</td><td>computed automatically per 32-channel group (allocate <code>K_scales/V_scales</code>)</td></tr>
+  <tr><td><code>INT4_G32</code></td><td class="good">5/16</td><td>~1.2–1.8× faster</td><td>~0.10 nrmse</td><td>computed automatically per 32-channel group (allocate <code>K_scales/V_scales</code>)</td></tr>
 </table>
-<p>Rule of thumb: <strong>FP8 for speed, INT4 for capacity.</strong> The
-accuracy costs are gaussian-random worst cases; calibrated real-model KV does
-better, and both formats add <em>zero kernel error</em> on top of the
-quantization itself.</p>
+<p>The accuracy column is the error of the stored values on gaussian data;
+both formats add <em>zero kernel error</em> on top of it. It is not what a
+format costs a model.</p>
+<p><strong>Choose the format per layer, not per model.</strong> Each layer has
+its own <code>KvCache</code> and so its own <code>kv_dtype</code>. Quantizing V
+is harmless; quantizing K puts noise on the attention logits, and a layer
+whose K has a few very large channels cannot take it. On Qwen2.5-1.5B that is
+layer 0, and leaving just that layer's cache in <code>AUTO</code> restores the
+model:</p>
+<table>
+  <tr><th>Cache (Qwen2.5-1.5B, real kernels)</th><th>Size vs fp16</th><th>Next-token agreement<br>with an fp16 cache</th></tr>
+  <tr><td>FP8 in every layer</td><td>2.00× smaller</td><td>83.6%</td></tr>
+  <tr><td>FP8, layer 0 in <code>AUTO</code></td><td class="good">1.93× smaller</td><td class="good">96.1%</td></tr>
+  <tr><td>INT4 in every layer</td><td>3.20× smaller</td><td>3.9%</td></tr>
+  <tr><td>INT4, layers 0, 1, 15 in <code>AUTO</code></td><td class="good">2.59× smaller</td><td class="good">94.3%</td></tr>
+</table>
+<p>To find the layers for your model, measure:
+<code>fa_ptx.kv_logit_noise(q, k, "fp8")</code> takes a sample of one layer's
+Q and K (64 tokens are enough) and returns the noise that format would put on
+the layer's attention logits, in nats. Keep a layer in <code>AUTO</code> when
+it exceeds about 0.5. Details: <code>docs/e2e-model-test.md</code>.</p>
+<p>Rule of thumb: <strong>FP8 for speed and near-lossless output, INT4 for the
+longest context that fits</strong>, both with the fragile layers left in
+<code>AUTO</code>.</p>
 
 <h2><span class="no">7</span>Validate and benchmark</h2>
 <p>Eight independent gates validate everything against double-precision

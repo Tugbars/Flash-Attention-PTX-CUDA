@@ -18,7 +18,7 @@ see the [README](../README.md) and [vllm-comparison.md](vllm-comparison.md).
 - **Decode attention** (split-KV, memory-bound): single-token queries against
   long KV caches, contiguous or paged.
 - **Paged KV cache** with block tables, per-sequence lengths, and optional
-  **FP8** (2× smaller, ~1.8× faster decode) or **INT4** (4× smaller)
+  **FP8** (2× smaller, ~1.8× faster decode) or **INT4** (3.2× smaller)
   quantization — plus the cache-write kernel that quantizes on the way in.
 - **Chunked prefill** over the paged cache (multi-turn serving), on fp16/bf16,
   FP8 and INT4 caches alike.
@@ -217,13 +217,35 @@ about 1.0–1.25× the time of the same chunk on an fp16 cache (RTX 5080).
 |---|---|---|---|---|
 | `AUTO` | 1× | baseline (~99% of HBM peak) | — | — |
 | `FP8_E4M3` | **1/2** | **~1.8× faster** | ~0.035 nrmse (worst case) | you provide per-tensor `k_scale`/`v_scale` (max abs / 448) |
-| `INT4_G32` | **~1/4** | ~1.2–1.8× faster | ~0.10 nrmse (worst case) | computed automatically per 32-channel group; allocate `K_scales`/`V_scales` pools |
+| `INT4_G32` | **5/16** (3.2× smaller) | ~1.2–1.8× faster | ~0.10 nrmse | computed automatically per 32-channel group; allocate `K_scales`/`V_scales` pools |
 
-Rule of thumb: **FP8 when you want speed, INT4 when you need to fit a longer
-context or bigger batch in VRAM.** Accuracy costs above are gaussian-random
-worst cases; calibrated real-model KV does better. Both formats add zero
-kernel error on top of the quantization itself (validated against
-quantization-aware fp64 references).
+The accuracy column is the error of the stored values on gaussian data. Both
+formats add zero kernel error on top of that (validated against
+quantization-aware fp64 references). It is not what the format costs a model.
+
+**Choose the format per layer, not per model.** Each layer has its own
+`KvCache`, so each can have its own `kv_dtype`, and that matters: on
+Qwen2.5-1.5B an FP8 cache in every layer changes 16% of the model's next-token
+choices, and INT4 in every layer breaks it. Nearly all of that comes from one
+layer. Quantizing V is harmless; quantizing K puts noise on the attention
+logits, and layer 0's K has a few channels about 300 times larger than the
+rest. Keeping that layer's cache in `AUTO` restores the model:
+
+| Cache (Qwen2.5-1.5B, real kernels) | Size vs fp16 | Next-token agreement with an fp16 cache |
+|---|---|---|
+| FP8 in every layer | 2.00× smaller | 83.6% |
+| FP8, layer 0 in `AUTO` | 1.93× smaller | 96.1% |
+| INT4 in every layer | 3.20× smaller | 3.9% |
+| INT4, layers 0, 1, 15 in `AUTO` | 2.59× smaller | 94.3% |
+
+To find the layers for your model, measure. `fa_ptx.kv_logit_noise(q, k,
+"fp8")` takes a sample of one layer's Q and K (64 tokens are enough) and
+returns the noise that format would put on the layer's attention logits, in
+nats. Keep a layer in `AUTO` when it exceeds about 0.5. Method, numbers and a
+second model: [e2e-model-test.md](e2e-model-test.md).
+
+Rule of thumb: **FP8 for speed and near-lossless output, INT4 for the longest
+context that fits**, both with the fragile layers left in `AUTO`.
 
 ## 8. Validate and benchmark
 
@@ -349,6 +371,24 @@ sequences by mutating `seq_lens` / `block_table` / pools **in place** (the
 captured graphs see the updates — no recapture needed); the returned tensor
 is a view of the bucket's static buffer, valid until the next `decode()` on
 that bucket (`.clone()` to keep it).
+
+### `fa_ptx.kv_logit_noise(q, k, kv_dtype) -> float`
+
+Which layers can take a quantized cache (section 7). `q` is `[T, H_q, D]` and
+`k` is `[T, H_kv, D]` for one sequence, as attention sees them (after RoPE);
+64 tokens are enough. Returns the noise, in nats, that a `"fp8"` or `"int4"`
+cache would put on that layer's attention logits. Pure PyTorch, no cache
+needed:
+
+```python
+fragile = [li for li, (q, k) in enumerate(layer_samples)
+           if fa_ptx.kv_logit_noise(q, k, "fp8") > 0.5]   # keep these "auto"
+```
+
+`fa_ptx.simulate_kv(x, kv_dtype, scale=None)` returns what a cache of that
+format would hand back for `x` (quantize, then dequantize). It matches the
+real cache to kernel precision, so a format can be tried on a model before any
+cache exists.
 
 ### Raw ops
 

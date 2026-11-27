@@ -134,13 +134,21 @@ launch_flash_attention_varlen(const FlashAttentionVarlenParams &params);
 // (k_scale into the softmax scale, v_scale into the output write), so FP8
 // reads cost no per-element scale arithmetic.
 //
-// INT4_G32 quarters cache bytes: asymmetric uint4 with a (scale, zero) half2
-// per GROUP of 32 head-dim channels, computed per (token, kv-head) by the
-// cache writer — no caller calibration needed. Requires the parallel scale
-// pools (K_scales / V_scales):
+// INT4_G32 stores 5 bits per element, under a third of fp16: asymmetric uint4
+// with a (scale, zero) half2 per GROUP of 32 head-dim channels, computed per
+// (token, kv-head) by the cache writer — no caller calibration needed.
+// Requires the parallel scale pools (K_scales / V_scales):
 //   payload : [num_pages, page_size, H_kv, D/2]  bytes (2 nibbles/byte,
 //             channel c even = low nibble of byte c/2)
 //   scales  : [num_pages, page_size, H_kv, D/32] half2 (scale, zero)
+//
+// Choose the format PER LAYER. The kernels reproduce the stored values
+// exactly, but what a format costs a model is decided by K: its error is
+// multiplied by Q and lands on the attention logits, and a layer whose K has
+// a few very large channels (layer 0 of Qwen2.5-1.5B) can receive more
+// quantization noise than signal. One such layer in FP8 is enough to damage
+// the model; kept in AUTO, the other layers quantize safely. Measured results
+// and the rule for finding those layers: docs/e2e-model-test.md.
 // ============================================================================
 enum class KvDType { AUTO = 0, FP8_E4M3 = 1, INT4_G32 = 2 };
 

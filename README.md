@@ -28,7 +28,7 @@ What it contains:
 
 - **Prefill attention** on tensor cores: fp16 or bf16, head dimension 64 or 128, causal or full, MHA / GQA / MQA, as a padded batch `[B, H, S, D]` or as packed ragged sequences.
 - **Decode attention**: one query token against a long KV cache. This is a separate, memory-bound kernel that splits the cache across the GPU.
-- **Paged KV cache** with block tables and per-sequence lengths, stored as fp16/bf16, FP8 (half the bytes) or INT4 (a quarter). The cache-write kernel quantizes on the way in and can apply RoPE to K in the same pass.
+- **Paged KV cache** with block tables and per-sequence lengths, stored as fp16/bf16, FP8 (half the bytes) or INT4 (under a third), chosen per layer. The cache-write kernel quantizes on the way in and can apply RoPE to K in the same pass.
 - **Chunked prefill** against the paged cache for follow-up turns, on all three cache formats.
 - **PyTorch bindings** (`fa_ptx`) that trace through `torch.compile` and can be captured in CUDA graphs.
 - An opt-in **autotuner** that benchmarks the tile configurations for a batch shape once and reuses the winner.
@@ -100,7 +100,9 @@ Decode is about 9% faster at B=1 and 3% at B=8. Prefill is at parity. Three thin
 - The numbers need `--compile`. With the CUDA graph alone, decode takes 5.53 ms/token at B=1, which is slower than vLLM.
 - Run-to-run spread on a desktop GPU is 5 to 15%. These are the best of 3 runs; vLLM's are its own benchmark's average of 5.
 
-Output quality depends on the cache format. With a bf16 cache the model agrees with transformers on 61 of 64 teacher-forced tokens. FP8 is usable with mild degradation (52 of 64). INT4 is too lossy for a model this small: 30 of 64, and free-running generation collapses. Details are in [docs/e2e-model-test.md](docs/e2e-model-test.md).
+With a bf16 cache the model agrees with transformers on 61 of 64 teacher-forced tokens.
+
+A quantized cache has to be chosen per layer. Quantizing every layer alike damages this model: over 1,161 tokens of prose, FP8 keeps 83.6% of the next-token choices an fp16 cache makes and INT4 keeps 3.9%. Almost all of that comes from layer 0, whose K has a few channels about 300 times larger than the rest. With that layer's cache left in fp16, FP8 keeps 96.1% at 1.93× less memory. INT4 with layers 0, 1 and 15 in fp16 keeps 94.3% at 2.59× less. The layers are found by measurement (`fa_ptx.kv_logit_noise`, or `--fp16-layers auto` in the runner). Details are in [docs/e2e-model-test.md](docs/e2e-model-test.md).
 
 ```sh
 python python/e2e_qwen.py --verify --gen 64          # parity gates vs transformers
@@ -184,7 +186,7 @@ Nine gate programs in [tests/](tests/) cover the prefill kernels, decode, the ca
 - One checks that the three-call API produces bit-identical output to the underlying launchers.
 - One checks the error contract: every rejected argument returns `cudaErrorInvalidValue` without launching a kernel or writing to the output. Nothing in the library aborts the process.
 
-The Python bindings have their own 24-check suite, [python/test_fa_ptx.py](python/test_fa_ptx.py).
+The Python bindings have their own 27-check suite, [python/test_fa_ptx.py](python/test_fa_ptx.py).
 
 ```bash
 cmake --build . --target fa_validate fa_varlen_validate fa_paged_validate \

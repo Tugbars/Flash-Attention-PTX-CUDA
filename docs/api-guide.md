@@ -118,14 +118,24 @@ cache.kv_dtype = KvDType::FP8_E4M3;
 cache.k_scale = kmax / 448.f; cache.v_scale = vmax / 448.f;
 ```
 
-| `kv_dtype` | KV bytes vs fp16 | Decode speed (RTX 5080, D=128, long ctx) | Accuracy cost (gaussian worst case) |
+| `kv_dtype` | KV bytes vs fp16 | Decode speed (RTX 5080, D=128, long ctx) | Error of the stored values (gaussian data) |
 |---|---|---|---|
 | `AUTO` (fp16/bf16) | 1x | baseline | — |
 | `FP8_E4M3` | **1/2** | **~1.7–1.9x faster** | ~0.035 nrmse |
-| `INT4_G32` | **~1/4** | ~1.2–1.8x faster | ~0.10 nrmse |
+| `INT4_G32` | **5/16** | ~1.2–1.8x faster | ~0.10 nrmse |
 
 FP8 is the speed play, INT4 the capacity play. Both add **zero kernel error**
 on top of quantization (validated against quantization-aware fp64 references).
+
+That error column is not what a format costs a model. `kv_dtype` belongs to
+one cache, so a model can use a different one per layer, and it should: K's
+quantization error lands on the attention logits, and a layer whose K has a
+few very large channels cannot be quantized safely. On Qwen2.5-1.5B, FP8 in
+every layer keeps 83.6% of the next-token choices of an fp16 cache; with layer
+0 left in `AUTO` it keeps 96.1%. [how-to-use.md](how-to-use.md) section 7 has
+the table and the rule for finding such layers
+(`fa_ptx.kv_logit_noise`); [e2e-model-test.md](e2e-model-test.md) has the
+measurements.
 
 ## A full continuous-batching step
 
